@@ -462,6 +462,8 @@ mod tests {
 
         let raw = repo.git_raw(WORKTREE_ARGS);
         let worktrees = parse_worktrees(&raw);
+        // git reports canonical paths (macOS temp dirs live under the /var -> /private/var symlink).
+        let (wt1, wt2) = (wt1.canonicalize().expect("wt1"), wt2.canonicalize().expect("wt2"));
 
         assert_eq!(worktrees.len(), 3);
         let main = &worktrees[0];

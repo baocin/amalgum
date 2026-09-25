@@ -212,6 +212,9 @@ pub fn validate_branch_name(name: &str) -> Result<(), &'static str> {
     if name == "@" {
         return Err("ref name may not be the single character '@'");
     }
+    if name == "HEAD" {
+        return Err("a branch may not be named HEAD");
+    }
     if name.contains("@{") {
         return Err("ref name may not contain '@{'");
     }
@@ -250,7 +253,6 @@ pub fn validate_branch_name(name: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn normalize_table() {
@@ -452,13 +454,8 @@ mod tests {
     /// Cross-checks our rules against the real `git check-ref-format --branch` for a broad set
     /// of candidate names, so drift from actual `git` behaviour is caught.
     ///
-    /// Two intentional disagreements, both because this function is pure (no repo access) and
-    /// must judge a name for a *new* branch, not resolve an existing ref:
-    /// - `@` alone: real `git --branch` accepts it as shorthand for "the current branch" (it
-    ///   requires a repo to resolve); we reject it as too ambiguous a name to create.
-    /// - the literal name `HEAD`: real `git --branch` special-cases and rejects exactly this
-    ///   string (but not e.g. `feat/HEAD`); the contract's rule list does not call this out, so
-    ///   we do not special-case it.
+    /// `@`, `@{…}`, and `HEAD` are resolved by git rather than validated, so they are checked
+    /// against our rules only: none of them is acceptable as the name of a new branch.
     #[test]
     fn validate_branch_name_agrees_with_real_git() {
         let candidates = [
@@ -497,8 +494,6 @@ mod tests {
             "ba[d",
             "ba\\d",
             "ba@{d",
-            "@{0}",
-            "@{-1}",
             ".bad",
             "bad/.bad",
             "bad.lock",
@@ -511,10 +506,11 @@ mod tests {
             "feat/日本語",
             "emoji-🎉",
         ];
-        let known_disagreements = ["@", "HEAD"];
-
+        // Hermetic: `@{-1}`-style names are *resolved* by git against the repo's reflog, so the
+        // answer depends on where the test runs. Use a fresh repo with the user's config ignored.
+        let repo = crate::testutil::TempRepo::new();
         for name in candidates {
-            let real_ok = Command::new("git")
+            let real_ok = crate::testutil::hermetic_git(repo.path())
                 .args(["check-ref-format", "--branch", name])
                 .output()
                 .map(|o| o.status.success())
@@ -523,14 +519,10 @@ mod tests {
             assert_eq!(ours_ok, real_ok, "disagreement with real git for {name:?}");
         }
 
-        for name in known_disagreements {
-            let real_ok = Command::new("git")
-                .args(["check-ref-format", "--branch", name])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            let ours_ok = validate_branch_name(name).is_ok();
-            assert_ne!(ours_ok, real_ok, "expected a documented disagreement for {name:?}");
+        // Names git resolves instead of validating (and whose answer varies by git version and
+        // repo state): as names for a *new* branch we always reject them.
+        for name in ["@", "@{0}", "@{-1}", "HEAD"] {
+            assert!(validate_branch_name(name).is_err(), "{name:?} must be rejected");
         }
     }
 }
