@@ -1,30 +1,35 @@
 //! `AMALGUM_SCREENSHOT=<file.png>`: render a few frames, save the window as a PNG, and exit.
 //! Lets agents and CI look at the UI without a screenshot tool (e.g. under Xvfb):
 //! `AMALGUM_HOME=$(mktemp -d) AMALGUM_SCREENSHOT=shot.png xvfb-run cargo run`.
+//! `AMALGUM_SCREENSHOT_AFTER=<seconds>` (default 2) leaves time to drive the app first, e.g.
+//! with `amalgum notify` over the control socket.
 
 use std::path::PathBuf;
 
-/// Frames to let layout, fonts, and background jobs settle before capturing.
-const SETTLE_FRAMES: u32 = 30;
+/// Seconds to let layout, fonts, and background jobs settle before capturing.
+const DEFAULT_SETTLE_SECS: f64 = 2.0;
 
 #[derive(Debug, Default)]
 pub struct Screenshot {
     target: Option<PathBuf>,
-    frames: u32,
+    settle_secs: f64,
     requested: bool,
 }
 
 impl Screenshot {
     pub fn from_env() -> Self {
         let target = std::env::var_os("AMALGUM_SCREENSHOT").filter(|v| !v.is_empty()).map(PathBuf::from);
-        Self { target, frames: 0, requested: false }
+        let settle_secs = std::env::var("AMALGUM_SCREENSHOT_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SETTLE_SECS);
+        Self { target, settle_secs, requested: false }
     }
 
     /// Call once per frame.
     pub fn tick(&mut self, ctx: &egui::Context) {
         let Some(target) = &self.target else { return };
-        self.frames += 1;
-        if !self.requested && self.frames >= SETTLE_FRAMES {
+        if !self.requested && ctx.input(|i| i.time) >= self.settle_secs {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.requested = true;
         }

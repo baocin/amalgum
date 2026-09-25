@@ -232,7 +232,7 @@ impl App {
         let Some(ws) = self.state.active.as_deref() else { return StatusInfo::default() };
         let s = self.summary(ws);
         let (status, _) = self.workspace_status(ws);
-        let agent = (status != Status::None).then(|| (status, format!("{status:?}").to_lowercase()));
+        let agent = (status != Status::None).then(|| (status, status.label().to_string()));
         StatusInfo {
             branch: s.branch,
             detached: s.detached,

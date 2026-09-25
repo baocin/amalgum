@@ -38,6 +38,18 @@ impl Status {
             Status::NeedsInput => "◐",
         }
     }
+
+    /// Words for the status bar and tooltips ("needs input").
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::None => "",
+            Status::Disconnected => "disconnected",
+            Status::Hibernated => "hibernated",
+            Status::Idle => "idle",
+            Status::Running => "running",
+            Status::NeedsInput => "needs input",
+        }
+    }
 }
 
 /// Where an observation came from, ordered by confidence (`Hook` is the maximum).

@@ -26,6 +26,8 @@ pub fn install(ctx: &egui::Context) {
             list.insert(i, name.into());
         }
     }
+    // egui ships Hack only in the monospace chain; it also carries status-dot glyphs (◐).
+    fonts.families.entry(FontFamily::Proportional).or_default().push("Hack".into());
     ctx.set_fonts(fonts);
     ctx.all_styles_mut(|style| {
         style.text_styles = [

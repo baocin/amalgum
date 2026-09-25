@@ -319,9 +319,14 @@ fn workspace_row(
 
         if let Some((text, at)) = &info.last_message {
             ui.horizontal(|ui| {
-                ui.colored_label(colors.get(Token::FgSecondary), format!("\"{text}\""));
+                // Age first, right-aligned; the message takes the rest, elided to one line (W3).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.colored_label(colors.get(Token::FgSecondary), relative_time(now, *at));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let label =
+                            egui::RichText::new(format!("\"{text}\"")).color(colors.get(Token::FgSecondary));
+                        ui.add(egui::Label::new(label).truncate());
+                    });
                 });
             });
         }
