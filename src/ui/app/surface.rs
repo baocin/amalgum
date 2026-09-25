@@ -66,7 +66,9 @@ impl App {
         ui.allocate_rect(area, egui::Sense::hover());
         let font_size = self.settings.terminal.font_size;
         let mut focus_to: Option<PaneId> = None;
-        for (pane_id, r) in tab.layout.layout(to_model(area)) {
+        let panes =
+            if self.zoomed { vec![(tab.focused, to_model(area))] } else { tab.layout.layout(to_model(area)) };
+        for (pane_id, r) in panes {
             let rect = to_egui(r).shrink(1.0);
             let key = pane_key(&tab.id, pane_id);
             let focused = self.focus == Focus::Terminal && tab.focused == pane_id;

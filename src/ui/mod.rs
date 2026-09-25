@@ -11,6 +11,7 @@ mod control;
 mod git_pane;
 mod jobs;
 mod palette;
+mod screenshot;
 mod shortcuts;
 mod sidebar;
 mod terminal;

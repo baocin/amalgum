@@ -38,7 +38,7 @@ What exists today, mapped to docs/SPEC.md. Update this file in the same PR as th
 | §5.27 port parsing (lsof/ss) | `ports`, `platform::listening_ports` | ✅ (polling from the UI ⬜) |
 | §5.23 settings with spec defaults | `model::settings` | ✅ |
 | §5.22 persistent state, §5.27 split layout | `model::state`, `model::layout` | ✅ |
-| §5.19, §7 action table, presets, palette matching | `model::keymap`, `model::fuzzy` | see below |
+| §5.19, §7 action table, presets, palette matching | `model::keymap`, `model::fuzzy` | ✅ |
 | §4 theme tokens, ANSI + lane palettes, WCAG checks | `model::theme` | ✅ |
 
 ## App (`src/ui/`)
@@ -63,9 +63,11 @@ What exists today, mapped to docs/SPEC.md. Update this file in the same PR as th
    - `border` on `bg.base`: 1.45:1 light, 1.57:1 dark (UI borders need 3:1)
    - `fg.secondary` on `bg.selected`, dark: 3.77:1
    - `fg.on-accent` (white) on `accent`, dark: 2.77:1
-2. **Linux "Super as Mod" preset** (§1, §7): egui does not report the Super key on Linux, so the preset
+2. **Shortcut conflict in §7.1**: `Mod+Alt+↑/↓` is both "previous/next workspace" and "move focus between
+   panes". The default table keeps the workspace meaning; pane focus up/down ships unbound (rebindable).
+3. **Linux "Super as Mod" preset** (§1, §7): egui does not report the Super key on Linux, so the preset
    cannot be matched until egui exposes it.
-3. **Background work uses std threads, not tokio** (§1 lists tokio): there is no async I/O yet, so threads +
+4. **Background work uses std threads, not tokio** (§1 lists tokio): there is no async I/O yet, so threads +
    channels are simpler. Revisit when SSH connection management lands.
-4. **License**: none chosen; `Cargo.toml` has `publish = false` and no license field.
-5. **Apple signing**: release builds are ad-hoc signed until `MACOS_*` / `APPLE_*` secrets are added.
+5. **License**: none chosen; `Cargo.toml` has `publish = false` and no license field.
+6. **Apple signing**: release builds are ad-hoc signed until `MACOS_*` / `APPLE_*` secrets are added.

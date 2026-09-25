@@ -301,7 +301,9 @@ fn agent_event(agent: AgentKind, json: Option<String>, env: &Env, stdin: &mut dy
 /// absolute paths pass through.
 fn resolve_open_location(location: &str, cwd: &Path) -> String {
     match crate::git::Location::parse(location) {
-        crate::git::Location::Local { path } if path.is_relative() => cwd.join(path).to_string_lossy().into_owned(),
+        crate::git::Location::Local { path } if path.is_relative() => {
+            cwd.join(path).to_string_lossy().into_owned()
+        }
         _ => location.to_string(),
     }
 }

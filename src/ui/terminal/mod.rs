@@ -98,6 +98,14 @@ impl TerminalPane {
     pub fn pid(&self) -> u32 {
         todo!()
     }
+    /// The selected text, if any (Edit → Copy, `Mod+C`).
+    pub fn selection_text(&self) -> Option<String> {
+        todo!()
+    }
+    /// Paste as typed input, bracketed when the application enabled bracketed paste.
+    pub fn paste(&self, text: &str) {
+        todo!()
+    }
     /// Visible screen as text (scrollback persistence, accessibility, tests).
     pub fn screen_text(&self) -> String {
         todo!()

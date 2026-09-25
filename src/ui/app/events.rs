@@ -140,10 +140,10 @@ impl App {
         message: Option<String>,
         at: u64,
     ) {
-        if let (Some(ws), Some(msg)) = (ws, message.as_ref()) {
-            if let Some(live) = self.live.get_mut(ws) {
-                live.last_message = Some((msg.clone(), at));
-            }
+        if let (Some(ws), Some(msg)) = (ws, message.as_ref())
+            && let Some(live) = self.live.get_mut(ws)
+        {
+            live.last_message = Some((msg.clone(), at));
         }
         if let Some(t) = self.tracker(ws, tab) {
             t.observe(Observation { status, source, message, at });
@@ -271,11 +271,10 @@ impl App {
             Change::Cwd(ws, tab, pane, path) => {
                 if let Some(p) =
                     self.state.tab_mut(&ws, &tab).and_then(|t| t.panes.iter_mut().find(|p| p.id == pane))
+                    && p.cwd.as_deref() != Some(path.as_str())
                 {
-                    if p.cwd.as_deref() != Some(path.as_str()) {
-                        p.cwd = Some(path);
-                        self.dirty = true;
-                    }
+                    p.cwd = Some(path);
+                    self.dirty = true;
                 }
             }
             Change::Title(ws, tab, pane, title) => {

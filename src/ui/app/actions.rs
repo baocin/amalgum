@@ -5,8 +5,9 @@ use super::{App, Focus};
 use crate::git::Location;
 use crate::model::fuzzy::Group;
 use crate::model::keymap::{self, Action, Context};
-use crate::model::layout::Axis;
+use crate::model::layout::{Axis, Dir, Rect};
 use crate::model::state::GitView;
+use crate::model::theme::Mode;
 use crate::ui::chrome::Toast;
 use crate::ui::palette::{Item, Palette, Target};
 use crate::ui::shortcuts;
@@ -61,8 +62,153 @@ impl App {
     }
 
     fn dispatch_more(&mut self, ctx: &egui::Context, action: Action) {
-        let _ = (ctx, Axis::Horizontal, GitView::Graph);
-        self.toast(Toast::info(format!("{} is not available in this build yet", keymap::def(action).label)));
+        use Action as A;
+        let nth = |a: Action| match a {
+            A::Workspace1 => Some(0),
+            A::Workspace2 => Some(1),
+            A::Workspace3 => Some(2),
+            A::Workspace4 => Some(3),
+            A::Workspace5 => Some(4),
+            A::Workspace6 => Some(5),
+            A::Workspace7 => Some(6),
+            A::Workspace8 => Some(7),
+            A::Workspace9 => Some(8),
+            _ => None,
+        };
+        if let Some(n) = nth(action) {
+            if let Some(id) = self.state.workspaces().get(n).map(|w| w.id.clone()) {
+                self.activate(ctx, &id);
+            }
+            return;
+        }
+        match action {
+            A::PreviousWorkspace => self.cycle_workspace(ctx, -1),
+            A::NextWorkspace => self.cycle_workspace(ctx, 1),
+            A::NewTerminalTab => self.new_tab(ctx),
+            A::CloseTabOrPane | A::ClosePane => self.close_pane(),
+            A::PreviousTerminalTab => self.cycle_tab(-1),
+            A::NextTerminalTab => self.cycle_tab(1),
+            A::SplitRight => self.split(ctx, Axis::Horizontal),
+            A::SplitDown => self.split(ctx, Axis::Vertical),
+            A::FocusPaneLeft => self.move_focus(Dir::Left),
+            A::FocusPaneRight => self.move_focus(Dir::Right),
+            A::FocusPaneUp => self.move_focus(Dir::Up),
+            A::FocusPaneDown => self.move_focus(Dir::Down),
+            A::ZoomPane => self.zoomed = !self.zoomed,
+            A::MaximizePane => match self.focus {
+                Focus::Git => self.git_maximized = !self.git_maximized,
+                Focus::Terminal => self.zoomed = !self.zoomed,
+            },
+            A::ToggleGitPane => {
+                if let Some(ws) = self.state.active.clone().and_then(|id| self.state.workspace_mut(&id)) {
+                    ws.git_pane_open = !ws.git_pane_open;
+                    self.dirty = true;
+                }
+            }
+            A::ToggleSidebar => self.show_sidebar = !self.show_sidebar,
+            A::NotificationPanel => self.show_notifications = !self.show_notifications,
+            A::FocusGraph => self.set_git_view(GitView::Graph),
+            A::GitPaneChangesView => self.set_git_view(GitView::Changes),
+            A::GitPaneRefsView => self.set_git_view(GitView::Refs),
+            A::FocusTerminalFromGitPane => self.focus = Focus::Terminal,
+            A::Undo | A::Redo => {
+                if let Some(git) = self.active_live().and_then(|l| l.git.as_mut()) {
+                    if action == A::Undo { git.undo() } else { git.redo() }
+                }
+            }
+            A::ToggleTheme => {
+                let flipped = match self.colors.mode {
+                    Mode::Dark => Mode::Light,
+                    Mode::Light => Mode::Dark,
+                };
+                self.theme_override = Some(flipped);
+            }
+            A::ZoomIn | A::ZoomOut | A::ZoomReset => {
+                let size = &mut self.settings.terminal.font_size;
+                *size = match action {
+                    A::ZoomIn => (*size + 1.0).min(32.0),
+                    A::ZoomOut => (*size - 1.0).max(8.0),
+                    _ => 12.0,
+                };
+            }
+            A::TerminalCopy | A::Copy => {
+                if let Some(text) = self.focused_terminal().and_then(|t| t.selection_text()) {
+                    ctx.copy_text(text);
+                }
+            }
+            A::TerminalPaste | A::Paste => {
+                let text = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                if let Some(t) = self.focused_terminal() {
+                    t.paste(&text);
+                }
+            }
+            A::Settings => self.open_settings_file(),
+            A::OpenLogFolder => {
+                let _ = std::fs::create_dir_all(self.dirs.logs());
+                let _ = crate::platform::open_in_default_app(&self.dirs.logs().display().to_string());
+            }
+            A::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            A::MinimizeWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            A::ZoomWindow => {
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            A::ShortcutOverlay => self.palette = Some(Palette::default()),
+            other => {
+                self.toast(Toast::info(format!(
+                    "{} is not available in this build yet",
+                    keymap::def(other).label
+                )));
+            }
+        }
+    }
+
+    fn cycle_workspace(&mut self, ctx: &egui::Context, delta: isize) {
+        let ids: Vec<String> = self.state.workspaces().iter().map(|w| w.id.clone()).collect();
+        let Some(pos) = self.state.active.as_ref().and_then(|a| ids.iter().position(|i| i == a)) else {
+            return;
+        };
+        let next = (pos as isize + delta).rem_euclid(ids.len() as isize) as usize;
+        self.activate(ctx, &ids[next]);
+    }
+
+    fn cycle_tab(&mut self, delta: isize) {
+        let Some(ws) = self.state.active.clone().and_then(|id| self.state.workspace_mut(&id)) else { return };
+        if ws.tabs.is_empty() {
+            return;
+        }
+        ws.active_tab = (ws.active_tab as isize + delta).rem_euclid(ws.tabs.len() as isize) as usize;
+        self.dirty = true;
+    }
+
+    /// `Mod+Alt+arrows`: geometric neighbour in the active tab's split tree (§5.27).
+    fn move_focus(&mut self, dir: Dir) {
+        let Some(id) = self.state.active.clone() else { return };
+        let Some(ws) = self.state.workspace(&id) else { return };
+        let Some(tab) = ws.tabs.get(ws.active_tab) else { return };
+        // Layout is proportional, so any area gives the same neighbours.
+        let area = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 1000.0 };
+        if let Some(pane) = tab.layout.neighbor(area, tab.focused, dir) {
+            self.focus_pane(&id, pane);
+        }
+    }
+
+    fn focused_terminal(&self) -> Option<&crate::ui::terminal::TerminalPane> {
+        let ws = self.state.workspace(self.state.active.as_deref()?)?;
+        let tab = ws.tabs.get(ws.active_tab)?;
+        self.live.get(&ws.id)?.panes.get(&tab.focused)
+    }
+
+    /// Settings has no window yet: open `settings.toml` (written with defaults if missing).
+    fn open_settings_file(&mut self) {
+        let path = self.dirs.settings();
+        if !path.exists()
+            && let Err(e) = self.settings.save(&path)
+        {
+            self.toast(Toast::error("Could not write settings.toml", e.to_string()));
+            return;
+        }
+        let _ = crate::platform::open_in_default_app(&path.display().to_string());
     }
 
     pub(super) fn palette_items(&self) -> Vec<Item> {

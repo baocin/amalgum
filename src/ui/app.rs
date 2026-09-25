@@ -71,12 +71,17 @@ pub struct App {
     open_sheet: Option<String>,
     show_notifications: bool,
     show_sidebar: bool,
+    /// `Mod+Shift+Enter`: the focused terminal fills its tab.
+    zoomed: bool,
+    /// `Mod+\` with the git pane focused: the git pane fills the window (§3).
+    git_maximized: bool,
     focus: Focus,
     dirty: bool,
     /// `ctx.input(|i| i.time)` of the current frame, for toasts.
     time: f64,
     /// OS notifications are raised only when the window is not focused (§5.29).
     focused_window: bool,
+    screenshot: super::screenshot::Screenshot,
 }
 
 impl App {
@@ -129,10 +134,13 @@ impl App {
             open_sheet: None,
             show_notifications: false,
             show_sidebar: true,
+            zoomed: false,
+            git_maximized: false,
             focus: Focus::Terminal,
             dirty: false,
             time: 0.0,
             focused_window: true,
+            screenshot: super::screenshot::Screenshot::from_env(),
             settings,
             state,
         };
@@ -353,27 +361,17 @@ impl eframe::App for App {
             .as_deref()
             .and_then(|id| self.state.workspace(id))
             .is_some_and(|w| w.git_pane_open);
-        if git_open {
-            let (colors, settings) = (self.colors, self.settings.clone());
-            let events = egui::Panel::right("git")
+        let maximized = git_open && self.git_maximized;
+        if git_open && !maximized {
+            egui::Panel::right("git")
                 .resizable(true)
                 .default_size(420.0)
-                .show(ui, |ui| {
-                    let clicked = ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed());
-                    let events = self
-                        .active_live()
-                        .and_then(|l| l.git.as_mut())
-                        .map(|g| g.show(ui, &colors, &settings, now));
-                    (clicked, events.unwrap_or_default())
-                })
-                .inner;
-            if events.0 {
-                self.focus = Focus::Git;
-            }
-            self.on_git_events(events.1);
+                .show(ui, |ui| self.git_pane(ui, now));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            if self.state.workspaces().is_empty() {
+            if maximized {
+                self.git_pane(ui, now);
+            } else if self.state.workspaces().is_empty() {
                 let banner = false;
                 if let Some(action) =
                     welcome::show(ui, &self.state.recents, banner, &self.keymap, &self.colors, now)
@@ -390,6 +388,7 @@ impl eframe::App for App {
             control.publish(self.snapshot());
         }
         self.persist();
+        self.screenshot.tick(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -399,6 +398,17 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The active workspace's git pane; a click inside moves keyboard focus to it.
+    fn git_pane(&mut self, ui: &mut egui::Ui, now: u64) {
+        if ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+            self.focus = Focus::Git;
+        }
+        let (colors, settings) = (self.colors, self.settings.clone());
+        let events =
+            self.active_live().and_then(|l| l.git.as_mut()).map(|g| g.show(ui, &colors, &settings, now));
+        self.on_git_events(events.unwrap_or_default());
+    }
+
     fn overlays(&mut self, ctx: &egui::Context, now: u64) {
         if let Some(mut palette) = self.palette.take() {
             let items = self.palette_items();
