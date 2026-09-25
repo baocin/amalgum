@@ -4,7 +4,8 @@
 //! are the only auth. One app instance per user: binding over a socket that a live app answers
 //! fails with `ErrorKind::AddrInUse` (the caller then forwards its args and exits); a stale
 //! socket file with nobody listening is removed and re-bound. Launches take an advisory lock on
-//! `<socket>.lock` around that check-and-rebind, so racing launches cannot both win.
+//! `<socket>.lock` around that check-and-rebind, and a quitting app around its unlink, so racing
+//! launches cannot both win and a quitting app cannot remove the socket of the one after it.
 
 use super::protocol::{Request, Response};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -49,17 +50,24 @@ impl ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
+        // Under the launch lock from before the listener can close until the file is gone: a
+        // launch that found our socket refused would otherwise rebind the path in between, and
+        // lose its fresh socket to our unlink (ext4 even hands it our freed inode number, so the
+        // identity check would pass). Released before the join, so a stuck accept thread can't
+        // block the next launch.
+        let launch_lock = lock_beside(&self.path).ok();
         self.stop.store(true, Ordering::SeqCst);
         // The accept loop blocks in `accept()`; connecting to our own socket unblocks it so
         // it can observe `stop` and exit instead of waiting for a real client forever.
         let _ = UnixStream::connect(&self.path);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
         if let Ok(meta) = std::fs::metadata(&self.path)
             && (meta.dev(), meta.ino()) == self.identity
         {
             let _ = std::fs::remove_file(&self.path);
+        }
+        drop(launch_lock);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
@@ -195,7 +203,9 @@ pub fn send(path: &Path, req: &Request, timeout: Duration) -> io::Result<Respons
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream.write_all(req.to_line().as_bytes())?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    // Only a courtesy: the server reads exactly one line and may already have answered and
+    // hung up, which makes this fail with ENOTCONN on macOS while the answer sits unread.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 
     let mut buf = Vec::new();
     BufReader::new(stream).read_until(b'\n', &mut buf)?;
@@ -261,6 +271,11 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let sock = dir.path().join("app.sock");
             drop(UnixListener::bind(&sock).expect("bind")); // the file stays, nobody listens
+            // ...once any child another test is spawning right now, which holds a copy of that
+            // listener until it execs, has let go of it too.
+            while UnixStream::connect(&sock).is_ok() {
+                thread::yield_now();
+            }
             let racers = 4;
             let barrier = Arc::new(std::sync::Barrier::new(racers));
             let results: Vec<io::Result<ServerHandle>> = (0..racers)
@@ -285,6 +300,32 @@ mod tests {
                 // An orphaned server's `Drop` would wait forever on an accept() nobody can reach.
                 std::mem::forget(results);
                 panic!("racing launches: {outcome:?}, reachable at path: {reachable}");
+            }
+        }
+    }
+
+    /// An app quitting while the next one launches must not remove the new app's socket: its
+    /// listener closes before it unlinks, so a launch can find the path refused, take it over
+    /// (on ext4 even reusing the old inode number), and then lose it to the quitting app.
+    #[test]
+    fn a_quitting_server_never_removes_the_socket_of_one_launched_meanwhile() {
+        for round in 0..100 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sock = dir.path().join("app.sock");
+            let quitting = serve(&sock, |_| Response::ok()).expect("first serve");
+            let dropper = thread::spawn(move || drop(quitting));
+            let next = loop {
+                match serve(&sock, |_| Response::ok()) {
+                    Ok(server) => break server,
+                    Err(e) if e.kind() == io::ErrorKind::AddrInUse => thread::yield_now(),
+                    Err(e) => panic!("round {round}: launch failed: {e}"),
+                }
+            };
+            dropper.join().expect("drop thread");
+            if send(&sock, &Request::new(Command::List), Duration::from_secs(2)).is_err() {
+                // Its `Drop` would wait forever on an accept() nobody can reach.
+                std::mem::forget(next);
+                panic!("round {round}: the new server is not reachable at its path");
             }
         }
     }
@@ -323,15 +364,53 @@ mod tests {
 
         let mut stream = UnixStream::connect(server.path()).expect("connect");
         stream.set_write_timeout(Some(Duration::from_secs(5))).expect("timeout");
-        let big = vec![b'a'; MAX_LINE_BYTES + 10];
-        stream.write_all(&big).expect("write");
-        stream.write_all(b"\n").expect("write newline");
-        stream.shutdown(std::net::Shutdown::Write).expect("shutdown write");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        let mut line = vec![b'a'; MAX_LINE_BYTES + 10];
+        line.push(b'\n');
+        // The server answers and hangs up once it has read past the cap, which can be before the
+        // rest of this write or the shutdown (EPIPE / ENOTCONN on macOS): only the answer counts.
+        let hung_up = |e: &io::Error| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected | io::ErrorKind::ConnectionReset
+            )
+        };
+        if let Err(e) = stream.write_all(&line) {
+            assert!(hung_up(&e), "write: {e}");
+        }
+        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+            assert!(hung_up(&e), "shutdown write: {e}");
+        }
 
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).expect("read");
+        BufReader::new(stream).read_until(b'\n', &mut buf).expect("read");
         let resp = Response::from_line(std::str::from_utf8(&buf).unwrap()).expect("parses as a response");
         assert!(!resp.ok);
+    }
+
+    /// The server reads one line and answers without waiting for the client's half-close, so it
+    /// may hang up before `send` shuts its side down; on macOS that `shutdown` then fails with
+    /// ENOTCONN. The request was delivered and answered all the same.
+    #[test]
+    fn send_returns_the_answer_when_the_server_hangs_up_before_our_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let rounds = 100;
+        let server = thread::spawn(move || {
+            for _ in 0..rounds {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut line = Vec::new();
+                BufReader::new(&stream).read_until(b'\n', &mut line).expect("read request");
+                (&stream).write_all(Response::ok().to_line().as_bytes()).expect("answer");
+            } // each stream is dropped right after answering, whatever the client is doing
+        });
+        for round in 0..rounds {
+            let resp = send(&sock, &Request::new(Command::List), Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+            assert!(resp.ok);
+        }
+        server.join().expect("server thread");
     }
 
     #[test]

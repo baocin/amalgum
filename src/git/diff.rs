@@ -135,8 +135,8 @@ fn dequote_path(raw: &str) -> String {
     }
 }
 
-/// Parse a `--- `/`+++ `/binary-line path field with its `a/`/`b/` prefix: `/dev/null` → `None`,
-/// otherwise the dequoted path with `prefix` stripped if present.
+/// Parse a `--- `/`+++ ` path field with its `a/`/`b/` prefix: `/dev/null` → `None`, otherwise
+/// the dequoted path with `prefix` stripped if present.
 fn parse_prefixed_path(raw: &str, prefix: &str) -> Option<String> {
     let raw = raw.trim();
     if raw == "/dev/null" {
@@ -467,20 +467,29 @@ pub fn patch_for(file: &FileDiff, hunk: usize, sel: &Selection, reverse: bool) -
 /// file in place, under its name in the index or worktree being patched (the diff's old side
 /// forward, its new side under `-R`), with a plain `a/P b/P` header. A rename, copy, or mode
 /// change belongs to the whole file, not to a hunk or line range, and a partial selection of a
-/// new or deleted file keeps the file. `None` if that name is missing or lacks its `a/`/`b/`
-/// prefix.
+/// new or deleted file keeps the file. `None` if a name the patch uses is missing or lacks its
+/// `a/`/`b/` prefix: the kept header's `---` and `+++` names (`/dev/null` aside), or the one
+/// name a rewritten header is built from.
 fn patch_header(file: &FileDiff, reverse: bool, whole_file: bool) -> Option<Vec<u8>> {
     let (is_new, is_deleted) = (file.old_path.is_none(), file.new_path.is_none());
     let (target_lacks_file, removes_file) = if reverse { (is_deleted, is_new) } else { (is_new, is_deleted) };
     if target_lacks_file || (removes_file && whole_file) {
-        return Some(file.header.clone());
+        let prefixed = |marker: &[u8], side: &[u8]| {
+            header_name(&file.header, marker)
+                .is_some_and(|n| n == b"/dev/null" || n.strip_prefix(b"\"").unwrap_or(n).starts_with(side))
+        };
+        return (prefixed(b"--- ", b"a/") && prefixed(b"+++ ", b"b/")).then(|| file.header.clone());
     }
-    let marker: &[u8] = if reverse { b"+++ " } else { b"--- " };
-    let name = file.header.split(|&b| b == b'\n').find_map(|l| l.strip_prefix(marker))?;
-    // git ends a `---`/`+++` name that contains a space with a tab.
-    let name = name.strip_suffix(b"\t").unwrap_or(name);
+    let name = header_name(&file.header, if reverse { b"+++ " } else { b"--- " })?;
     let (a, b) = (with_side_prefix(name, b'a')?, with_side_prefix(name, b'b')?);
     Some([&b"diff --git "[..], &a, b" ", &b, b"\n--- ", &a, b"\n+++ ", &b, b"\n"].concat())
+}
+
+/// The name on `header`'s line starting with `marker` (`--- ` or `+++ `), as git prints it.
+fn header_name<'h>(header: &'h [u8], marker: &[u8]) -> Option<&'h [u8]> {
+    let name = header.split(|&b| b == b'\n').find_map(|l| l.strip_prefix(marker))?;
+    // git ends a `---`/`+++` name that contains a space with a tab.
+    Some(name.strip_suffix(b"\t").unwrap_or(name))
 }
 
 /// A header name as git prints it (`a/X`, `b/X`, or quoted `"a/X"`) with its side set to `side`.
@@ -1405,6 +1414,43 @@ mod tests {
                     @@ -1,1 +1,1 @@\n-a\n+b\n";
         let files = parse(diff.as_bytes());
         assert_eq!(patch_for(&files[0], 0, &Selection::WholeHunk, false), None);
+    }
+
+    #[test]
+    fn patch_for_refuses_a_kept_new_or_deleted_file_header_without_side_prefixes() {
+        // Regression: the diff's own header, kept to create or delete the file, went out
+        // unchecked, so `git apply` would create or delete a top-level `x.rs`.
+        for (new_side, deleted_side) in [("src/x.rs", "src/x.rs"), ("w/src/x.rs", "i/src/x.rs")] {
+            let new_file = format!(
+                "diff --git src/x.rs src/x.rs\nnew file mode 100644\nindex 0000000..1111111\n\
+                 --- /dev/null\n+++ {new_side}\n@@ -0,0 +1,2 @@\n+a\n+b\n"
+            );
+            let files = parse(new_file.as_bytes());
+            assert_eq!(files[0].old_path, None);
+            assert_eq!(
+                patch_for(&files[0], 0, &Selection::Lines(0..=0), false),
+                None,
+                "stage part: {new_side}"
+            );
+            assert_eq!(patch_for(&files[0], 0, &Selection::WholeHunk, true), None, "unstage all: {new_side}");
+
+            let deleted_file = format!(
+                "diff --git src/x.rs src/x.rs\ndeleted file mode 100644\nindex 1111111..0000000\n\
+                 --- {deleted_side}\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n"
+            );
+            let files = parse(deleted_file.as_bytes());
+            assert_eq!(files[0].new_path, None);
+            assert_eq!(
+                patch_for(&files[0], 0, &Selection::WholeHunk, false),
+                None,
+                "stage all: {deleted_side}"
+            );
+            assert_eq!(
+                patch_for(&files[0], 0, &Selection::Lines(0..=0), true),
+                None,
+                "discard part: {deleted_side}"
+            );
+        }
     }
 
     #[test]

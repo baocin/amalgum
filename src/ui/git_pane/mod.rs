@@ -529,32 +529,26 @@ impl GitPane {
         let Some(entry) = peeked else {
             return; // nothing recorded yet; `journal.undo/redo` would say NothingToDo anyway
         };
-        let guard = if is_undo { &entry.after } else { &entry.before };
-        let touched: Vec<String> = guard.refs.keys().cloned().collect();
-        let want_stashes = !guard.stashes.is_empty();
+        // What both snapshots depend on: the guard checks one, and after a failed run the journal
+        // re-reads the repo to check whether it reached the other anyway.
+        let mut touched: Vec<String> =
+            entry.before.refs.keys().chain(entry.after.refs.keys()).cloned().collect();
+        touched.sort();
+        touched.dedup();
+        let want_stashes = !entry.before.stashes.is_empty() || !entry.after.stashes.is_empty();
         self.undo_busy = true;
         let journal = std::mem::take(&mut self.journal);
         let git = self.git.clone();
         jobs::spawn(ctx, &self.tx, move || {
-            let (head, branch) = worker::head_and_branch(&git);
-            let mut refs = BTreeMap::new();
-            for name in &touched {
-                if let Ok(out) = git.run(&["rev-parse", name]) {
-                    refs.insert(name.clone(), String::from_utf8_lossy(&out).trim().to_string());
-                }
-            }
-            let stashes = if want_stashes {
-                git.run(STASH_ARGS)
-                    .map(|o| gitrefs::parse_stashes(&o).into_iter().map(|s| s.oid).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let current = crate::git::journal::Snapshot { head, branch, refs, stashes };
+            let snapshot = || worker::read_snapshot(&git, &touched, want_stashes);
+            let current = snapshot();
             let mut journal = journal;
-            // The journal marks the entry undone/redone only if the plan succeeds.
             let run = |plan: &crate::git::journal::Plan| worker::run_plan(&git, plan);
-            let result = if is_undo { journal.undo(&current, run) } else { journal.redo(&current, run) };
+            let result = if is_undo {
+                journal.undo(&current, run, snapshot)
+            } else {
+                journal.redo(&current, run, snapshot)
+            };
             let outcome = worker::JournalRunOutcome { journal, result };
             if is_undo { Reply::Undo(outcome) } else { Reply::Redo(outcome) }
         });
@@ -582,6 +576,13 @@ impl GitPane {
                     e.stderr.clone(),
                 )));
                 self.refresh_now(ctx); // a plan of several commands may have stopped part-way
+            }
+            Err(Failed::AppliedWithError(e)) => {
+                events.push(GitEvent::Toast(Toast::warning(
+                    format!("The {action} took effect, but git reported: {}", e.summary()),
+                    e.stderr.clone(),
+                )));
+                self.refresh_now(ctx);
             }
         }
     }

@@ -45,7 +45,8 @@ pub fn open_terminal_at(path: &Path) -> io::Result<()> {
     os::open_terminal_at(path)
 }
 
-/// Link the running executable onto `$PATH` as `amalgum` (§5.31). Returns the link path.
+/// Link the running executable (inside an AppImage, the AppImage file, which outlives the mount
+/// the executable runs from) onto `$PATH` as `amalgum` (§5.31). Returns the link path.
 /// Only an older symlink is replaced: a path that already reaches the executable is left as it
 /// is, and any other file there is an `AlreadyExists` error.
 pub fn install_cli_shim() -> io::Result<PathBuf> {

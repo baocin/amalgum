@@ -7,7 +7,7 @@ use crate::git::cmd::{Git, GitError};
 use crate::git::diff::{FileChange, FileDiff};
 use crate::git::journal::{self, Entry as JournalEntry, Plan, Refused, Snapshot};
 use crate::git::log::Commit;
-use crate::git::refs::{Ref, Remote, Stash, Worktree};
+use crate::git::refs::{Ref, Remote, STASH_ARGS, Stash, Worktree};
 use crate::git::status::{RepoOp, Status};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -74,16 +74,40 @@ pub(super) enum Reply {
     Redo(JournalRunOutcome),
 }
 
-/// `git rev-parse HEAD` and `git symbolic-ref --short -q HEAD`, tolerating an unborn HEAD
-/// (`None`) or a detached one (`branch: None`).
+/// `git rev-parse HEAD` and the branch name from `git symbolic-ref -q HEAD`, tolerating an
+/// unborn HEAD (`None`) or a detached one (`branch: None`). The name is the full ref minus
+/// `refs/heads/`, as `git checkout` takes it and as checkout entries record it: `--short` would
+/// print `heads/v1` for a branch `v1` when a tag `v1` also exists.
 pub(super) fn head_and_branch(git: &Git) -> (Option<String>, Option<String>) {
     let head = git.run(&["rev-parse", "HEAD"]).ok().map(|o| String::from_utf8_lossy(&o).trim().to_string());
     let branch = git
-        .run(&["symbolic-ref", "--short", "-q", "HEAD"])
+        .run(&["symbolic-ref", "-q", "HEAD"])
         .ok()
         .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+        .map(|r| r.strip_prefix("refs/heads/").map(str::to_string).unwrap_or(r))
         .filter(|b| !b.is_empty());
     (head, branch)
+}
+
+/// The repo's state for the journal guard (§5.18): HEAD and its branch, the hash of each ref in
+/// `refs` (a ref that doesn't resolve is left out), and the stash list if `stashes`.
+pub(super) fn read_snapshot(git: &Git, refs: &[String], stashes: bool) -> Snapshot {
+    let (head, branch) = head_and_branch(git);
+    let refs = refs
+        .iter()
+        .filter_map(|name| {
+            let out = git.run(&["rev-parse", name]).ok()?;
+            Some((name.clone(), String::from_utf8_lossy(&out).trim().to_string()))
+        })
+        .collect();
+    let stashes = if stashes {
+        git.run(STASH_ARGS)
+            .map(|o| crate::git::refs::parse_stashes(&o).into_iter().map(|s| s.oid).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Snapshot { head, branch, refs, stashes }
 }
 
 /// A short (7-char) hash for descriptions and labels; shorter inputs pass through unchanged.
@@ -374,6 +398,81 @@ mod tests {
         let mut git = Git::new(crate::git::Location::Local { path: repo.path().to_path_buf() });
         git.git_bin = "amalgum-git-binary-that-does-not-exist".to_string();
         assert!(diff_no_index(&git, "notes.txt").is_err());
+    }
+
+    // ---- undo/redo against real git -----------------------------------------------------------
+
+    fn local_git(repo: &crate::testutil::TempRepo) -> Git {
+        Git::new(crate::git::Location::Local { path: repo.path().to_path_buf() })
+    }
+
+    /// `git checkout <target>` through `git`, journaled the way `start_checkout` does it.
+    fn journaled_checkout(git: &Git, j: &mut journal::Journal, target: &str) {
+        let (before_head, before_branch) = head_and_branch(git);
+        git.run(&["checkout", target]).expect("checkout");
+        let (after_head, _) = head_and_branch(git);
+        j.record(checkout_entry(
+            0,
+            before_head.expect("HEAD"),
+            before_branch,
+            target,
+            after_head.expect("HEAD"),
+        ));
+    }
+
+    #[test]
+    fn undo_and_redo_checkout_of_a_branch_named_like_a_tag() {
+        // Regression: `symbolic-ref --short` disambiguates a branch `v1` as `heads/v1` when a tag
+        // `v1` exists, so the guard never saw the journaled `v1` (undo refused: `HEAD` moved),
+        // and an inverse `checkout heads/v1` detached HEAD instead of returning to the branch.
+        let mut repo = crate::testutil::TempRepo::new();
+        repo.commit("first");
+        repo.git(&["branch", "v1"]);
+        repo.git(&["tag", "v1"]);
+        let git = local_git(&repo);
+        let snapshot = || read_snapshot(&git, &[], false);
+        let run = |plan: &Plan| run_plan(&git, plan);
+        let mut j = journal::Journal::default();
+
+        journaled_checkout(&git, &mut j, "v1");
+        assert_eq!(head_and_branch(&git).1.as_deref(), Some("v1"));
+        j.undo(&snapshot(), run, snapshot).expect("undo passes the guard");
+        assert_eq!(head_and_branch(&git).1.as_deref(), Some("main"));
+        j.redo(&snapshot(), run, snapshot).expect("redo passes the guard");
+        assert_eq!(head_and_branch(&git).1.as_deref(), Some("v1"));
+
+        journaled_checkout(&git, &mut j, "main");
+        j.undo(&snapshot(), run, snapshot).expect("undo passes the guard");
+        assert_eq!(head_and_branch(&git).1.as_deref(), Some("v1"), "back on the branch, not detached");
+    }
+
+    #[test]
+    fn undo_checkout_whose_post_checkout_hook_fails_still_marks_the_entry() {
+        // `git checkout` switches, then exits with the post-checkout hook's status. The repo is
+        // in the entry's `before`, so the entry must be undone, or Mod+Z is refused from then on.
+        let mut repo = crate::testutil::TempRepo::new();
+        repo.commit("first");
+        repo.git(&["branch", "feat"]);
+        let git = local_git(&repo);
+        let snapshot = || read_snapshot(&git, &[], false);
+        let run = |plan: &Plan| run_plan(&git, plan);
+        let mut j = journal::Journal::default();
+        journaled_checkout(&git, &mut j, "feat");
+
+        let hooks = repo.path().join("failing-hooks");
+        let hook = repo.write("failing-hooks/post-checkout", "#!/bin/sh\nexit 1\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        repo.git(&["config", "core.hooksPath", &hooks.display().to_string()]);
+
+        let result = j.undo(&snapshot(), run, snapshot);
+        assert!(matches!(result, Err(journal::Failed::AppliedWithError(_))), "{:?}", result.err());
+        assert_eq!(head_and_branch(&git).1.as_deref(), Some("main"));
+        assert_eq!(j.peek_undo(), None);
+        assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("checkout feat"));
     }
 
     #[test]

@@ -180,30 +180,34 @@ impl Query {
         true
     }
 
-    /// `git log` filters for remote workspaces (no local index) that git can express *exactly*:
-    /// `--author`, `--grep` for `msg:` terms (both `--fixed-strings --regexp-ignore-case`, so
-    /// they match the same way [`contains_ci`] does locally), `--before/--after` as explicit
-    /// UTC instants, `-- <paths>`. Plain words are deliberately left out: they also match
-    /// hash/branch/tag names and changed file paths (§5.8), which `--grep` cannot see, so —
-    /// like hash/branch/tag filters — they are left entirely to [`Query::matches`] on whatever
-    /// commits this fetches.
+    /// `git log` filters for remote workspaces (no local index), narrowing what is fetched for
+    /// [`Query::matches`] to refine. `author:`, `msg:`, and `path:` terms are case-insensitive
+    /// substring filters as they are locally (`--author` and `--grep` with `--fixed-strings
+    /// --regexp-ignore-case`, and `-- <pathspecs>` from [`path_pathspec`]), and `before:`/`after:`
+    /// are `--before/--after` at explicit UTC instants. Only ASCII terms are sent: git folds
+    /// ASCII case alone (`Git::run` sets `LC_ALL=C`) where [`contains_ci`] folds Unicode case, so
+    /// git would drop commits that `matches` accepts. Plain words are deliberately left out too:
+    /// they also match hash/branch/tag names and changed file paths (§5.8), which `--grep` cannot
+    /// see, so — like hash/branch/tag filters — they are left entirely to [`Query::matches`].
     pub fn git_log_args(&self) -> Vec<String> {
+        fn ascii(terms: &[String]) -> Vec<&str> {
+            terms.iter().map(String::as_str).filter(|t| t.is_ascii()).collect()
+        }
+        let (author, msg, path) = (ascii(&self.author), ascii(&self.msg), ascii(&self.path));
         let mut args = Vec::new();
 
-        if !self.author.is_empty() || !self.msg.is_empty() {
+        if !author.is_empty() || !msg.is_empty() {
             args.push("--fixed-strings".to_string());
-        }
-        if !self.msg.is_empty() {
             args.push("--regexp-ignore-case".to_string());
         }
-        for a in &self.author {
+        for a in &author {
             args.push(format!("--author={a}"));
         }
-        if !self.msg.is_empty() {
-            if self.msg.len() > 1 {
+        if !msg.is_empty() {
+            if msg.len() > 1 {
                 args.push("--all-match".to_string());
             }
-            for term in &self.msg {
+            for term in &msg {
                 args.push(format!("--grep={term}"));
             }
         }
@@ -218,12 +222,28 @@ impl Query {
             args.push(format!("--after={} 00:00:00 +0000", format_ymd(after)));
         }
 
-        if !self.path.is_empty() {
+        if !path.is_empty() {
             args.push("--".to_string());
-            args.extend(self.path.iter().cloned());
+            args.extend(path.into_iter().map(path_pathspec));
         }
         args
     }
+}
+
+/// A pathspec matching every path that contains `term`, ignoring case, like a local `path:`
+/// filter: a plain `-- <term>` would be an anchored, case-sensitive prefix. `icase` magic
+/// folds (ASCII) case; the pattern is `*term*` with the term's own wildcard characters escaped, and
+/// outside `glob` magic git's `*` also matches `/`.
+fn path_pathspec(term: &str) -> String {
+    let mut spec = String::from(":(icase)*");
+    for c in term.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[') {
+            spec.push('\\');
+        }
+        spec.push(c);
+    }
+    spec.push('*');
+    spec
 }
 
 /// Inverse of `util::parse_date`: Unix seconds (UTC midnight) → `YYYY-MM-DD`.
@@ -399,7 +419,10 @@ mod tests {
     #[test]
     fn git_log_args_basic() {
         let q = Query::parse("author:mp path:src/auth");
-        assert_eq!(q.git_log_args(), vec!["--fixed-strings", "--author=mp", "--", "src/auth"]);
+        assert_eq!(
+            q.git_log_args(),
+            vec!["--fixed-strings", "--regexp-ignore-case", "--author=mp", "--", ":(icase)*src/auth*"]
+        );
     }
 
     #[test]
@@ -431,7 +454,12 @@ mod tests {
         let q = Query::parse("before:2024-06-01 after:2024-01-15 path:src");
         assert_eq!(
             q.git_log_args(),
-            vec!["--before=2024-06-01 00:00:00 +0000", "--after=2024-01-15 00:00:00 +0000", "--", "src"]
+            vec![
+                "--before=2024-06-01 00:00:00 +0000",
+                "--after=2024-01-15 00:00:00 +0000",
+                "--",
+                ":(icase)*src*"
+            ]
         );
     }
 
@@ -506,6 +534,84 @@ mod tests {
         cmd.extend(before_args.iter().map(String::as_str));
         let out = repo.git_raw(&cmd);
         assert!(out.split(|&b| b == 0).all(|r| r.is_empty()));
+    }
+
+    /// `git log -z --format=%H` plus `q`'s filter args in `repo`, newest first.
+    fn remote_search(repo: &TempRepo, q: &str) -> Vec<String> {
+        let filter_args = Query::parse(q).git_log_args();
+        let mut cmd: Vec<&str> = vec!["log", "-z", "--format=%H"];
+        cmd.extend(filter_args.iter().map(String::as_str));
+        let out = repo.git_raw(&cmd);
+        out.split(|&b| b == 0)
+            .filter(|r| !r.is_empty())
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn git_log_args_author_alone_is_case_insensitive_against_real_git() {
+        // Regression: `--regexp-ignore-case` was only sent along with `msg:` terms, so an
+        // author-only query was case-sensitive in git and dropped commits `matches` accepts.
+        // TempRepo commits as "Ada Tester <ada@example.com>".
+        let mut repo = TempRepo::new();
+        let hash = repo.commit("first");
+        assert_eq!(remote_search(&repo, "author:tester"), vec![hash.clone()]);
+        assert_eq!(remote_search(&repo, "author:tester msg:FIRST"), vec![hash]);
+    }
+
+    #[test]
+    fn git_log_args_path_is_a_case_insensitive_substring_against_real_git() {
+        // Regression: `-- <path>` is an anchored, case-sensitive pathspec, so `path:auth` found
+        // nothing for a change to `src/Auth/login.rs`, which `matches` accepts.
+        let mut repo = TempRepo::new();
+        let auth = repo.commit_file("src/Auth/login.rs", "a", "auth");
+        repo.commit_file("README.md", "b", "readme");
+        assert_eq!(remote_search(&repo, "path:auth"), vec![auth.clone()]);
+        assert_eq!(remote_search(&repo, "path:C/AUTH/L"), vec![auth]);
+    }
+
+    #[test]
+    fn git_log_args_non_ascii_terms_do_not_drop_commits_against_real_git() {
+        // Regression: git folds only ASCII case under `LC_ALL=C` (as `Git::run` sets it), while
+        // `contains_ci` folds Unicode case, so a non-ASCII term sent to git dropped commits that
+        // `matches` accepts.
+        let mut repo = TempRepo::new();
+        repo.write("src/Äuth/x.rs", "a");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "Été fix", "--author=Élodie Ürban <elodie@example.com>"]);
+        let hash = repo.git(&["rev-parse", "HEAD"]);
+        repo.commit("unrelated");
+        for q in ["author:élodie", "author:ÜRBAN", "msg:été", "path:äuth"] {
+            assert!(remote_search(&repo, q).contains(&hash), "{q}");
+        }
+        // The ASCII terms of the same query still narrow git's output.
+        assert_eq!(remote_search(&repo, "author:élodie msg:FIX path:äuth"), vec![hash]);
+    }
+
+    #[test]
+    fn git_log_args_leave_non_ascii_terms_to_matches() {
+        let q = Query::parse("author:élodie author:ada msg:été msg:fix path:äuth path:src");
+        assert_eq!(
+            q.git_log_args(),
+            vec![
+                "--fixed-strings",
+                "--regexp-ignore-case",
+                "--author=ada",
+                "--grep=fix",
+                "--",
+                ":(icase)*src*"
+            ]
+        );
+        assert!(Query::parse("author:élodie msg:été path:äuth").git_log_args().is_empty());
+    }
+
+    #[test]
+    fn git_log_args_path_glob_characters_are_literal_against_real_git() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("w.txt", "a", "plain");
+        let brackets = repo.commit_file("[w]*?.txt", "b", "brackets");
+        assert_eq!(remote_search(&repo, "path:[w]*?"), vec![brackets]);
+        assert!(remote_search(&repo, "path:w*x").is_empty(), "`*` must not act as a wildcard");
     }
 
     #[test]

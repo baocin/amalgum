@@ -7,7 +7,8 @@
 //! branch HEAD is on, the refs the entry touched, and the stash list if it recorded one — (and
 //! redo only if it matches `before`); otherwise the repo moved underneath us (a terminal or an
 //! agent ran git) and the caller shows "Can't undo: `main` has moved since. Open reflog?".
-//! An entry is marked undone (or redone) only once its plan has run successfully.
+//! An entry is marked undone (or redone) once its plan has run successfully, or when a command
+//! of the plan failed but re-reading the repo finds it in the state the plan leads to anyway.
 //! Recording a new operation discards any undone entries (the redo tail).
 
 use serde::{Deserialize, Serialize};
@@ -55,15 +56,19 @@ pub enum Refused {
     Moved(String),
 }
 
-/// Why [`Journal::undo`] or [`Journal::redo`] did not complete. Either way the entry keeps its
-/// undone state, so the same action can be retried.
+/// Why [`Journal::undo`] or [`Journal::redo`] reports an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failed<E> {
-    /// Refused before anything ran.
+    /// Refused before anything ran. The entry keeps its undone state.
     Refused(Refused),
-    /// A command of the plan failed. A multi-command plan may have stopped part-way, in which
-    /// case the guard refuses the next attempt.
+    /// A command of the plan failed and the repo is not in the state the plan leads to. The
+    /// entry keeps its undone state, so the same action can be retried; a multi-command plan
+    /// may have stopped part-way, in which case the guard refuses the next attempt.
     Run(E),
+    /// A command of the plan failed, yet the repo is in the state the plan leads to (and no
+    /// longer in the one it started from): `git checkout` exits with a failing `post-checkout`
+    /// hook's status after switching, say. The entry was marked like after a success.
+    AppliedWithError(E),
 }
 
 impl<E> From<Refused> for Failed<E> {
@@ -122,9 +127,12 @@ impl Journal {
         Some(start)
     }
     /// `Mod+Z`: check the guard against `current`, hand the inverse plan of the entry
-    /// [`Journal::peek_undo`] names to `run`, and mark that entry undone only if `run` succeeds.
-    /// A failed command (an agent holding a lock, say) leaves the journal as it was, so the
-    /// undo can be retried.
+    /// [`Journal::peek_undo`] names to `run`, and mark that entry undone if `run` succeeds.
+    /// When it fails, `reread` snapshots the repo again (the same refs and stash list as
+    /// `current`): a command can exit non-zero after its change took effect, so the entry is
+    /// still marked, as [`Failed::AppliedWithError`], if the repo now matches its `before` and
+    /// no longer its `after`. Otherwise (an agent holding a lock, say) the journal is left as it
+    /// was, so the undo can be retried.
     ///
     /// The spec (§5.18) says undo runs "if `before` still matches", but that reads as shorthand
     /// for "the repo is still in the state the operation produced": undo replays the *inverse* of
@@ -137,6 +145,7 @@ impl Journal {
         &mut self,
         current: &Snapshot,
         run: impl FnOnce(&Plan) -> Result<(), E>,
+        reread: impl FnOnce() -> Snapshot,
     ) -> Result<(), Failed<E>> {
         let idx = self.entries.iter().rposition(|e| !e.undone).ok_or(Refused::NothingToDo)?;
         let entry = &self.entries[idx];
@@ -146,25 +155,51 @@ impl Journal {
         if let Some(name) = mismatch(&entry.after, current) {
             return Err(Refused::Moved(name).into());
         }
-        run(inverse).map_err(Failed::Run)?;
-        self.entries[idx].undone = true;
-        Ok(())
+        let result = run(inverse);
+        self.settle(idx, true, result, reread)
     }
     /// `Mod+Shift+Z`: like [`Journal::undo`], for the entry [`Journal::peek_redo`] names, guarded
-    /// against its `before` snapshot and running its forward plan.
+    /// against its `before` snapshot and running its forward plan (so a failed run still marks
+    /// the entry redone if the repo reached its `after`).
     pub fn redo<E>(
         &mut self,
         current: &Snapshot,
         run: impl FnOnce(&Plan) -> Result<(), E>,
+        reread: impl FnOnce() -> Snapshot,
     ) -> Result<(), Failed<E>> {
         let idx = self.redo_run_start().ok_or(Refused::NothingToDo)?;
         let entry = &self.entries[idx];
         if let Some(name) = mismatch(&entry.before, current) {
             return Err(Refused::Moved(name).into());
         }
-        run(&entry.forward).map_err(Failed::Run)?;
-        self.entries[idx].undone = false;
-        Ok(())
+        let result = run(&entry.forward);
+        self.settle(idx, false, result, reread)
+    }
+    /// Sets entry `idx`'s `undone` flag to `undone` after its plan ran with `result`: always on
+    /// success; on failure only if `reread` finds the repo in the snapshot the plan leads to
+    /// (`before` for an undo, `after` for a redo) and no longer in the one it started from.
+    fn settle<E>(
+        &mut self,
+        idx: usize,
+        undone: bool,
+        result: Result<(), E>,
+        reread: impl FnOnce() -> Snapshot,
+    ) -> Result<(), Failed<E>> {
+        let failed = match result {
+            Ok(()) => None,
+            Err(e) => {
+                let entry = &self.entries[idx];
+                let (target, start) =
+                    if undone { (&entry.before, &entry.after) } else { (&entry.after, &entry.before) };
+                let now = reread();
+                if mismatch(target, &now).is_some() || mismatch(start, &now).is_none() {
+                    return Err(Failed::Run(e));
+                }
+                Some(Failed::AppliedWithError(e))
+            }
+        };
+        self.entries[idx].undone = undone;
+        failed.map_or(Ok(()), Err)
     }
     /// Newest first, for the Undo panel.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
@@ -260,26 +295,28 @@ mod tests {
     /// Undo with a runner that always succeeds; returns the plan it was handed.
     fn undo_ok(j: &mut Journal, current: &Snapshot) -> Result<Plan, Refused> {
         let mut ran = Plan::new();
-        match j.undo(current, |plan| -> Result<(), Infallible> {
+        let run = |plan: &Plan| -> Result<(), Infallible> {
             ran = plan.clone();
             Ok(())
-        }) {
+        };
+        match j.undo(current, run, || unreachable!("the run never fails")) {
             Ok(()) => Ok(ran),
             Err(Failed::Refused(refused)) => Err(refused),
-            Err(Failed::Run(never)) => match never {},
+            Err(Failed::Run(never) | Failed::AppliedWithError(never)) => match never {},
         }
     }
 
     /// Redo with a runner that always succeeds; returns the plan it was handed.
     fn redo_ok(j: &mut Journal, current: &Snapshot) -> Result<Plan, Refused> {
         let mut ran = Plan::new();
-        match j.redo(current, |plan| -> Result<(), Infallible> {
+        let run = |plan: &Plan| -> Result<(), Infallible> {
             ran = plan.clone();
             Ok(())
-        }) {
+        };
+        match j.redo(current, run, || unreachable!("the run never fails")) {
             Ok(()) => Ok(ran),
             Err(Failed::Refused(refused)) => Err(refused),
-            Err(Failed::Run(never)) => match never {},
+            Err(Failed::Run(never) | Failed::AppliedWithError(never)) => match never {},
         }
     }
 
@@ -299,7 +336,10 @@ mod tests {
         let mut j = Journal::default();
         j.record(entry("commit a", "h0", "h1"));
 
-        assert_eq!(j.undo(&snap("h1"), |_| Err("index.lock exists")), Err(Failed::Run("index.lock exists")));
+        assert_eq!(
+            j.undo(&snap("h1"), |_| Err("index.lock exists"), || snap("h1")),
+            Err(Failed::Run("index.lock exists"))
+        );
         assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("commit a"));
         assert_eq!(j.peek_redo(), None, "nothing was undone, so nothing to redo");
 
@@ -313,11 +353,48 @@ mod tests {
         j.record(entry("commit a", "h0", "h1"));
         undo_ok(&mut j, &snap("h1")).expect("undo succeeds");
 
-        assert_eq!(j.redo(&snap("h0"), |_| Err("index.lock exists")), Err(Failed::Run("index.lock exists")));
+        assert_eq!(
+            j.redo(&snap("h0"), |_| Err("index.lock exists"), || snap("h0")),
+            Err(Failed::Run("index.lock exists"))
+        );
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit a"));
         assert_eq!(j.peek_undo(), None);
 
         assert!(redo_ok(&mut j, &snap("h0")).is_ok());
+    }
+
+    #[test]
+    fn failed_undo_that_reached_before_anyway_marks_the_entry_undone() {
+        // `git checkout main` switched, then exited 1 with a failing post-checkout hook.
+        let mut j = Journal::default();
+        j.record(entry("checkout feat", "h0", "h1"));
+
+        let result = j.undo(&snap("h1"), |_| Err("post-checkout hook failed"), || snap("h0"));
+        assert_eq!(result, Err(Failed::AppliedWithError("post-checkout hook failed")));
+        assert_eq!(j.peek_undo(), None, "the repo is in `before`: the entry is undone");
+        assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("checkout feat"));
+
+        let result = j.redo(&snap("h0"), |_| Err("post-checkout hook failed"), || snap("h1"));
+        assert_eq!(result, Err(Failed::AppliedWithError("post-checkout hook failed")));
+        assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("checkout feat"));
+        assert_eq!(j.peek_redo(), None);
+    }
+
+    #[test]
+    fn failed_run_is_not_marked_when_before_and_after_look_alike() {
+        // A stash pop that failed on a conflict keeps the stash: the repo still matches `after`
+        // (and `before`, which recorded no stash list), so nothing shows the undo took effect.
+        let mut j = Journal::default();
+        let mut e = entry("stash push", "h1", "h1");
+        e.after.stashes = vec!["s1".to_string()];
+        e.inverse = Some(vec![vec!["stash".to_string(), "pop".to_string()]]);
+        j.record(e);
+        let mut current = snap("h1");
+        current.stashes = vec!["s1".to_string()];
+
+        let result = j.undo(&current, |_| Err("conflict"), || current.clone());
+        assert_eq!(result, Err(Failed::Run("conflict")));
+        assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("stash push"));
     }
 
     #[test]
@@ -574,7 +651,7 @@ mod tests {
         });
 
         // The UI's current snapshot matches `after`: undo is allowed.
-        j.undo(&snap(&h1), |plan| run_in(&repo, plan))
+        j.undo(&snap(&h1), |plan| run_in(&repo, plan), || unreachable!("the reset succeeds"))
             .expect("undo succeeds against the real post-commit state");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]), h0, "HEAD moved back to the pre-commit hash");
 
@@ -610,10 +687,11 @@ mod tests {
     /// builds its guard snapshot.
     fn real_snapshot(repo: &crate::testutil::TempRepo) -> Snapshot {
         let branch = crate::testutil::hermetic_git(repo.path())
-            .args(["symbolic-ref", "--short", "-q", "HEAD"])
+            .args(["symbolic-ref", "-q", "HEAD"])
             .output()
             .expect("spawn git");
         let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        let branch = branch.strip_prefix("refs/heads/").map(str::to_string).unwrap_or(branch);
         Snapshot {
             head: Some(repo.git(&["rev-parse", "HEAD"])),
             branch: (!branch.is_empty()).then_some(branch),
@@ -655,13 +733,14 @@ mod tests {
 
         let lock = repo.path().join(".git").join("refs").join("heads").join("main.lock");
         std::fs::write(&lock, "").expect("take the lock");
-        let result = j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan));
+        let result = j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan), || real_snapshot(&repo));
         assert!(matches!(&result, Err(Failed::Run(stderr)) if stderr.contains("main.lock")), "{result:?}");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]), h1, "nothing moved");
         assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("commit second"));
 
         std::fs::remove_file(&lock).expect("release the lock");
-        j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan)).expect("the retry succeeds");
+        j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan), || real_snapshot(&repo))
+            .expect("the retry succeeds");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]), h0);
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit second"));
     }

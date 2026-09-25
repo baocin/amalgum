@@ -251,11 +251,12 @@ pub fn run(cmd: Cmd, env: &Env, stdin: &mut dyn Read, out: &mut dyn Write) -> i3
 /// codes and §5.31 ("notification-type commands always exit 0"). Returns the raw [`Response`]
 /// too, for subcommands (`list`) that render its `data`.
 fn dispatch(cmd: protocol::Command, env: &Env) -> (i32, Option<protocol::Response>) {
+    let request = protocol::Request::new(cmd);
+    let notification = request.cmd.is_notification();
     let Some(sock) = resolve_sock(env) else {
-        return (handle_no_app(&cmd, env), None);
+        return (handle_no_app(&request, env), None);
     };
-    let request = protocol::Request::new(cmd.clone());
-    let timeout = if cmd.is_notification() { NOTIFY_TIMEOUT } else { QUERY_TIMEOUT };
+    let timeout = if notification { NOTIFY_TIMEOUT } else { QUERY_TIMEOUT };
     match socket::send(&sock, &request, timeout) {
         Ok(resp) => {
             if resp.ok {
@@ -264,17 +265,21 @@ fn dispatch(cmd: protocol::Command, env: &Env) -> (i32, Option<protocol::Respons
                 if let Some(err) = &resp.error {
                     eprintln!("{err}");
                 }
-                (if cmd.is_notification() { 0 } else { 1 }, Some(resp))
+                (if notification { 0 } else { 1 }, Some(resp))
             }
         }
-        Err(e) if is_connect_failure(&e) => (handle_no_app(&cmd, env), None),
+        Err(e) if is_connect_failure(&e) => (handle_no_app(&request, env), None),
         Err(e) => {
             eprintln!("amalgum: {e}");
             // A reverse-forwarded socket accepts even when the app behind it is gone or
             // unreachable (sshd answers the connect itself), so for an event a hang-up or a
             // timeout means "no app" just as much as a refused connect does: queue it rather
-            // than lose it. The price is a rare duplicate, if a slow app did handle it.
-            if cmd.is_notification() { (handle_no_app(&cmd, env), None) } else { (1, None) }
+            // than lose it. The app may have handled it all the same, and the next drain then
+            // replays it: a forwarded request costs about two round trips through the
+            // ControlMaster, so past ~250 ms RTT (or behind a busy master) that is every event,
+            // not a rare one. The queued copy is this very request, `ts` included, so a replay
+            // carries the event's real time, not the moment it was queued.
+            if notification { (handle_no_app(&request, env), None) } else { (1, None) }
         }
     }
 }
@@ -292,13 +297,12 @@ fn is_connect_failure(e: &std::io::Error) -> bool {
 /// What happens when there is no app to talk to: notification-type commands are queued (on a
 /// remote host) or silently dropped (locally), always exiting 0; query-type commands report
 /// the failure and exit 1.
-fn handle_no_app(cmd: &protocol::Command, env: &Env) -> i32 {
-    if cmd.is_notification() {
+fn handle_no_app(request: &protocol::Request, env: &Env) -> i32 {
+    if request.cmd.is_notification() {
         if let (Some(home), Some(sock)) = (&env.home, resolve_sock(env))
             && queue::should_queue(&sock, home)
         {
-            let request = protocol::Request::new(cmd.clone());
-            let _ = queue::append(&paths::queue_file(home), &request);
+            let _ = queue::append(&paths::queue_file(home), request);
         }
         0
     } else {
@@ -341,11 +345,13 @@ fn agent_event(agent: AgentKind, json: Option<String>, env: &Env, stdin: &mut dy
 }
 
 /// `run`'s words as the line the app types into a shell: a single word is already a command
-/// line; several are quoted one by one so the shell splits them back into the same words.
+/// line; several are quoted one by one so the shell splits them back into the same words, with
+/// nothing expanded, not even a leading `~` (the user's own shell already expanded what it
+/// meant to).
 fn shell_command_line(words: &[String]) -> String {
     match words {
         [line] => line.clone(),
-        _ => words.iter().map(|w| crate::ssh::quote(w)).collect::<Vec<_>>().join(" "),
+        _ => words.iter().map(|w| crate::ssh::quote_literal(w)).collect::<Vec<_>>().join(" "),
     }
 }
 
@@ -685,9 +691,12 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let (done, wait) = std::sync::mpsc::channel::<()>();
         let sshd = std::thread::spawn(move || {
-            let conn = listener.accept().unwrap();
+            let (conn, _) = listener.accept().unwrap();
+            let mut received = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&conn), &mut received).unwrap();
             let _ = wait.recv(); // hold the connection open, silent, until the test is done
             drop(conn);
+            received
         });
 
         let e = env(Some(home.path()), Some(sock));
@@ -695,11 +704,30 @@ mod tests {
         let (code, _) = run_cmd(Cmd::SetStatus { status: StatusArg::Idle, message: None }, &e);
         let took = started.elapsed();
         drop(done);
-        sshd.join().unwrap();
+        let received = sshd.join().unwrap();
 
         assert_eq!(code, 0);
         assert!(took < Duration::from_millis(900), "took {took:?}, over the 1 s hook budget");
-        assert_eq!(queue::drain(&paths::queue_file(home.path())).unwrap().len(), 1);
+        // Same request, `ts` included: the app may yet have handled the one it was sent.
+        let queued = queue::drain(&paths::queue_file(home.path())).unwrap();
+        assert_eq!(queued, [received.trim_end()]);
+    }
+
+    /// An event that got no answer in time may have reached the app all the same, so what is
+    /// queued is the request that was sent, not a re-stamped copy: its replay keeps the event's
+    /// real time (§5.28) instead of looking newer than what happened after it.
+    #[test]
+    fn a_queued_event_is_the_request_that_was_sent_ts_included() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = paths::remote_root(home.path()).join("run").join("app.sock");
+        let e = env(Some(home.path()), Some(sock));
+        let status =
+            Command::SetStatus { status: StatusArg::Idle, message: None, workspace: None, tab: None };
+        let sent = protocol::Request { v: protocol::VERSION, ts: 1_700_000_000, cmd: status };
+
+        assert_eq!(handle_no_app(&sent, &e), 0);
+        let queued = queue::drain(&paths::queue_file(home.path())).unwrap();
+        assert_eq!(queued, [sent.to_line().trim_end()]);
     }
 
     #[test]
@@ -994,6 +1022,10 @@ mod tests {
         for (words, want) in [
             (vec!["git", "commit", "-m", "fix the bug"], "git commit -m 'fix the bug'"),
             (vec!["pytest", "-k", "a and b"], "pytest -k 'a and b'"),
+            // A tilde the user quoted stays literal: the app's shell must not expand it.
+            (vec!["ls", "~/x"], "ls '~/x'"),
+            (vec!["echo", "~"], "echo '~'"),
+            (vec!["git", "add", "=notes.md"], "git add '=notes.md'"),
             (vec!["npm start && open http://localhost:3000"], "npm start && open http://localhost:3000"),
         ] {
             let command = words.iter().map(|w| w.to_string()).collect();

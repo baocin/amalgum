@@ -90,7 +90,7 @@ impl GitPane {
         let git = self.git.clone();
         crate::ui::jobs::spawn(ctx, &self.tx, move || {
             let result = git
-                .run(&["show", "-s", "--format=%B", &id])
+                .run(&crate::git::log::message_args(&id))
                 .map(|o| crate::git::log::split_message(&String::from_utf8_lossy(&o)));
             worker::Reply::CommitBody { id, result }
         });

@@ -7,12 +7,14 @@
 //!
 //! ControlPath: `<control_dir>/<16 hex of fnv1a64(host)>`. Unix socket paths are limited to 104
 //! bytes on macOS and ssh appends a 17-byte temporary suffix while creating the socket, so the
-//! name is kept short instead of using `%C`. The `-o ControlPath=…` value is quoted for ssh's
-//! own option parser, since the macOS control dir contains a space.
+//! name is kept short instead of using `%C`, and [`Conn::master_args`] refuses a control dir too
+//! long for even that ([`MAX_CONTROL_PATH_BYTES`]). The `-o ControlPath=…` value is quoted for
+//! ssh's own option parser, since the macOS control dir contains a space.
 //! Host keys are only ever accepted through the W16 dialog: [`Conn::master_args`] with
 //! `trust_new_host_key` adds `StrictHostKeyChecking=accept-new` for that one connection. Never
 //! `StrictHostKeyChecking=no`.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Private tmux server name (`tmux -L amalgum`).
@@ -30,31 +32,39 @@ pub fn embedded_cli(target: &str) -> Option<&'static [u8]> {
     embedded::EMBEDDED_CLI.iter().find(|(t, _)| *t == target).map(|(_, bin)| *bin)
 }
 
-/// Characters that need no quoting in a POSIX shell word: safe outside quotes in any position,
+/// Characters that need no quoting in a shell word: safe outside quotes in any position,
 /// including as the first character (so a lone `-oProxyCommand=x`-shaped argument stays inert:
-/// the shell never treats it as anything but a literal string).
+/// the shell never treats it as anything but a literal string). The one exception is a leading
+/// `=`, which zsh (a common login shell, so what sshd often runs the command with) replaces with
+/// the path of the command it names; [`quote_literal`] quotes that case.
 fn is_shell_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
 }
 
 /// POSIX-shell quote one argument for a remote command line.
 ///
-/// Characters outside `[A-Za-z0-9_@%+=:,./-]` force single-quoting, with embedded `'` escaped as
-/// `'\''`. An empty string becomes `''`. A bare `~` or a leading `~/` is left unquoted (the rest
-/// of a `~/...` path is still quoted) so the remote shell performs tilde expansion against its
-/// own `$HOME`; any other tilde form (`~user`, a `~` not at the start) is quoted like any other
-/// character and stays inert.
+/// Characters outside `[A-Za-z0-9_@%+=:,./-]`, or a leading `=`, force single-quoting, with
+/// embedded `'` escaped as `'\''`. An empty string becomes `''`. A bare `~` or a leading `~/` is
+/// left unquoted (the rest of a `~/...` path is still quoted) so the remote shell performs tilde
+/// expansion against its own `$HOME`; any other tilde form (`~user`, a `~` not at the start) is
+/// quoted like any other character and stays inert.
 pub fn quote(arg: &str) -> String {
-    if arg.is_empty() {
-        return "''".to_string();
-    }
     if arg == "~" {
         return "~".to_string();
     }
     if let Some(rest) = arg.strip_prefix("~/") {
         return format!("~/{}", quote(rest));
     }
-    if arg.chars().all(is_shell_safe) {
+    quote_literal(arg)
+}
+
+/// Like [`quote`], but a leading `~` is quoted too, so the shell expands nothing: for words that
+/// are the user's own (`amalgum run -- ls '~/x'`), not paths on a remote host.
+pub fn quote_literal(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if !arg.starts_with('=') && arg.chars().all(is_shell_safe) {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -115,6 +125,11 @@ pub fn user_sets_keepalive(ssh_g: &str) -> bool {
         .is_some_and(|interval| interval != 0)
 }
 
+/// The longest ControlPath ssh can create a master socket at. `sockaddr_un.sun_path` holds 104
+/// bytes on macOS (108 on Linux; the smaller counts everywhere, as for the app socket) including
+/// the NUL, and ssh first binds `<ControlPath>.<16 random chars>` before renaming it into place.
+pub const MAX_CONTROL_PATH_BYTES: usize = 104 - 1 - 17;
+
 /// One host's connection parameters.
 #[derive(Debug, Clone)]
 pub struct Conn {
@@ -142,7 +157,22 @@ impl Conn {
 
     /// `-o ControlMaster=auto -o ControlPath=… -o ControlPersist=… [-o ServerAliveInterval=…
     /// -o ServerAliveCountMax=…] [-o StrictHostKeyChecking=accept-new] -N -f <host>`.
-    pub fn master_args(&self, opts: &MasterOptions, trust_new_host_key: bool) -> Vec<String> {
+    ///
+    /// `InvalidInput` when the control path is over [`MAX_CONTROL_PATH_BYTES`]: ssh could not
+    /// create the master's socket there (with the default macOS control dir, a user name over
+    /// 18 bytes), and would only fail later with a less clear message.
+    pub fn master_args(&self, opts: &MasterOptions, trust_new_host_key: bool) -> io::Result<Vec<String>> {
+        let path = self.control_path();
+        if path.as_os_str().len() > MAX_CONTROL_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ssh control socket path too long ({} bytes, max {MAX_CONTROL_PATH_BYTES}): {}",
+                    path.as_os_str().len(),
+                    path.display()
+                ),
+            ));
+        }
         let mut args = vec![
             "-o".to_string(),
             "ControlMaster=auto".to_string(),
@@ -164,7 +194,7 @@ impl Conn {
         args.push("-N".into());
         args.push("-f".into());
         args.push(self.host.clone());
-        args
+        Ok(args)
     }
 
     /// `-o ControlPath=<path>`: every command after `master_args` must name the master's
@@ -389,45 +419,103 @@ mod tests {
             ("*.rs", "'*.rs'"),
             ("new\nline", "'new\nline'"),
             ("a'b", "'a'\\''b'"),
+            // zsh's EQUALS expansion turns a leading `=word` into the path of command `word`.
+            ("=notes.md", "'=notes.md'"),
+            ("=", "'='"),
         ];
         for (input, want) in cases {
             assert_eq!(&quote(input), want, "quote({input:?})");
         }
     }
 
-    /// Round-trip a hostile table of arguments through a real POSIX shell (`sh -c "printf '%s\n'
-    /// <quoted…>"`) and check the shell reproduces the original text exactly.
+    #[test]
+    fn quote_literal_quotes_a_leading_tilde_too() {
+        let cases: &[(&str, &str)] = &[
+            ("~", "'~'"),
+            ("~/x", "'~/x'"),
+            ("~/foo bar", "'~/foo bar'"),
+            ("=notes.md", "'=notes.md'"),
+            ("plain", "plain"),
+            ("", "''"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(&quote_literal(input), want, "quote_literal({input:?})");
+        }
+    }
+
+    /// Arguments that must reach a remote shell unchanged: substitutions, globs, separators,
+    /// quotes, newlines, tilde forms other than `~` and `~/`, and a leading `=` (zsh).
+    const HOSTILE: &[&str] = &[
+        "simple",
+        "with space",
+        "$(rm -rf /)",
+        "`echo hi`",
+        "new\nline",
+        "*.rs",
+        "-rf",
+        "--flag=value",
+        "a'b",
+        "''",
+        "",
+        "~user",
+        "~alice/foo",
+        "$HOME",
+        "glob[abc]",
+        "semi;colon|pipe&amp",
+        "trailing-newline\n",
+        "=notes.md",
+        "=ls",
+        "%1",
+        "a=b",
+    ];
+
+    /// What `<shell> -c "printf '%s\n' <quoted>"` prints, minus the one newline `printf` adds (so
+    /// an argument that itself ends in `\n` still round-trips exactly); `None` when the shell is
+    /// not installed.
+    fn printed_by(shell: &[&str], quoted: &str) -> Option<String> {
+        let script = format!("printf '%s\\n' {quoted}");
+        let out = match Command::new(shell[0]).args(&shell[1..]).arg("-c").arg(&script).output() {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("spawn {shell:?}: {e}"),
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{shell:?} failed on {script:?}: {stderr}");
+        let got = String::from_utf8_lossy(&out.stdout);
+        Some(got.strip_suffix('\n').unwrap_or(&got).to_string())
+    }
+
+    /// Round-trip the hostile table through a real POSIX shell and check it reproduces the
+    /// original text exactly.
     #[test]
     fn quote_round_trips_through_sh() {
-        let cases: &[&str] = &[
-            "simple",
-            "with space",
-            "$(rm -rf /)",
-            "`echo hi`",
-            "new\nline",
-            "*.rs",
-            "-rf",
-            "--flag=value",
-            "a'b",
-            "''",
-            "",
-            "~user",
-            "~alice/foo",
-            "$HOME",
-            "glob[abc]",
-            "semi;colon|pipe&amp",
-            "trailing-newline\n",
-        ];
-        for &arg in cases {
+        for &arg in HOSTILE {
             let quoted = quote(arg);
-            let script = format!("printf '%s\\n' {quoted}");
-            let out = Command::new("sh").arg("-c").arg(&script).output().expect("spawn sh");
-            assert!(out.status.success(), "sh failed for {arg:?} (script: {script:?})");
-            let got = String::from_utf8_lossy(&out.stdout);
-            // `printf '%s\n'` appends exactly one trailing newline; strip only that one so an
-            // argument that itself ends in `\n` still round-trips exactly.
-            let got = got.strip_suffix('\n').unwrap_or(&got);
-            assert_eq!(got, arg, "round trip for {arg:?} via {quoted:?}");
+            assert_eq!(printed_by(&["sh"], &quoted).expect("sh"), arg, "round trip via {quoted:?}");
+        }
+    }
+
+    /// zsh, the macOS default login shell and so often the one sshd runs a remote command with,
+    /// expands more than POSIX sh (a leading `=`). Skipped where no `zsh` is installed; `-f`
+    /// keeps the developer's rc files out.
+    #[test]
+    fn quote_round_trips_through_zsh() {
+        for &arg in HOSTILE {
+            let quoted = quote(arg);
+            let Some(got) = printed_by(&["zsh", "-f"], &quoted) else {
+                eprintln!("skipped: no zsh on PATH");
+                return;
+            };
+            assert_eq!(got, arg, "round trip via {quoted:?}");
+        }
+    }
+
+    /// `quote_literal` keeps even `~` and `~/…` from being expanded.
+    #[test]
+    fn quote_literal_round_trips_through_sh() {
+        for &arg in HOSTILE.iter().chain(&["~", "~/x", "~/foo bar"]) {
+            let quoted = quote_literal(arg);
+            assert_eq!(printed_by(&["sh"], &quoted).expect("sh"), arg, "round trip via {quoted:?}");
         }
     }
 
@@ -500,16 +588,21 @@ mod tests {
     /// including the terminating NUL, and ssh first binds `<ControlPath>.<16 random chars>` (17
     /// more bytes) before renaming it into place. `control_path` always adds exactly one
     /// separator plus 16 hex chars (17 bytes) to `control_dir`, regardless of host. With the
-    /// default macOS control dir that leaves room for a username of up to 18 bytes (the one
-    /// below); a longer one needs a shorter runtime dir (`paths::Dirs`).
+    /// default macOS control dir that leaves room for a user name of up to 18 bytes; past that
+    /// ssh could not create the master's socket, and `master_args` says so up front.
     #[test]
-    fn control_path_fits_macos_socket_limit() {
-        let control_dir = "/Users/abcdefghijklmnopqr/Library/Application Support/amalgum/run/ssh"; // portability: allow
-        let c = conn("gpu-box.example.internal.corp", control_dir);
-        let path_len = c.control_path().as_os_str().len();
-        assert_eq!(path_len, control_dir.len() + 17, "control_path always adds exactly 17 bytes");
-        let bound = path_len + 17 + 1; // ssh's temporary suffix, then the NUL
-        assert!(bound <= 104, "ssh binds a {bound}-byte socket path, over the macOS sockaddr_un limit");
+    fn master_args_refuse_a_control_path_ssh_cannot_bind_on_macos() {
+        let control_dir = |user: &str| format!("/Users/{user}/Library/Application Support/amalgum/run/ssh"); // portability: allow
+        let longest = conn("gpu-box.example.internal.corp", &control_dir("abcdefghijklmnopqr"));
+        let path_len = longest.control_path().as_os_str().len();
+        assert_eq!(path_len, control_dir("abcdefghijklmnopqr").len() + 17, "always exactly 17 bytes more");
+        assert_eq!(path_len + 17 + 1, 104, "ssh's temporary suffix and the NUL fill sun_path exactly");
+        assert!(longest.master_args(&MasterOptions::default(), false).is_ok());
+
+        let too_long = conn("gpu-box", &control_dir("christopher.johnson"));
+        let err = too_long.master_args(&MasterOptions::default(), false).expect_err("ssh can't bind it");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(&too_long.control_path().display().to_string()), "{err}");
     }
 
     /// ssh re-splits every `-o` value like a config line and expands `%` tokens in ControlPath,
@@ -519,7 +612,7 @@ mod tests {
         let c = conn("gpu-box", "/Users/u/Library/Application Support/100%/a\"b\\c/ssh"); // portability: allow
         let hash = c.control_path().file_name().expect("file name").to_string_lossy().into_owned();
         let want = format!(r#"ControlPath="/Users/u/Library/Application Support/100%%/a\"b\\c/ssh/{hash}""#); // portability: allow
-        assert_eq!(c.master_args(&MasterOptions::default(), false)[3], want);
+        assert_eq!(c.master_args(&MasterOptions::default(), false).unwrap()[3], want);
         assert_eq!(c.check_args()[1], want);
     }
 
@@ -530,7 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let control_dir = dir.path().join("Application Support").join("100%").join("ssh");
         let c = Conn { host: "gpu-box".into(), control_dir };
-        for args in [c.master_args(&MasterOptions::default(), false), c.exec_args(&["true"])] {
+        for args in [c.master_args(&MasterOptions::default(), false).unwrap(), c.exec_args(&["true"])] {
             let out = match Command::new("ssh").args(["-F", "none", "-G"]).args(&args).output() {
                 Ok(out) => out,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -551,7 +644,7 @@ mod tests {
     fn master_args_default_options() {
         let c = conn("gpu-box", "run/ssh");
         let opts = MasterOptions::default();
-        let args = c.master_args(&opts, false);
+        let args = c.master_args(&opts, false).unwrap();
         assert_eq!(
             args,
             vec![
@@ -576,7 +669,7 @@ mod tests {
     fn master_args_without_keepalive() {
         let c = conn("gpu-box", "run/ssh");
         let opts = MasterOptions { persist: "10m".into(), keepalive: None };
-        let args = c.master_args(&opts, false);
+        let args = c.master_args(&opts, false).unwrap();
         assert!(!args.iter().any(|a| a.starts_with("ServerAlive")), "keepalive omitted: {args:?}");
     }
 
@@ -585,10 +678,10 @@ mod tests {
         let c = conn("gpu-box", "run/ssh");
         let opts = MasterOptions::default();
 
-        let trusted = c.master_args(&opts, true);
+        let trusted = c.master_args(&opts, true).unwrap();
         assert!(trusted.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
 
-        let untrusted = c.master_args(&opts, false);
+        let untrusted = c.master_args(&opts, false).unwrap();
         assert!(!untrusted.iter().any(|a| a.starts_with("StrictHostKeyChecking")));
 
         for args in [&trusted, &untrusted] {

@@ -144,9 +144,18 @@ pub fn parse_log(out: &[u8]) -> Vec<Commit> {
     out.split(|&b| b == 0).filter(|rec| !rec.is_empty()).filter_map(parse_record).collect()
 }
 
-/// Full message for the details area: `git show -s --format=%B <id>` output, split into the
-/// subject (first line) and body (rest, leading blank lines trimmed, trailing whitespace
-/// trimmed). CRLF line endings are tolerated.
+/// `git show` argv printing commit `rev`'s full message for [`split_message`] (`HEAD` for the
+/// amend editor's prefill). `--no-show-signature` as in [`log_args`]: a signed commit's
+/// verification output would otherwise precede the message. The trailing `--` marks `rev` as a
+/// revision: without it git refuses one that is also a worktree path (a file named `HEAD`, or
+/// `head` on a case-insensitive filesystem) as ambiguous.
+pub fn message_args(rev: &str) -> [&str; 6] {
+    ["show", "-s", "--no-show-signature", "--format=%B", rev, "--"]
+}
+
+/// Full message for the details area: [`message_args`] output, split into the subject (first
+/// line) and body (rest, leading blank lines trimmed, trailing whitespace trimmed). CRLF line
+/// endings are tolerated.
 pub fn split_message(full: &str) -> (String, String) {
     let full = full.replace("\r\n", "\n");
     let mut parts = full.splitn(2, '\n');
@@ -471,14 +480,12 @@ mod tests {
         assert_eq!(m.parents, vec![on_main, on_topic]);
     }
 
-    #[test]
-    fn log_args_show_signature_does_not_pollute_commit_id() {
-        // Regression for a user with `log.showSignature=true`: without `--no-show-signature`,
-        // git writes the configured `gpg.program`'s verification chatter to stdout right before
-        // the record, and it has no separator from the id field. A stub `gpg.program` stands in
-        // for real GPG (no key needed); the commit's `gpgsig` header just needs to look enough
-        // like a signature that git invokes it — it never checks whether it's really valid.
-        let repo = TempRepo::new();
+    /// Makes `main` a commit with a (fake) `gpgsig` header and message `signed subject` + a body,
+    /// and writes a stub `gpg.program` that "verifies" it. Returns the commit's hash and the
+    /// `-c` value selecting the stub. The header just needs to look enough like a signature
+    /// that git invokes the program — it never checks whether it's really valid — so no key
+    /// or real GPG is needed.
+    fn signed_commit_with_stub_gpg(repo: &TempRepo) -> (String, String) {
         let tree = repo.git(&["write-tree"]);
         let commit_text = format!(
             "tree {tree}\n\
@@ -489,7 +496,9 @@ mod tests {
              \x20garbagebase64data==\n\
              \x20-----END PGP SIGNATURE-----\n\
              \n\
-             signed commit\n"
+             signed subject\n\
+             \n\
+             signed body\n"
         );
         repo.write("commit-msg.txt", &commit_text);
         let hash = repo.git(&["hash-object", "-t", "commit", "-w", "commit-msg.txt"]);
@@ -507,8 +516,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
+        (hash, format!("gpg.program={}", stub_path.display()))
+    }
 
-        let gpg_program_cfg = format!("gpg.program={}", stub_path.display());
+    #[test]
+    fn log_args_show_signature_does_not_pollute_commit_id() {
+        // Regression for a user with `log.showSignature=true`: without `--no-show-signature`,
+        // git writes the configured `gpg.program`'s verification chatter to stdout right before
+        // the record, and it has no separator from the id field.
+        let repo = TempRepo::new();
+        let (hash, gpg_program_cfg) = signed_commit_with_stub_gpg(&repo);
         let mut args: Vec<&str> = vec!["-c", "log.showSignature=true", "-c", &gpg_program_cfg];
         let fixed_args = log_args(&[]);
         args.extend(fixed_args.iter().map(String::as_str));
@@ -601,6 +618,40 @@ mod tests {
     #[test]
     fn split_message_empty_input() {
         assert_eq!(split_message(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn message_args_show_signature_does_not_pollute_the_message() {
+        // Regression for a user with `log.showSignature=true` who signs their own commits: the
+        // verification chatter landed ahead of `%B`, so it became the amend editor's subject
+        // (and then the amended commit's) and the start of the details body.
+        let repo = TempRepo::new();
+        let (hash, gpg_program_cfg) = signed_commit_with_stub_gpg(&repo);
+        for rev in ["HEAD", hash.as_str()] {
+            let mut args: Vec<&str> = vec!["-c", "log.showSignature=true", "-c", &gpg_program_cfg];
+            args.extend_from_slice(&message_args(rev));
+            let full = String::from_utf8_lossy(&repo.git_raw(&args)).into_owned();
+            assert_eq!(
+                split_message(&full),
+                ("signed subject".to_string(), "signed body".to_string()),
+                "{rev}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_args_rev_is_not_taken_for_a_file_of_the_same_name() {
+        // Regression: with a revision argument (unlike the `git log -1` it replaced), `git show`
+        // refuses a name that is both a revision and a worktree file: "ambiguous argument
+        // 'HEAD': both revision and filename". That broke the amend prefill.
+        let mut repo = TempRepo::new();
+        let hash = repo.commit_file("a.txt", "a", "Subject\n\nBody");
+        repo.write("HEAD", "not a revision");
+        repo.write(&hash, "not a revision either");
+        for rev in ["HEAD", hash.as_str()] {
+            let full = String::from_utf8_lossy(&repo.git_raw(&message_args(rev))).into_owned();
+            assert_eq!(split_message(&full), ("Subject".to_string(), "Body".to_string()), "{rev}");
+        }
     }
 
     #[test]

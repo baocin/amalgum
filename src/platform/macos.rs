@@ -70,3 +70,32 @@ pub fn notify(title: &str, body: &str) -> io::Result<()> {
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `\` and `"` are the only characters that can end an AppleScript string literal, and agent
+    /// text (`amalgum notify --body`) reaches `osascript` through this.
+    #[test]
+    fn applescript_escape_keeps_text_inside_the_string_literal() {
+        assert_eq!(applescript_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(
+            applescript_escape(r#"\" & (do shell script "id") & ""#),
+            r#"\\\" & (do shell script \"id\") & \""#
+        );
+    }
+
+    /// The property that matters: osascript reads the escaped text back as exactly the input.
+    #[test]
+    fn applescript_escape_round_trips_through_osascript() {
+        for text in [r#"a"b\c"#, r#"\" & (do shell script "id") & ""#, "plain text"] {
+            let out = std::process::Command::new("osascript")
+                .args(["-e", &format!("return \"{}\"", applescript_escape(text))])
+                .output()
+                .expect("osascript runs");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'), text);
+        }
+    }
+}

@@ -5,7 +5,7 @@ use super::worker;
 use super::{GitEvent, GitPane};
 use crate::git::cmd::GitError;
 use crate::git::diff::{self, FileDiff, Selection as HunkSelection};
-use crate::git::log::split_message;
+use crate::git::log::{message_args, split_message};
 use crate::git::message::{self, SubjectLen};
 use crate::git::status::{Entry, EntryKind, Status};
 use crate::model::settings::Settings;
@@ -369,8 +369,7 @@ impl GitPane {
     fn dispatch_last_commit_message(&self, ctx: &egui::Context) {
         let git = self.git.clone();
         crate::ui::jobs::spawn(ctx, &self.tx, move || {
-            let result =
-                git.run(&["log", "-1", "--format=%B"]).map(|o| split_message(&String::from_utf8_lossy(&o)));
+            let result = git.run(&message_args("HEAD")).map(|o| split_message(&String::from_utf8_lossy(&o)));
             worker::Reply::LastCommitMessage(result)
         });
     }
