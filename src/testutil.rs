@@ -66,9 +66,13 @@ impl TempRepo {
     }
 }
 
-/// A `git` command isolated from the machine's configuration.
+/// A `git` command isolated from the machine's configuration — and from any repository an
+/// enclosing git hook points at (the pre-commit gate runs these tests with GIT_DIR set).
 pub fn hermetic_git(dir: &Path) -> Command {
     let mut c = Command::new("git");
+    for var in crate::git::cmd::REPO_ENV_VARS {
+        c.env_remove(var);
+    }
     c.current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")

@@ -12,6 +12,28 @@ use std::process::{Command, Stdio};
 
 use crate::ssh::{self, Conn};
 
+/// Environment variables that redirect git to a different repository, index, or object store
+/// (`git rev-parse --local-env-vars`). Git exports several of them to hooks, so anything run
+/// from a hook (the pre-commit gate's tests, an agent) would otherwise act on the *hook's*
+/// repository instead of the `-C <path>` it asked for. Every git we spawn clears them.
+pub const REPO_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
 /// Where a workspace's repository lives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
@@ -194,6 +216,9 @@ impl Git {
         let argv = self.argv(args);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        for var in REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd.env("LC_ALL", "C");
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
@@ -550,5 +575,19 @@ mod tests {
             stderr: "fatal: not a git repository\n".into(),
         };
         assert_eq!(err.to_string(), "Not a git repository");
+    }
+
+    #[test]
+    fn command_never_inherits_a_hooks_repository() {
+        // Inside a git hook, GIT_DIR/GIT_INDEX_FILE point at the hook's repo; they must not leak.
+        let cmd = Git::new(Location::Local { path: PathBuf::from("repo") }).command(&["status"]);
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
+            assert!(removed.iter().any(|r| r == var), "{var} not cleared: {removed:?}");
+        }
     }
 }

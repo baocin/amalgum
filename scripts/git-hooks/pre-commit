@@ -1,3 +1,8 @@
 #!/usr/bin/env bash
 # The gate as a git hook, so it holds in every tool (and with no agent at all).
-exec "$(git rev-parse --show-toplevel)/scripts/agent/verify"
+root="$(git rev-parse --show-toplevel)"
+# Git exports GIT_DIR/GIT_INDEX_FILE/… to hooks. The gate's tests create throwaway repos, so
+# never let those variables reach them (they would rewrite *this* repository's refs).
+# shellcheck disable=SC2046  # one variable name per word, by design
+unset $(git rev-parse --local-env-vars)
+cd "$root" && exec scripts/agent/verify
