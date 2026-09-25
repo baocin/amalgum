@@ -297,24 +297,13 @@ fn agent_event(agent: AgentKind, json: Option<String>, env: &Env, stdin: &mut dy
     }
 }
 
-/// `host:path` (host non-empty, no `/`, and not starting with `/`, `.`, or `~`) is remote;
-/// everything else — including a bare relative or absolute path — is local (mirrors
-/// `git::Location::parse`'s classification, §5.31).
-fn is_remote_location(location: &str) -> bool {
-    match location.split_once(':') {
-        Some((host, _)) => !host.is_empty() && !host.contains('/') && !host.starts_with(['/', '.', '~']),
-        None => false,
-    }
-}
-
-/// Resolve a relative local path against `cwd`; leave `host:path` and already-absolute paths
-/// untouched.
+/// Resolve a relative local path against `cwd` (the app's cwd differs); `host:path` and
+/// absolute paths pass through.
 fn resolve_open_location(location: &str, cwd: &Path) -> String {
-    if is_remote_location(location) {
-        return location.to_string();
+    match crate::git::Location::parse(location) {
+        crate::git::Location::Local { path } if path.is_relative() => cwd.join(path).to_string_lossy().into_owned(),
+        _ => location.to_string(),
     }
-    let p = Path::new(location);
-    if p.is_absolute() { location.to_string() } else { cwd.join(p).to_string_lossy().into_owned() }
 }
 
 /// `list`'s expected `data` shape (produced by the running app; the CLI only renders it):
@@ -512,18 +501,6 @@ mod tests {
     }
 
     // --- open: remote vs local, relative-path resolution -----------------------------------
-
-    #[test]
-    fn is_remote_location_classifies_like_the_spec_examples() {
-        assert!(is_remote_location("host:path"));
-        assert!(is_remote_location("gpu-box:~/g"));
-        assert!(!is_remote_location("./a:b"));
-        assert!(!is_remote_location("/x:y")); // portability: allow
-        assert!(!is_remote_location("~/a:b"));
-        assert!(!is_remote_location("no-colon-at-all"));
-        assert!(!is_remote_location("a/b:c")); // '/' before ':' disqualifies it
-        assert!(!is_remote_location(":empty-host"));
-    }
 
     #[test]
     fn resolve_open_location_joins_relative_paths_to_cwd() {
