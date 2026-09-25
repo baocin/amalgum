@@ -156,35 +156,41 @@ impl Conn {
         args
     }
 
-    /// `-O check <host>`: is the master alive?
-    pub fn check_args(&self) -> Vec<String> {
-        vec!["-O".into(), "check".into(), self.host.clone()]
+    /// `-o ControlPath=<path>`: every command after `master_args` must name the master's
+    /// socket, or ssh looks for the user's default ControlPath and misses ours.
+    fn via_master(&self, rest: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut args = vec!["-o".to_string(), format!("ControlPath={}", self.control_path().display())];
+        args.extend(rest);
+        args
     }
 
-    /// `-O exit <host>`.
+    /// `-o ControlPath=… -O check <host>`: is the master alive?
+    pub fn check_args(&self) -> Vec<String> {
+        self.via_master(["-O".into(), "check".into(), self.host.clone()])
+    }
+
+    /// `-o ControlPath=… -O exit <host>`.
     pub fn exit_args(&self) -> Vec<String> {
-        vec!["-O".into(), "exit".into(), self.host.clone()]
+        self.via_master(["-O".into(), "exit".into(), self.host.clone()])
     }
 
     /// Run a command on the master: `-o ControlPath=… -o ControlMaster=no <host> -- <quoted
     /// argv>`. `ControlMaster=no` means this fails cleanly instead of starting a new master when
     /// none is running.
     pub fn exec_args(&self, remote_argv: &[&str]) -> Vec<String> {
-        vec![
-            "-o".into(),
-            format!("ControlPath={}", self.control_path().display()),
+        self.via_master([
             "-o".into(),
             "ControlMaster=no".into(),
             self.host.clone(),
             "--".into(),
             remote_command(remote_argv),
-        ]
+        ])
     }
 
-    /// Reverse-forward the app socket: `-O forward -R <remote_sock>:<local_sock>
+    /// Reverse-forward the app socket: `-o ControlPath=… -O forward -R <remote_sock>:<local_sock>
     /// -o StreamLocalBindUnlink=yes <host>`.
     pub fn forward_socket_args(&self, remote_sock: &str, local_sock: &Path) -> Vec<String> {
-        vec![
+        self.via_master([
             "-O".into(),
             "forward".into(),
             "-R".into(),
@@ -192,33 +198,36 @@ impl Conn {
             "-o".into(),
             "StreamLocalBindUnlink=yes".into(),
             self.host.clone(),
-        ]
+        ])
     }
 
-    /// Open a remote port locally: `-O forward -L <local>:localhost:<remote> <host>`.
+    /// Open a remote port locally: `-o ControlPath=… -O forward -L <local>:localhost:<remote> <host>`.
     pub fn forward_port_args(&self, local_port: u16, remote_port: u16) -> Vec<String> {
-        vec![
+        self.via_master([
             "-O".into(),
             "forward".into(),
             "-L".into(),
             format!("{local_port}:localhost:{remote_port}"),
             self.host.clone(),
-        ]
+        ])
     }
 
-    /// `-O cancel -L <local>:localhost:<remote> <host>`: undo a forward opened with
+    /// `-o ControlPath=… -O cancel -L <local>:localhost:<remote> <host>`: undo a forward opened with
     /// [`forward_port_args`](Self::forward_port_args).
     pub fn cancel_port_args(&self, local_port: u16, remote_port: u16) -> Vec<String> {
-        vec![
+        self.via_master([
             "-O".into(),
             "cancel".into(),
             "-L".into(),
             format!("{local_port}:localhost:{remote_port}"),
             self.host.clone(),
-        ]
+        ])
     }
 
-    /// Terminal with session survival: `-t <host> -- tmux -L amalgum -f ~/.amalgum/tmux.conf
+    /// Environment pairs are quoted whole, so values are literal (no `~` or `$` expansion):
+    /// pass absolute remote paths.
+    ///
+    /// Terminal with session survival: `-o ControlPath=… -t <host> -- tmux -L amalgum -f ~/.amalgum/tmux.conf
     /// new-session -A -s <session> -c <cwd> -e K=V …`.
     pub fn tmux_args(&self, session: &str, cwd: &str, env: &[(&str, &str)]) -> Vec<String> {
         let conf = format!("~/{}/tmux.conf", crate::paths::REMOTE_ROOT);
@@ -230,19 +239,19 @@ impl Conn {
             quote(cwd),
         );
         for (k, v) in env {
-            cmd.push_str(&format!(" -e {k}={}", quote(v)));
+            cmd.push_str(&format!(" -e {}", quote(&format!("{k}={v}"))));
         }
-        vec!["-t".into(), self.host.clone(), "--".into(), cmd]
+        self.via_master(["-t".into(), self.host.clone(), "--".into(), cmd])
     }
 
-    /// Terminal without tmux: `-t <host> -- 'cd <cwd> && exec env K=V … "$SHELL" -l'`.
+    /// Terminal without tmux: `-o ControlPath=… -t <host> -- 'cd <cwd> && exec env K=V … "$SHELL" -l'`.
     pub fn shell_args(&self, cwd: &str, env: &[(&str, &str)]) -> Vec<String> {
         let mut cmd = format!("cd {} && exec env", quote(cwd));
         for (k, v) in env {
-            cmd.push_str(&format!(" {k}={}", quote(v)));
+            cmd.push_str(&format!(" {}", quote(&format!("{k}={v}"))));
         }
         cmd.push_str(" \"$SHELL\" -l");
-        vec!["-t".into(), self.host.clone(), "--".into(), cmd]
+        self.via_master(["-t".into(), self.host.clone(), "--".into(), cmd])
     }
 }
 
@@ -559,52 +568,71 @@ mod tests {
         );
     }
 
+    /// The `-o ControlPath=…` pair every post-master command starts with.
+    fn via(c: &Conn) -> Vec<String> {
+        vec!["-o".into(), format!("ControlPath={}", c.control_path().display())]
+    }
+
+    fn with_via(c: &Conn, rest: &[&str]) -> Vec<String> {
+        via(c).into_iter().chain(rest.iter().map(|s| s.to_string())).collect()
+    }
+
     #[test]
     fn tmux_args_shape() {
         let c = conn("gpu-box", "run/ssh");
         let args = c.tmux_args("tab-1", "/srv/app", &[("AMALGUM_SOCK", "~/.amalgum/run/app.sock")]); // portability: allow
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[1], "gpu-box");
-        assert_eq!(args[2], "--");
-        assert_eq!(
-            args[3],
-            "tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s tab-1 -c /srv/app -e AMALGUM_SOCK=~/.amalgum/run/app.sock" // portability: allow
-        );
-        assert_eq!(args.len(), 4);
+        let cmd = "tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s tab-1 -c /srv/app -e 'AMALGUM_SOCK=~/.amalgum/run/app.sock'"; // portability: allow
+        assert_eq!(args, with_via(&c, &["-t", "gpu-box", "--", cmd]));
     }
 
     #[test]
-    fn tmux_args_quotes_cwd_and_env_values() {
+    fn tmux_args_quote_cwd_and_whole_env_pairs() {
         let c = conn("gpu-box", "run/ssh");
-        let args = c.tmux_args("t", "/a b", &[("K", "v v")]); // portability: allow
+        let args = c.tmux_args("t", "/a b", &[("K", "v v"), ("X;rm", "1")]); // portability: allow
         assert_eq!(
-            args[3],
-            "tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s t -c '/a b' -e K='v v'"
-        ); // portability: allow
+            args.last().map(String::as_str),
+            Some("tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s t -c '/a b' -e 'K=v v' -e 'X;rm=1'") // portability: allow
+        );
     }
 
     #[test]
     fn shell_args_shape() {
         let c = conn("gpu-box", "run/ssh");
         let args = c.shell_args("/srv/app", &[("AMALGUM_TAB", "t1")]); // portability: allow
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[1], "gpu-box");
-        assert_eq!(args[2], "--");
-        assert_eq!(args[3], "cd /srv/app && exec env AMALGUM_TAB=t1 \"$SHELL\" -l"); // portability: allow
+        let cmd = "cd /srv/app && exec env AMALGUM_TAB=t1 \"$SHELL\" -l"; // portability: allow
+        assert_eq!(args, with_via(&c, &["-t", "gpu-box", "--", cmd]));
     }
 
     #[test]
     fn shell_args_quotes_cwd() {
         let c = conn("gpu-box", "run/ssh");
         let args = c.shell_args("/a b", &[]); // portability: allow
-        assert_eq!(args[3], "cd '/a b' && exec env \"$SHELL\" -l"); // portability: allow
+        assert_eq!(args.last().map(String::as_str), Some("cd '/a b' && exec env \"$SHELL\" -l")); // portability: allow
+    }
+
+    #[test]
+    fn every_post_master_command_names_the_control_path() {
+        let c = conn("gpu-box", "run/ssh");
+        let local = PathBuf::from("app.sock");
+        for args in [
+            c.check_args(),
+            c.exit_args(),
+            c.exec_args(&["true"]),
+            c.forward_socket_args("r.sock", &local),
+            c.forward_port_args(1, 2),
+            c.cancel_port_args(1, 2),
+            c.tmux_args("t", "d", &[]),
+            c.shell_args("d", &[]),
+        ] {
+            assert_eq!(args[..2], via(&c)[..], "{args:?}");
+        }
     }
 
     #[test]
     fn check_and_exit_args() {
         let c = conn("gpu-box", "run/ssh");
-        assert_eq!(c.check_args(), vec!["-O", "check", "gpu-box"]);
-        assert_eq!(c.exit_args(), vec!["-O", "exit", "gpu-box"]);
+        assert_eq!(c.check_args(), with_via(&c, &["-O", "check", "gpu-box"]));
+        assert_eq!(c.exit_args(), with_via(&c, &["-O", "exit", "gpu-box"]));
     }
 
     #[test]
@@ -612,31 +640,15 @@ mod tests {
         let c = conn("gpu-box", "run/ssh");
         let local = PathBuf::from("/tmp/app.sock"); // portability: allow
         let args = c.forward_socket_args("~/.amalgum/run/app.sock", &local); // portability: allow
-        assert_eq!(
-            args,
-            vec![
-                "-O",
-                "forward",
-                "-R",
-                "~/.amalgum/run/app.sock:/tmp/app.sock", // portability: allow
-                "-o",
-                "StreamLocalBindUnlink=yes",
-                "gpu-box",
-            ]
-        );
+        let spec = "~/.amalgum/run/app.sock:/tmp/app.sock"; // portability: allow
+        assert_eq!(args, with_via(&c, &["-O", "forward", "-R", spec, "-o", "StreamLocalBindUnlink=yes", "gpu-box"]));
     }
 
     #[test]
     fn forward_and_cancel_port_args() {
         let c = conn("gpu-box", "run/ssh");
-        assert_eq!(
-            c.forward_port_args(3000, 8080),
-            vec!["-O", "forward", "-L", "3000:localhost:8080", "gpu-box"]
-        );
-        assert_eq!(
-            c.cancel_port_args(3000, 8080),
-            vec!["-O", "cancel", "-L", "3000:localhost:8080", "gpu-box"]
-        );
+        assert_eq!(c.forward_port_args(3000, 8080), with_via(&c, &["-O", "forward", "-L", "3000:localhost:8080", "gpu-box"]));
+        assert_eq!(c.cancel_port_args(3000, 8080), with_via(&c, &["-O", "cancel", "-L", "3000:localhost:8080", "gpu-box"]));
     }
 
     // --- Backoff ------------------------------------------------------------------------------
