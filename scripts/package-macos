@@ -14,6 +14,7 @@ rm -rf "$app" "$dmg"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 lipo -create -output "$app/Contents/MacOS/amalgum" "$arm" "$x86"
 lipo -info "$app/Contents/MacOS/amalgum"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+cp assets/fonts/*-OFL.txt "$app/Contents/Resources/"
 iconset="$(mktemp -d)/Amalgum.iconset"; mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" assets/icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null

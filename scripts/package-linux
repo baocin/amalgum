@@ -12,6 +12,7 @@ rm -rf "$stage"; mkdir -p "$stage"
 install -m 0755 "$bin" "$stage/amalgum"
 cp packaging/linux/amalgum.desktop README.md "$stage/"
 cp assets/icon.png "$stage/amalgum.png"
+mkdir -p "$stage/licenses" && cp assets/fonts/*-OFL.txt "$stage/licenses/"
 tar -C dist -czf "dist/$name.tar.gz" "$name"
 echo "dist/$name.tar.gz" >&3
 

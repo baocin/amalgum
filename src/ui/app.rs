@@ -8,6 +8,7 @@
 
 mod actions;
 mod events;
+mod ports;
 mod surface;
 mod workspace;
 
@@ -50,6 +51,8 @@ struct Live {
 /// Results coming back from worker threads.
 enum Msg {
     Opened(Result<workspace::Opened, String>),
+    /// Listening ports per workspace (`app/ports.rs`).
+    Ports(HashMap<String, Vec<u16>>),
 }
 
 pub struct App {
@@ -82,6 +85,8 @@ pub struct App {
     /// OS notifications are raised only when the window is not focused (§5.29).
     focused_window: bool,
     screenshot: super::screenshot::Screenshot,
+    ports: HashMap<String, Vec<u16>>,
+    last_port_scan: f64,
 }
 
 impl App {
@@ -109,7 +114,7 @@ impl App {
         let control = Control::start(&dirs, ctx)
             .map_err(|e| {
                 toasts.push(
-                    Toast::error(
+                    Toast::warning(
                         "Control socket unavailable; `amalgum` commands won't reach this window",
                         e.to_string(),
                     ),
@@ -141,9 +146,12 @@ impl App {
             time: 0.0,
             focused_window: true,
             screenshot: super::screenshot::Screenshot::from_env(),
+            ports: HashMap::new(),
+            last_port_scan: f64::NEG_INFINITY,
             settings,
             state,
         };
+        super::fonts::install(ctx);
         app.apply_theme(ctx);
         if app.settings.general.restore_workspaces {
             let ids: Vec<String> = app.state.workspaces().iter().map(|w| w.id.clone()).collect();
@@ -211,7 +219,7 @@ impl App {
                     ahead: s.ahead,
                     behind: s.behind,
                     dirty: s.changed,
-                    ports: Vec::new(),
+                    ports: self.ports.get(&ws.id).cloned().unwrap_or_default(),
                     last_message: self.live.get(&ws.id).and_then(|l| l.last_message.clone()),
                     note: None,
                 };
@@ -233,7 +241,7 @@ impl App {
             changed: s.changed,
             op: s.op.map(|op| (op, s.conflicts)),
             agent,
-            ports: Vec::new(),
+            ports: self.ports.get(ws).cloned().unwrap_or_default(),
             unread: self.notifications.unread(),
             remote_state: None,
         }
@@ -254,11 +262,13 @@ impl App {
                     .map(|(tab, pane)| {
                         let key = workspace::pane_key(&tab.id, pane.id);
                         let status = live.and_then(|l| l.trackers.get(&key)).map_or(Status::None, Tracker::status);
-                        serde_json::json!({ "id": key, "title": pane.title, "status": status, "cwd": pane.cwd, "ports": [] })
+                        let term = live.and_then(|l| l.panes.get(&pane.id));
+                        let exited = term.and_then(|t| t.exit_code()).map(|code| code.unwrap_or(-1));
+                        serde_json::json!({ "id": key, "title": pane.title, "status": status, "cwd": pane.cwd, "exited": exited })
                     })
                     .collect();
                 serde_json::json!({
-                    "id": ws.id, "name": ws.name, "location": workspace::location_label(&ws.location, None),
+                    "id": ws.id, "name": ws.name, "ports": self.ports.get(&ws.id), "location": workspace::location_label(&ws.location, None),
                     "status": self.workspace_status(&ws.id).0, "tabs": tabs,
                 })
             })
@@ -276,6 +286,7 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Opened(Ok(opened)) => self.on_opened(ctx, opened),
+                Msg::Ports(found) => self.on_ports(found),
                 Msg::Opened(Err(e)) => {
                     self.toast(Toast::error(e.lines().next().unwrap_or("Could not open"), e.clone()))
                 }
@@ -333,6 +344,7 @@ impl eframe::App for App {
         self.poll_terminals(&ctx, now);
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
+        self.scan_ports(&ctx);
 
         let menu = egui::Panel::top("menu").show(ui, |ui| chrome::menu_bar(ui, &self.keymap)).inner;
         if let Some(action) = menu {

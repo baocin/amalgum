@@ -8,6 +8,7 @@
 mod app;
 mod chrome;
 mod control;
+mod fonts;
 mod git_pane;
 mod jobs;
 mod palette;

@@ -23,9 +23,6 @@ impl Colors {
     pub fn lane(&self, lane: usize) -> Color32 {
         rgb(theme::lane(lane, self.mode))
     }
-    pub fn blame(&self, t: f32) -> Color32 {
-        rgb(theme::blame_heat(t, self.mode))
-    }
     /// A token at partial opacity (hibernated overlay 50 %, dimmed graph rows 60 %).
     pub fn faded(&self, token: Token, opacity: f32) -> Color32 {
         self.get(token).gamma_multiply(opacity)

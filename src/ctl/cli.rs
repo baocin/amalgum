@@ -310,8 +310,8 @@ fn resolve_open_location(location: &str, cwd: &Path) -> String {
 
 /// `list`'s expected `data` shape (produced by the running app; the CLI only renders it):
 /// ```json
-/// {"workspaces": [{"id": "…", "name": "…", "location": "…", "status": "…",
-///   "tabs": [{"id": "…", "title": "…", "status": "…", "cwd": "…", "ports": [8080]}]}]}
+/// {"workspaces": [{"id": "…", "name": "…", "location": "…", "status": "…", "ports": [8080],
+///   "tabs": [{"id": "…", "title": "…", "status": "…", "cwd": "…", "exited": null}]}]}
 /// ```
 fn list(as_json: bool, env: &Env, out: &mut dyn Write) -> i32 {
     let (code, resp) = dispatch(protocol::Command::List, env);

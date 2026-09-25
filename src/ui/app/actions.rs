@@ -231,7 +231,22 @@ impl App {
             detail: r.location.display(crate::paths::home().as_deref()),
             target: Target::Location(r.location.clone()),
         });
-        actions.chain(workspaces).chain(recents).collect()
+        let branches = self
+            .state
+            .active
+            .as_deref()
+            .and_then(|id| self.live.get(id))
+            .and_then(|l| l.git.as_ref())
+            .map(|g| g.local_branches())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| Item {
+                group: Group::Branches,
+                label: b.clone(),
+                detail: "Enter to checkout".into(),
+                target: Target::Branch(b),
+            });
+        actions.chain(workspaces).chain(branches).chain(recents).collect()
     }
 
     pub(super) fn on_palette(&mut self, ctx: &egui::Context, target: Target) {
@@ -240,7 +255,9 @@ impl App {
             Target::Workspace(id) => self.activate(ctx, &id),
             Target::Location(loc) => self.open(ctx, loc, None, None),
             Target::Branch(name) => {
-                self.toast(Toast::info(format!("Checkout from the palette is not wired yet ({name})")))
+                if let Some(git) = self.active_live().and_then(|l| l.git.as_mut()) {
+                    git.checkout(ctx, name);
+                }
             }
         }
     }

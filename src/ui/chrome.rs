@@ -31,6 +31,12 @@ impl Toast {
     pub fn error(title: impl Into<String>, details: impl Into<String>) -> Self {
         Self { level: ToastLevel::Error, title: title.into(), details: Some(details.into()) }
     }
+    pub fn success(title: impl Into<String>) -> Self {
+        Self { level: ToastLevel::Success, title: title.into(), details: None }
+    }
+    pub fn warning(title: impl Into<String>, details: impl Into<String>) -> Self {
+        Self { level: ToastLevel::Warning, title: title.into(), details: Some(details.into()) }
+    }
     pub fn info(title: impl Into<String>) -> Self {
         Self { level: ToastLevel::Info, title: title.into(), details: None }
     }
@@ -296,12 +302,15 @@ pub fn status_bar(ui: &mut egui::Ui, info: &StatusInfo, colors: &Colors) -> Opti
                 action = Some(StatusAction::AbortOp);
             }
         } else if let Some(name) = &info.detached {
-            ui.colored_label(colors.get(Token::Warning), format!("⑂ {name} (detached)"));
+            ui.colored_label(
+                colors.get(Token::Warning),
+                format!("{} {name} (detached)", super::fonts::BRANCH),
+            );
             if ui.small_button("Create branch").clicked() {
                 action = Some(StatusAction::CreateBranch);
             }
         } else if let Some(name) = &info.branch {
-            ui.label(format!("⑂ {name}"));
+            ui.label(format!("{} {name}", super::fonts::BRANCH));
             ui.colored_label(colors.get(Token::Success), format!("↑{}", info.ahead));
             ui.colored_label(colors.get(Token::Warning), format!("↓{}", info.behind));
             if info.changed > 0 && ui.link(format!("{} changed", info.changed)).clicked() {

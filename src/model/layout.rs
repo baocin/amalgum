@@ -34,6 +34,7 @@ pub struct Rect {
     pub h: f32,
 }
 
+#[cfg(test)]
 impl Rect {
     fn area(self) -> f32 {
         self.w * self.h

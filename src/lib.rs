@@ -13,9 +13,6 @@
 //! - [`platform`] the only module that may call OS-specific APIs (§1)
 //! - `ui`         the eframe app (feature `gui`)
 
-// SKELETON: contracts are `todo!()` stubs until implemented; remove this line once none remain.
-#![allow(unused_variables, dead_code, clippy::todo)]
-
 pub mod agent;
 pub mod ctl;
 pub mod git;
