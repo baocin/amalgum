@@ -616,12 +616,12 @@ mod tests {
         assert_eq!(c.check_args()[1], want);
     }
 
-    /// `ssh -G` parses the options and prints the resulting config without connecting. Skipped
-    /// where no `ssh` is installed.
+    /// `ssh -G` parses the options and prints the resulting config without connecting or touching
+    /// the filesystem, so a short relative dir keeps the space and `%` without tripping the macOS
+    /// length limit ($TMPDIR alone is ~50 bytes there). Skipped where no `ssh` is installed.
     #[test]
     fn control_path_option_survives_ssh_option_parsing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let control_dir = dir.path().join("Application Support").join("100%").join("ssh");
+        let control_dir = PathBuf::from("Application Support/100%/ssh");
         let c = Conn { host: "gpu-box".into(), control_dir };
         for args in [c.master_args(&MasterOptions::default(), false).unwrap(), c.exec_args(&["true"])] {
             let out = match Command::new("ssh").args(["-F", "none", "-G"]).args(&args).output() {
