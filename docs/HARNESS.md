@@ -9,6 +9,7 @@ with any agent or none.
 
 | Layer | Files | Contract |
 |---|---|---|
+| Session start (web) | `.claude/hooks/session-start.sh` | Claude Code on the web only: pinned toolchain, crates, and the gate's builds warmed before the session starts (synchronous). |
 | Bootstrap | `scripts/agent/bootstrap` | Clean checkout → green gate in one command. Idempotent; network used once to prime the cargo cache. |
 | **Gate** | `scripts/agent/verify` | One command, one exit code, cheapest signal first, remedy on every `✗` line. Scoped to paths changed vs `origin/main`; prints what it skipped; `VERIFY_FULL=1` for branch-level callers; unknown scope runs everything. |
 | Runbook | `CLAUDE.md` (`AGENTS.md` → symlink) | Under 200 lines; only facts that change a decision. Points at files instead of copying them. |
