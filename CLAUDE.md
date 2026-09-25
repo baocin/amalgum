@@ -28,7 +28,9 @@ Spec: `docs/SPEC.md` (cited as §5.28). Built vs. planned: `docs/STATUS.md`. Har
 - macOS caps unix socket paths at 104 bytes and ssh appends a 17-byte suffix while creating a ControlMaster
   socket. That is why `ssh::Conn::control_path` uses a 16-hex-char name, not `%C`. Don't "simplify" it.
 - Tests that run git must use `testutil::TempRepo` / `hermetic_git`. Otherwise the developer's global config
-  (signing, hooks, `init.defaultBranch`) leaks in and tests pass locally, fail in CI.
+  leaks in (tests pass locally, fail in CI) — and under the pre-commit gate, git's exported `GIT_DIR` makes a
+  raw `Command::new("git")` rewrite *this* repository (it happened: core.bare=true, fixture refs). The
+  portability check rejects raw git spawns.
 - Running the app headless: `xvfb-run` plus `libxkbcommon-x11` (winit dlopens it; a missing one panics inside
   `xkbcommon-dl`). wgpu has no adapter under Xvfb, so "falling back to OpenGL" on stderr is expected.
 - Cargo's `build.rs` embeds remote CLIs only when `AMALGUM_EMBED_CLI_DIR` is set (release). Locally

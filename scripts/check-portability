@@ -18,6 +18,8 @@ check "OS-specific cfg outside src/platform/ — move it behind a platform:: fun
 check "OS tool invoked outside src/platform/ — call the platform:: function instead" \
   'Command::new\("(open|xdg-open|osascript|lsof|ss|notify-send|dbus-send|launchctl|defaults)"\)' \
   'src/*.rs' ':!src/platform/*'
+check "git spawned directly — use git::Git (app) or testutil::hermetic_git (tests); both clear the GIT_DIR/GIT_INDEX_FILE git exports to hooks" \
+  'Command::new\("git"\)' 'src/*.rs' 'tests/*.rs' ':!src/git/cmd.rs' ':!src/testutil.rs'
 check "Absolute path literal — derive it from paths::Dirs, \$HOME, or git config" \
   '"/(Users|home|usr|etc|opt|var|tmp|Library|Applications|private)/' 'src/*.rs' ':!src/platform/*'
 check "egui/eframe/terminal crate used outside src/ui/ — the headless CLI must build without them" \
