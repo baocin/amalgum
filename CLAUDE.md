@@ -15,6 +15,7 @@ Spec: `docs/SPEC.md` (cited as §5.28). Built vs. planned: `docs/STATUS.md`. Har
 | `scripts/agent/bootstrap` | once | Clean checkout → green gate; installs the pre-commit hook. |
 | `scripts/build app\|cli [target]` | minutes | Release binaries, identical to CI. |
 | `AMALGUM_HOME=$(mktemp -d) cargo run` | | Run the app without touching your real state. |
+| `AMALGUM_HOME=$(mktemp -d) AMALGUM_SCREENSHOT=/tmp/s.png xvfb-run -a cargo run -- <repo>` | ~5 s | Look at a UI change: renders, saves a PNG, exits. Read the PNG. |
 
 ## 2. Gotchas that cost hours
 

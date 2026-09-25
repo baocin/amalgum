@@ -191,3 +191,59 @@ fn fake_server_smoke_test() {
     let resp = socket::send(server.path(), &req, Duration::from_secs(2)).expect("send");
     assert!(resp.ok);
 }
+
+/// `hooks setup|status|remove` end to end against a throwaway HOME (§5.29 "Hook installer").
+#[test]
+fn hooks_setup_status_remove_round_trip_in_a_temp_home() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let run = |args: &[&str]| {
+        let out = Proc::new(bin()).args(args).env("HOME", home.path()).output().expect("run amalgum hooks");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_lowercase()
+    };
+
+    let settings = home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&settings, r#"{"theme":"dark"}"#).expect("seed user settings");
+
+    run(&["hooks", "setup", "claude"]);
+    let installed = std::fs::read_to_string(&settings).expect("settings written");
+    assert!(installed.contains("agent-event --agent claude"), "{installed}");
+    assert!(installed.contains("\"theme\""), "user settings must survive: {installed}");
+    assert!(run(&["hooks", "status", "claude"]).contains("installed"));
+
+    run(&["hooks", "setup", "claude"]);
+    assert_eq!(std::fs::read_to_string(&settings).expect("reread"), installed, "setup is idempotent");
+
+    run(&["hooks", "remove", "claude"]);
+    let removed = std::fs::read_to_string(&settings).expect("settings kept");
+    assert!(!removed.contains("agent-event"), "{removed}");
+    assert!(removed.contains("\"theme\""));
+    assert!(run(&["hooks", "status", "claude"]).contains("missing"));
+}
+
+/// `--sequence-editor` rewrites git's todo file from the plan named by AMALGUM_REBASE_PLAN (§5.16).
+#[test]
+fn sequence_editor_helper_writes_the_plan_into_the_todo_file() {
+    use amalgum::git::rebase::{Action, Plan, Step, write_plan_files};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plan = Plan {
+        steps: vec![
+            Step { action: Action::Pick, hash: "aaaaaaa".into(), subject: "first".into(), message: None },
+            Step { action: Action::Drop, hash: "bbbbbbb".into(), subject: "second".into(), message: None },
+        ],
+    };
+    let (plan_file, _messages) = write_plan_files(&plan, dir.path()).expect("plan files");
+    let todo = dir.path().join("git-rebase-todo");
+    std::fs::write(&todo, "pick bbbbbbb second\npick aaaaaaa first\n").expect("seed todo");
+
+    let out = Proc::new(bin())
+        .arg("--sequence-editor")
+        .arg(&todo)
+        .env("AMALGUM_REBASE_PLAN", &plan_file)
+        .output()
+        .expect("run helper");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let written = std::fs::read_to_string(&todo).expect("todo");
+    assert_eq!(written.lines().collect::<Vec<_>>(), ["pick aaaaaaa first", "drop bbbbbbb second"]);
+}
