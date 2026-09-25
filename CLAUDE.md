@@ -33,6 +33,9 @@ Spec: `docs/SPEC.md` (cited as §5.28). Built vs. planned: `docs/STATUS.md`. Har
   portability check rejects raw git spawns.
 - Running the app headless: `xvfb-run` plus `libxkbcommon-x11` (winit dlopens it; a missing one panics inside
   `xkbcommon-dl`). wgpu has no adapter under Xvfb, so "falling back to OpenGL" on stderr is expected.
+- Parallel agents in separate worktrees must not share a `CARGO_TARGET_DIR`. Cargo fingerprints path
+  packages by mtime and hashes them identically in every worktree, so one worktree runs another's stale test
+  binary and reports a false green.
 - Cargo's `build.rs` embeds remote CLIs only when `AMALGUM_EMBED_CLI_DIR` is set (release). Locally
   `ssh::embedded_cli` returns `None`; that is expected, not a bug.
 

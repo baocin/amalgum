@@ -12,11 +12,14 @@ What exists today, mapped to docs/SPEC.md. Update this file in the same PR as th
 | CI: gate on Linux + macOS; builds for x86_64-linux-gnu app, x86_64/aarch64-linux-musl CLI, aarch64/x86_64-apple-darwin app + CLI | ✅ | `.github/workflows/ci.yml` |
 | Link allow-list for the Linux app, fully static CLI < 2 MiB | ✅ | `scripts/check-linkage` |
 | macOS universal `.app` + `.dmg` (ad-hoc signed; Developer ID + notarization when secrets exist) | ✅ | `scripts/package-macos`, `release.yml` |
-| Linux tarball + `.desktop`; AppImage when `APPIMAGETOOL` is set | 🟡 | `scripts/package-linux` — no icon asset yet, so AppImage is not built in CI |
+| Linux tarball + `.desktop` + icon; AppImage when `APPIMAGETOOL` is set | 🟡 | `scripts/package-linux` — CI does not install appimagetool, so no AppImage is built yet |
 | Remote CLIs embedded into release apps | ✅ | `build.rs`, `release.yml`, `ssh::embedded_cli` |
-| Bundled fonts (Inter, JetBrains Mono) and icons | ⬜ | egui's default fonts are used |
+| Bundled fonts (Inter, JetBrains Mono, SIL OFL) and app icon | ✅ | `assets/`, `ui::fonts`; licenses ship in both packages |
 
 ## Core (headless, unit-tested)
+
+An adversarial review (six dimensions, every finding independently verified against real git, ssh and
+shells) found 55 distinct defects; all were fixed test-first and each fix was attacked again by a second reviewer.
 
 | Spec | Module | Status |
 |---|---|---|
@@ -35,7 +38,7 @@ What exists today, mapped to docs/SPEC.md. Update this file in the same PR as th
 | §5.27 OSC 7/0/2/9/99/777/133 + BEL scanner | `agent::osc` | ✅ |
 | §5.30 hibernation rules | `agent::hibernate` | ✅ (the UI that acts on them is ⬜) |
 | §5.29 notification store | `agent::notifications` | ✅ |
-| §5.27 port parsing (lsof/ss) | `ports`, `platform::listening_ports` | ✅ (polling from the UI ⬜) |
+| §5.27 port parsing (lsof/ss) | `ports`, `platform::listening_ports` | ✅ |
 | §5.23 settings with spec defaults | `model::settings` | ✅ |
 | §5.22 persistent state, §5.27 split layout | `model::state`, `model::layout` | ✅ |
 | §5.19, §7 action table, presets, palette matching | `model::keymap`, `model::fuzzy` | ✅ |
