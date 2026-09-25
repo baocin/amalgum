@@ -40,11 +40,11 @@ pub(super) struct CheckoutOutcome {
     pub entry: JournalEntry,
 }
 
-/// The outcome of a successful undo/redo worker job: the journal (handed back so the UI thread
-/// regains ownership of it) and what happened.
+/// The outcome of an undo/redo worker job: the journal (handed back so the UI thread regains
+/// ownership of it) and what happened.
 pub(super) struct JournalRunOutcome {
     pub journal: journal::Journal,
-    pub result: Result<(), Refused>,
+    pub result: Result<(), journal::Failed<GitError>>,
 }
 
 /// Replies carried back from worker threads over the pane's channel. Variants carrying a
@@ -97,7 +97,9 @@ pub(super) fn short_hash(id: &str) -> &str {
 /// runs it directly and accepts exit codes 0 and 1 as success.
 pub(super) fn diff_no_index(git: &Git, path: &str) -> Result<Vec<u8>, GitError> {
     use std::process::Stdio;
-    let args = ["diff", "--no-color", "--no-index", "--", "/dev/null", path]; // portability: allow
+    let mut args = vec!["diff", "--no-index"];
+    args.extend_from_slice(crate::git::diff::DIFF_ARGS);
+    args.extend(["--", "/dev/null", path]); // portability: allow
     let command_line = format!("git diff --no-index -- /dev/null {path}"); // portability: allow
     let mut cmd = git.command(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

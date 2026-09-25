@@ -1,7 +1,8 @@
-//! Diffs (§5.5–5.7): parse `git diff`/`git show` unified output, list changed files, synthesise
-//! patches that stage/unstage/discard a hunk or a line range (`git apply --cached [-R]`), and
-//! compute word-level intra-line highlights.
+//! Diffs (§5.5–5.7): parse `git diff`/`git show` unified output (run with [`DIFF_ARGS`]), list
+//! changed files, synthesise patches that stage/unstage/discard a hunk or a line range
+//! (`git apply --cached [-R]`), and compute word-level intra-line highlights.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -19,8 +20,17 @@ pub struct Line {
     pub kind: LineKind,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
-    /// Without the leading ` `/`+`/`-` and without the newline.
-    pub text: String,
+    /// The line's bytes without the leading ` `/`+`/`-` and the `\n`, verbatim — a CRLF line
+    /// keeps its `\r`, non-UTF-8 text is untouched — so [`patch_for`] reproduces it exactly.
+    /// Shown through [`Line::display`].
+    pub text: Vec<u8>,
+}
+
+impl Line {
+    /// `text` for display: decoded lossily, without a CRLF line's `\r`.
+    pub fn display(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(self.text.strip_suffix(b"\r").unwrap_or(&self.text))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +51,7 @@ pub struct FileDiff {
     /// `None` for deleted files.
     pub new_path: Option<String>,
     /// The `diff --git` header through the `+++` line, verbatim, for patch synthesis.
-    pub header: String,
+    pub header: Vec<u8>,
     pub binary: bool,
     pub hunks: Vec<Hunk>,
 }
@@ -158,9 +168,9 @@ fn take_quoted(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Best-effort path pair from `diff --git a/X b/Y`, used as a fallback for diffs that carry no
-/// other path line (mode-only changes). For quoted names the whole `"a/X" "b/Y"` pair is
-/// authoritative; for unquoted names, `X`/`Y` are found by the only split of `X b/Y` where the
-/// two halves are equal (true whenever the path is not itself being renamed).
+/// other path line (mode-only changes, binary files). For quoted names the whole `"a/X" "b/Y"`
+/// pair is authoritative; for unquoted names, `X`/`Y` are found by the only split of `X b/Y`
+/// where the two halves are equal (true whenever the path is not itself being renamed).
 fn split_diff_git_line(l: &str) -> Option<(String, String)> {
     let rest = l.strip_prefix("diff --git ")?;
     if rest.starts_with('"') {
@@ -186,21 +196,6 @@ fn split_diff_git_line(l: &str) -> Option<(String, String)> {
     None
 }
 
-/// `Binary files A and B differ` → the two (optionally quoted, optionally `/dev/null`) paths.
-fn parse_binary_paths(l: &str) -> Option<(Option<String>, Option<String>)> {
-    let rest = l.strip_prefix("Binary files ")?;
-    let rest = rest.strip_suffix(" differ")?;
-    let (a_raw, b_raw): (String, String) = if rest.starts_with('"') {
-        let (a, after) = take_quoted(rest)?;
-        let after = after.strip_prefix(" and ")?;
-        (format!("\"{a}\""), after.to_string())
-    } else {
-        let (a, b) = rest.split_once(" and ")?;
-        (a.to_string(), b.to_string())
-    };
-    Some((parse_prefixed_path(&a_raw, "a/"), parse_prefixed_path(&b_raw, "b/")))
-}
-
 /// `-a,b` / `+c,d` → `(start, len)`; a missing `,len` means length 1.
 fn parse_range(s: &str) -> Option<(u32, u32)> {
     let s = &s[1..];
@@ -215,33 +210,47 @@ fn parse_hunk_header(l: &str) -> Option<(u32, u32, u32, u32, String)> {
     let after = l.strip_prefix("@@ ")?;
     let close = after.find(" @@")?;
     let ranges = &after[..close];
-    let section = after[close + 3..].trim_start().to_string();
+    let section = after[close + 3..].trim().to_string();
     let (old, new) = ranges.split_once(' ')?;
     let (old_start, old_len) = parse_range(old)?;
     let (new_start, new_len) = parse_range(new)?;
     Some((old_start, old_len, new_start, new_len, section))
 }
 
-/// Parse unified diff output (possibly several files). Handles renames, mode changes, binary
-/// files, `\ No newline at end of file`, and quoted paths with escapes.
-pub fn parse(out: &str) -> Vec<FileDiff> {
-    let lines: Vec<&str> = out.lines().collect();
+/// Flags every `git diff`/`git show`/`git diff --no-index` whose output goes to [`parse`] must
+/// pass. They override the user config that changes what [`parse`] and [`patch_for`] rely on:
+/// color (`color.ui`), an external diff tool (`diff.external`) or textconv filter instead of
+/// git's own unified diff, and path prefixes other than `a/`/`b/` (`diff.noprefix`,
+/// `diff.mnemonicPrefix`).
+pub const DIFF_ARGS: &[&str] =
+    &["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
+
+/// Parse unified diff output (possibly several files) from a command run with [`DIFF_ARGS`].
+/// Handles renames, mode changes, binary files, `\ No newline at end of file`, and quoted
+/// paths with escapes. Content lines are kept as bytes: CRLF endings and non-UTF-8 text survive.
+pub fn parse(out: &[u8]) -> Vec<FileDiff> {
+    // Split on `\n` alone: `str::lines` would also strip the `\r` of a CRLF file's lines.
+    let mut lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
     let mut files = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if !lines[i].starts_with("diff --git ") {
+        if !lines[i].starts_with(b"diff --git ") {
             i += 1;
             continue;
         }
         let start = i;
-        let (mut old_path, mut new_path) = match split_diff_git_line(lines[i]) {
+        let (mut old_path, mut new_path) = match split_diff_git_line(&String::from_utf8_lossy(lines[i])) {
             Some((a, b)) => (Some(a), Some(b)),
             None => (None, None),
         };
         let mut binary = false;
         i += 1;
-        while i < lines.len() && !lines[i].starts_with("@@ ") && !lines[i].starts_with("diff --git ") {
-            let l = lines[i];
+        while i < lines.len() && !lines[i].starts_with(b"@@ ") && !lines[i].starts_with(b"diff --git ") {
+            let l = String::from_utf8_lossy(lines[i]);
+            let l = l.as_ref();
             if let Some(rest) = l.strip_prefix("rename from ") {
                 old_path = Some(dequote_path(rest));
             } else if let Some(rest) = l.strip_prefix("rename to ") {
@@ -259,57 +268,58 @@ pub fn parse(out: &str) -> Vec<FileDiff> {
             } else if let Some(rest) = l.strip_prefix("+++ ") {
                 new_path = parse_prefixed_path(rest, "b/");
             } else if l.starts_with("Binary files ") && l.ends_with(" differ") {
+                // Only the flag: the paths come from the lines above (`new file mode` and
+                // `deleted file mode` mark the `/dev/null` side). This line can't name them
+                // itself — an unquoted name may contain the " and " separating the two.
                 binary = true;
-                if let Some((a, b)) = parse_binary_paths(l) {
-                    old_path = a;
-                    new_path = b;
-                }
             }
             i += 1;
         }
-        let header_end = i;
-        let header = lines[start..header_end].join("\n") + "\n";
+        let mut header = lines[start..i].join(&b'\n');
+        header.push(b'\n');
 
         let mut hunks = Vec::new();
-        while i < lines.len() && lines[i].starts_with("@@ ") {
-            let Some((old_start, old_len, new_start, new_len, section)) = parse_hunk_header(lines[i]) else {
+        while i < lines.len() && lines[i].starts_with(b"@@ ") {
+            let Some((old_start, old_len, new_start, new_len, section)) =
+                parse_hunk_header(&String::from_utf8_lossy(lines[i]))
+            else {
                 break;
             };
             i += 1;
             let mut hunk_lines = Vec::new();
             let mut old_no = old_start;
             let mut new_no = new_start;
-            while i < lines.len() && !lines[i].starts_with("@@ ") && !lines[i].starts_with("diff --git ") {
+            while i < lines.len() && !lines[i].starts_with(b"@@ ") && !lines[i].starts_with(b"diff --git ") {
                 let l = lines[i];
-                if l == "\\ No newline at end of file" {
+                if l == b"\\ No newline at end of file" {
                     hunk_lines.push(Line {
                         kind: LineKind::NoNewline,
                         old_no: None,
                         new_no: None,
-                        text: String::new(),
+                        text: Vec::new(),
                     });
-                } else if let Some(t) = l.strip_prefix('+') {
+                } else if let Some(t) = l.strip_prefix(b"+") {
                     hunk_lines.push(Line {
                         kind: LineKind::Add,
                         old_no: None,
                         new_no: Some(new_no),
-                        text: t.to_string(),
+                        text: t.to_vec(),
                     });
                     new_no += 1;
-                } else if let Some(t) = l.strip_prefix('-') {
+                } else if let Some(t) = l.strip_prefix(b"-") {
                     hunk_lines.push(Line {
                         kind: LineKind::Del,
                         old_no: Some(old_no),
                         new_no: None,
-                        text: t.to_string(),
+                        text: t.to_vec(),
                     });
                     old_no += 1;
-                } else if let Some(t) = l.strip_prefix(' ') {
+                } else if let Some(t) = l.strip_prefix(b" ") {
                     hunk_lines.push(Line {
                         kind: LineKind::Context,
                         old_no: Some(old_no),
                         new_no: Some(new_no),
-                        text: t.to_string(),
+                        text: t.to_vec(),
                     });
                     old_no += 1;
                     new_no += 1;
@@ -318,7 +328,7 @@ pub fn parse(out: &str) -> Vec<FileDiff> {
                         kind: LineKind::Context,
                         old_no: Some(old_no),
                         new_no: Some(new_no),
-                        text: String::new(),
+                        text: Vec::new(),
                     });
                     old_no += 1;
                     new_no += 1;
@@ -342,96 +352,145 @@ pub enum Selection {
     Lines(std::ops::RangeInclusive<usize>),
 }
 
+/// One line of a [`patch_for`] hunk: the sides of the patch it is on (both for context), and
+/// whether the diff marked it `\ No newline at end of file`.
+struct PatchLine<'a> {
+    old: bool,
+    new: bool,
+    text: &'a [u8],
+    no_newline: bool,
+}
+
+fn push_patch_line(out: &mut Vec<u8>, sign: u8, text: &[u8], no_newline: bool) {
+    out.push(sign);
+    out.extend_from_slice(text);
+    out.push(b'\n');
+    if no_newline {
+        out.extend_from_slice(b"\\ No newline at end of file\n");
+    }
+}
+
 /// Build a patch applying only `sel` of `file.hunks[hunk]`, suitable for
 /// `git apply --cached` (stage), `git apply --cached -R` (unstage), or `git apply -R`
 /// (discard). Unselected `+` lines are dropped; unselected `-` lines become context; hunk header
 /// counts are recomputed. `reverse` means the patch will be applied with `-R` (so unselected
-/// `+` lines become context instead). Returns `None` if the selection contains no change.
-pub fn patch_for(file: &FileDiff, hunk: usize, sel: &Selection, reverse: bool) -> Option<String> {
+/// `+` lines become context instead). The patch changes the file's content only: a rename, copy,
+/// or mode change is left to file-level actions, and part of a new or deleted file is patched
+/// in place (`patch_header`). Returns `None` if the selection contains no change, or if the
+/// header names no `a/`/`b/` path (`file` did not come from [`DIFF_ARGS`] output).
+pub fn patch_for(file: &FileDiff, hunk: usize, sel: &Selection, reverse: bool) -> Option<Vec<u8>> {
     let h = file.hunks.get(hunk)?;
     let selected = |k: usize| match sel {
         Selection::WholeHunk => true,
         Selection::Lines(r) => r.contains(&k),
     };
-    let has_change =
-        (0..h.lines.len()).any(|k| selected(k) && matches!(h.lines[k].kind, LineKind::Add | LineKind::Del));
-    if !has_change {
+    let is_change = |k: usize| matches!(h.lines[k].kind, LineKind::Add | LineKind::Del);
+    if !(0..h.lines.len()).any(|k| selected(k) && is_change(k)) {
         return None;
     }
+    let whole_file = file.hunks.len() == 1 && (0..h.lines.len()).all(|k| selected(k) || !is_change(k));
 
-    let mut old_len = 0u32;
-    let mut new_len = 0u32;
-    let mut body = String::new();
-    let mut prev_emitted = false;
+    let mut kept: Vec<PatchLine> = Vec::new();
+    let mut prev_kept = false;
     for (k, line) in h.lines.iter().enumerate() {
-        match line.kind {
+        let (old, new) = match line.kind {
             LineKind::NoNewline => {
-                if prev_emitted {
-                    body.push_str("\\ No newline at end of file\n");
+                if prev_kept && let Some(prev) = kept.last_mut() {
+                    prev.no_newline = true;
                 }
+                continue;
             }
-            LineKind::Context => {
-                body.push(' ');
-                body.push_str(&line.text);
-                body.push('\n');
-                old_len += 1;
-                new_len += 1;
-                prev_emitted = true;
+            LineKind::Context => (true, true),
+            LineKind::Add if selected(k) => (false, true),
+            LineKind::Del if selected(k) => (true, false),
+            // Unselected `+` becomes context: the `-R` apply must leave it untouched.
+            LineKind::Add if reverse => (true, true),
+            // Unselected `-` becomes context: the forward apply must leave it untouched.
+            LineKind::Del if !reverse => (true, true),
+            LineKind::Add | LineKind::Del => {
+                prev_kept = false;
+                continue;
             }
-            LineKind::Add => {
-                let keep_sign = selected(k);
-                if keep_sign {
-                    body.push('+');
-                    body.push_str(&line.text);
-                    body.push('\n');
-                    new_len += 1;
-                    prev_emitted = true;
-                } else if reverse {
-                    // Unselected `+` becomes context: the `-R` apply must leave it untouched.
-                    body.push(' ');
-                    body.push_str(&line.text);
-                    body.push('\n');
-                    old_len += 1;
-                    new_len += 1;
-                    prev_emitted = true;
-                } else {
-                    prev_emitted = false;
-                }
+        };
+        kept.push(PatchLine { old, new, text: &line.text, no_newline: false });
+        prev_kept = true;
+    }
+
+    let (mut old_len, mut new_len) = (0u32, 0u32);
+    let mut body = Vec::new();
+    for (idx, line) in kept.iter().enumerate() {
+        old_len += u32::from(line.old);
+        new_len += u32::from(line.new);
+        // `\ No newline` holds on a side only while the line is that side's last line in this
+        // patch. A `-b` the selection turned into context can be followed by kept `+` lines;
+        // `b` then needs its newline on the new side, or git glues the next line onto it.
+        let later = &kept[idx + 1..];
+        let old_eof = line.no_newline && line.old && !later.iter().any(|l| l.old);
+        let new_eof = line.no_newline && line.new && !later.iter().any(|l| l.new);
+        match (line.old, line.new) {
+            (true, true) if old_eof == new_eof => push_patch_line(&mut body, b' ', line.text, old_eof),
+            (true, true) => {
+                push_patch_line(&mut body, b'-', line.text, old_eof);
+                push_patch_line(&mut body, b'+', line.text, new_eof);
             }
-            LineKind::Del => {
-                let keep_sign = selected(k);
-                if keep_sign {
-                    body.push('-');
-                    body.push_str(&line.text);
-                    body.push('\n');
-                    old_len += 1;
-                    prev_emitted = true;
-                } else if !reverse {
-                    // Unselected `-` becomes context: the forward apply must leave it untouched.
-                    body.push(' ');
-                    body.push_str(&line.text);
-                    body.push('\n');
-                    old_len += 1;
-                    new_len += 1;
-                    prev_emitted = true;
-                } else {
-                    prev_emitted = false;
-                }
-            }
+            (true, false) => push_patch_line(&mut body, b'-', line.text, old_eof),
+            _ => push_patch_line(&mut body, b'+', line.text, new_eof),
         }
     }
 
-    // Isolated single-hunk patch: nothing before this hunk changed, so new_start == old_start.
-    // git apply locates the hunk by context, tolerating the (possibly stale) offset.
-    let mut patch = file.header.clone();
-    patch.push_str(&format!("@@ -{},{} +{},{} @@", h.old_start, old_len, h.old_start, new_len));
+    // The patch's two sides differ by this hunk alone, so both start where the hunk sits in
+    // the file being patched: at the diff's old side for a forward apply (the index, which has
+    // none of the diff's hunks), at its new side under `-R` (the worktree or index, which has
+    // all of them). git apply starts searching there and takes the nearest match, so starting
+    // on the wrong side can land on an identical block elsewhere. As in git's own output, an
+    // empty side is numbered by the line before it.
+    let (start, len) = if reverse { (h.new_start, h.new_len) } else { (h.old_start, h.old_len) };
+    let first = if len == 0 { start.saturating_add(1) } else { start };
+    let range =
+        |n: u32| if n == 0 { format!("{},0", first.saturating_sub(1)) } else { format!("{first},{n}") };
+
+    let mut patch = patch_header(file, reverse, whole_file)?;
+    patch.extend_from_slice(format!("@@ -{} +{} @@", range(old_len), range(new_len)).as_bytes());
     if !h.section.is_empty() {
-        patch.push(' ');
-        patch.push_str(&h.section);
+        patch.push(b' ');
+        patch.extend_from_slice(h.section.as_bytes());
     }
-    patch.push('\n');
-    patch.push_str(&body);
+    patch.push(b'\n');
+    patch.extend_from_slice(&body);
     Some(patch)
+}
+
+/// The file header of a [`patch_for`] patch. The diff's own header is kept only when the patch
+/// must create or delete the file: when the index or worktree being patched lacks the file
+/// (staging part of a new file, restoring part of a deleted one), and when the selection is the
+/// whole change of a new or deleted file in the other direction. Otherwise the patch edits the
+/// file in place, under its name in the index or worktree being patched (the diff's old side
+/// forward, its new side under `-R`), with a plain `a/P b/P` header. A rename, copy, or mode
+/// change belongs to the whole file, not to a hunk or line range, and a partial selection of a
+/// new or deleted file keeps the file. `None` if that name is missing or lacks its `a/`/`b/`
+/// prefix.
+fn patch_header(file: &FileDiff, reverse: bool, whole_file: bool) -> Option<Vec<u8>> {
+    let (is_new, is_deleted) = (file.old_path.is_none(), file.new_path.is_none());
+    let (target_lacks_file, removes_file) = if reverse { (is_deleted, is_new) } else { (is_new, is_deleted) };
+    if target_lacks_file || (removes_file && whole_file) {
+        return Some(file.header.clone());
+    }
+    let marker: &[u8] = if reverse { b"+++ " } else { b"--- " };
+    let name = file.header.split(|&b| b == b'\n').find_map(|l| l.strip_prefix(marker))?;
+    // git ends a `---`/`+++` name that contains a space with a tab.
+    let name = name.strip_suffix(b"\t").unwrap_or(name);
+    let (a, b) = (with_side_prefix(name, b'a')?, with_side_prefix(name, b'b')?);
+    Some([&b"diff --git "[..], &a, b" ", &b, b"\n--- ", &a, b"\n+++ ", &b, b"\n"].concat())
+}
+
+/// A header name as git prints it (`a/X`, `b/X`, or quoted `"a/X"`) with its side set to `side`.
+fn with_side_prefix(name: &[u8], side: u8) -> Option<Vec<u8>> {
+    let (quote, unquoted) = match name.strip_prefix(b"\"") {
+        Some(rest) => (&b"\""[..], rest),
+        None => (&b""[..], name),
+    };
+    let path = unquoted.strip_prefix(b"a/").or_else(|| unquoted.strip_prefix(b"b/"))?;
+    Some([quote, &[side, b'/'], path].concat())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,14 +706,14 @@ mod tests {
         repo.commit_file("a.txt", "one\ntwo\nthree\n", "init");
         repo.write("a.txt", "one\nCHANGED\nthree\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert_eq!(f.old_path.as_deref(), Some("a.txt"));
         assert_eq!(f.new_path.as_deref(), Some("a.txt"));
         assert!(!f.binary);
-        assert!(f.header.starts_with("diff --git a/a.txt b/a.txt\n"));
-        assert!(f.header.ends_with("+++ b/a.txt\n"));
+        assert!(f.header.starts_with(b"diff --git a/a.txt b/a.txt\n"));
+        assert!(f.header.ends_with(b"+++ b/a.txt\n"));
         assert_eq!(f.hunks.len(), 1);
         let h = &f.hunks[0];
         assert_eq!((h.old_start, h.old_len, h.new_start, h.new_len), (1, 3, 1, 3));
@@ -684,7 +743,7 @@ mod tests {
         repo.write("new.txt", "hello\nworld\n");
         repo.git(&["add", "-A"]);
         let out = repo.git(&["diff", "--cached", "--", "new.txt"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert_eq!(f.old_path, None);
@@ -700,7 +759,7 @@ mod tests {
         repo.commit_file("gone.txt", "bye\n", "init");
         std::fs::remove_file(repo.path().join("gone.txt")).expect("rm");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].old_path.as_deref(), Some("gone.txt"));
         assert_eq!(files[0].new_path, None);
@@ -720,13 +779,13 @@ mod tests {
         );
         repo.git(&["add", "-A"]);
         let out = repo.git(&["diff", "--cached", "-M"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].old_path.as_deref(), Some("orig.txt"));
         assert_eq!(files[0].new_path.as_deref(), Some("renamed.txt"));
         assert_eq!(files[0].hunks.len(), 1);
-        assert!(files[0].hunks[0].lines.iter().any(|l| l.kind == LineKind::Del && l.text == "5"));
-        assert!(files[0].hunks[0].lines.iter().any(|l| l.kind == LineKind::Add && l.text == "EDITED"));
+        assert!(files[0].hunks[0].lines.iter().any(|l| l.kind == LineKind::Del && l.text == b"5"));
+        assert!(files[0].hunks[0].lines.iter().any(|l| l.kind == LineKind::Add && l.text == b"EDITED"));
     }
 
     #[test]
@@ -743,14 +802,14 @@ mod tests {
         }
         std::fs::set_permissions(&path, perm).expect("chmod");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].old_path.as_deref(), Some("script.sh"));
         assert_eq!(files[0].new_path.as_deref(), Some("script.sh"));
         assert!(files[0].hunks.is_empty());
         assert!(!files[0].binary);
-        assert!(files[0].header.contains("old mode 100644"));
-        assert!(files[0].header.contains("new mode 100755"));
+        assert!(String::from_utf8_lossy(&files[0].header).contains("old mode 100644"));
+        assert!(String::from_utf8_lossy(&files[0].header).contains("new mode 100755"));
     }
 
     #[test]
@@ -762,7 +821,7 @@ mod tests {
         repo.commit("init");
         std::fs::write(repo.path().join("img.png"), [0x89, b'P', b'N', b'G', 9, 9, 9]).expect("write");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 1);
         assert!(files[0].binary);
         assert!(files[0].hunks.is_empty());
@@ -778,7 +837,7 @@ mod tests {
         repo.commit("init");
         std::fs::write(repo.path().join("nn.txt"), "after").expect("write");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
         let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
         assert_eq!(kinds, vec![LineKind::Del, LineKind::NoNewline, LineKind::Add, LineKind::NoNewline]);
@@ -792,7 +851,7 @@ mod tests {
         std::fs::write(repo.path().join(name), "hello\n").expect("write");
         repo.git(&["add", "-A"]);
         let out = repo.git(&["diff", "--cached"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let f = files.iter().find(|f| f.new_path.as_deref() != Some("keep.txt")).expect("found");
         assert_eq!(f.new_path.as_deref(), Some(name));
         assert_eq!(f.old_path, None);
@@ -811,7 +870,7 @@ mod tests {
             .collect();
         repo.write("multi.txt", &content);
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files[0].hunks.len(), 2);
         assert_eq!(files[0].hunks[0].old_start, 1);
         assert_eq!(files[0].hunks[1].old_start, 25);
@@ -822,7 +881,7 @@ mod tests {
         // Hand-written: git omits `,1` when a side's length is 1.
         let diff =
             "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -5 +5,2 @@\n context\n+added\n";
-        let files = parse(diff);
+        let files = parse(diff.as_bytes());
         let h = &files[0].hunks[0];
         assert_eq!((h.old_start, h.old_len, h.new_start, h.new_len), (5, 1, 5, 2));
     }
@@ -832,7 +891,7 @@ mod tests {
         // Hand-written: `-C` output isn't produced by our default flags, but the format is fixed.
         let diff =
             "diff --git a/orig.txt b/copy.txt\ncopy from orig.txt\ncopy to copy.txt\nindex 1..1 100644\n";
-        let files = parse(diff);
+        let files = parse(diff.as_bytes());
         assert_eq!(files[0].old_path.as_deref(), Some("orig.txt"));
         assert_eq!(files[0].new_path.as_deref(), Some("copy.txt"));
         assert!(files[0].hunks.is_empty());
@@ -841,7 +900,7 @@ mod tests {
     #[test]
     fn parse_hunk_section_text() {
         let diff = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@ fn foo() {\n context\n-old\n+new\n";
-        let files = parse(diff);
+        let files = parse(diff.as_bytes());
         assert_eq!(files[0].hunks[0].section, "fn foo() {");
     }
 
@@ -853,7 +912,7 @@ mod tests {
         repo.write("a.txt", "A\n");
         repo.write("b.txt", "B\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].new_path.as_deref(), Some("a.txt"));
         assert_eq!(files[1].new_path.as_deref(), Some("b.txt"));
@@ -862,7 +921,7 @@ mod tests {
     // ---- patch_for() --------------------------------------------------------------------
 
     /// Feed `patch` to `git <args>` on stdin; panics with stderr on failure.
-    fn run_apply(repo: &TempRepo, args: &[&str], patch: &str) {
+    fn run_apply(repo: &TempRepo, args: &[&str], patch: &[u8]) {
         let mut child = hermetic_git(repo.path())
             .args(args)
             .stdin(Stdio::piped())
@@ -870,22 +929,22 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn git apply");
-        child.stdin.take().expect("stdin").write_all(patch.as_bytes()).expect("write patch");
+        child.stdin.take().expect("stdin").write_all(patch).expect("write patch");
         let out = child.wait_with_output().expect("wait");
         assert!(out.status.success(), "git {args:?} failed:\n{}", String::from_utf8_lossy(&out.stderr));
     }
 
-    fn stage(repo: &TempRepo, patch: &str) {
+    fn stage(repo: &TempRepo, patch: &[u8]) {
         run_apply(repo, &["apply", "--cached", "--check"], patch);
         run_apply(repo, &["apply", "--cached"], patch);
     }
 
-    fn unstage(repo: &TempRepo, patch: &str) {
+    fn unstage(repo: &TempRepo, patch: &[u8]) {
         run_apply(repo, &["apply", "--cached", "-R", "--check"], patch);
         run_apply(repo, &["apply", "--cached", "-R"], patch);
     }
 
-    fn discard(repo: &TempRepo, patch: &str) {
+    fn discard(repo: &TempRepo, patch: &[u8]) {
         run_apply(repo, &["apply", "-R", "--check"], patch);
         run_apply(repo, &["apply", "-R"], patch);
     }
@@ -900,7 +959,7 @@ mod tests {
         repo.commit_file("a.txt", "one\ntwo\nthree\n", "init");
         repo.write("a.txt", "one\nCHANGED\nthree\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
         stage(&repo, &patch);
         assert_eq!(staged_content(&repo, "a.txt"), "one\nCHANGED\nthree\n");
@@ -912,11 +971,11 @@ mod tests {
         repo.commit_file("a.txt", "1\n2\n3\n4\n5\n", "init");
         repo.write("a.txt", "1\nTWO\n3\nFOUR\n5\nSIX\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
         // Select only the `+FOUR` line: its paired `-4` is untouched (kept as context, i.e. `4`
         // stays), so the index ends up with both `4` and `FOUR` — matching `git add -p`.
-        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == "FOUR").expect("found");
+        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == b"FOUR").expect("found");
         let patch = patch_for(&files[0], 0, &Selection::Lines(idx..=idx), false).expect("patch");
         stage(&repo, &patch);
         assert_eq!(staged_content(&repo, "a.txt"), "1\n2\n3\n4\nFOUR\n5\n");
@@ -928,9 +987,9 @@ mod tests {
         repo.commit_file("a.txt", "1\n2\n3\n4\n5\n", "init");
         repo.write("a.txt", "1\nTWO\n3\nFOUR\n5\nSIX\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
-        let idx = h.lines.iter().position(|l| l.kind == LineKind::Del && l.text == "2").expect("found");
+        let idx = h.lines.iter().position(|l| l.kind == LineKind::Del && l.text == b"2").expect("found");
         let patch = patch_for(&files[0], 0, &Selection::Lines(idx..=idx), false).expect("patch");
         stage(&repo, &patch);
         assert_eq!(staged_content(&repo, "a.txt"), "1\n3\n4\n5\n");
@@ -942,11 +1001,11 @@ mod tests {
         repo.commit_file("a.txt", "1\n2\n3\n4\n5\n", "init");
         repo.write("a.txt", "1\nTWO\n3\nFOUR\n5\nSIX\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
         // Select the `-2`, `+TWO`, `-4` run (everything about the "2"/"4" edits, not "SIX"/"FOUR").
-        let start = h.lines.iter().position(|l| l.text == "2" && l.kind == LineKind::Del).expect("s");
-        let end = h.lines.iter().position(|l| l.text == "4" && l.kind == LineKind::Del).expect("e");
+        let start = h.lines.iter().position(|l| l.text == b"2" && l.kind == LineKind::Del).expect("s");
+        let end = h.lines.iter().position(|l| l.text == b"4" && l.kind == LineKind::Del).expect("e");
         let patch = patch_for(&files[0], 0, &Selection::Lines(start..=end), false).expect("patch");
         stage(&repo, &patch);
         // "4" is removed (its `-4` was selected) and "FOUR" is dropped (its `+FOUR` was not).
@@ -966,7 +1025,7 @@ mod tests {
             .collect();
         repo.write("multi.txt", &content);
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         assert_eq!(files[0].hunks.len(), 2);
         let patch = patch_for(&files[0], 1, &Selection::WholeHunk, false).expect("patch");
         stage(&repo, &patch);
@@ -983,7 +1042,7 @@ mod tests {
         repo.write("a.txt", "1\nTWO\n3\n");
         repo.git(&["add", "-A"]);
         let out = repo.git(&["diff", "--cached"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
         unstage(&repo, &patch);
         assert_eq!(staged_content(&repo, "a.txt"), "1\n2\n3\n");
@@ -999,9 +1058,9 @@ mod tests {
         repo.write("a.txt", "1\nTWO\n3\nFOUR\n5\n");
         repo.git(&["add", "-A"]);
         let out = repo.git(&["diff", "--cached"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
-        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == "TWO").expect("found");
+        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == b"TWO").expect("found");
         let patch = patch_for(&files[0], 0, &Selection::Lines(idx..=idx), true).expect("patch");
         unstage(&repo, &patch);
         // "TWO" is removed from the index; its paired `-2` wasn't selected so it stays dropped
@@ -1016,7 +1075,7 @@ mod tests {
         repo.commit_file("a.txt", "1\n2\n3\n", "init");
         repo.write("a.txt", "1\nTWO\n3\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
         discard(&repo, &patch);
         let wt = std::fs::read_to_string(repo.path().join("a.txt")).expect("read");
@@ -1029,9 +1088,9 @@ mod tests {
         repo.commit_file("a.txt", "1\n2\n3\n4\n5\n", "init");
         repo.write("a.txt", "1\nTWO\n3\nFOUR\n5\n");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
-        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == "TWO").expect("found");
+        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add && l.text == b"TWO").expect("found");
         let patch = patch_for(&files[0], 0, &Selection::Lines(idx..=idx), true).expect("patch");
         discard(&repo, &patch);
         // "TWO" is discarded from the worktree; its paired `-2` wasn't selected so "2" is not
@@ -1049,9 +1108,9 @@ mod tests {
         // in a plain `git diff` as a normal `--- /dev/null` addition, without staging content.
         repo.git(&["add", "-N", "new.txt"]);
         let out = repo.git(&["diff", "--", "new.txt"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let h = &files[0].hunks[0];
-        let idx = h.lines.iter().position(|l| l.text == "beta").expect("found");
+        let idx = h.lines.iter().position(|l| l.text == b"beta").expect("found");
         let patch = patch_for(&files[0], 0, &Selection::Lines(idx..=idx), false).expect("patch");
         stage(&repo, &patch);
         assert_eq!(staged_content(&repo, "new.txt"), "beta\n");
@@ -1065,9 +1124,9 @@ mod tests {
         repo.commit("init");
         std::fs::write(repo.path().join("nn.txt"), "1\n2\nnew").expect("write");
         let out = repo.git(&["diff"]);
-        let files = parse(&out);
+        let files = parse(out.as_bytes());
         let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
-        assert!(patch.trim_end_matches('\n').ends_with("No newline at end of file"));
+        assert!(patch.ends_with(b"\n\\ No newline at end of file\n"));
         stage(&repo, &patch);
         let staged = repo.git(&["show", ":nn.txt"]);
         assert_eq!(staged, "1\n2\nnew");
@@ -1077,7 +1136,7 @@ mod tests {
     fn patch_for_returns_none_without_change_lines() {
         let diff =
             "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
-        let files = parse(diff);
+        let files = parse(diff.as_bytes());
         // Select only the context lines (indices 0 and 3): no +/- present.
         assert_eq!(patch_for(&files[0], 0, &Selection::Lines(0..=0), false), None);
     }
@@ -1085,8 +1144,418 @@ mod tests {
     #[test]
     fn patch_for_unknown_hunk_index_returns_none() {
         let diff = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n";
-        let files = parse(diff);
+        let files = parse(diff.as_bytes());
         assert_eq!(patch_for(&files[0], 5, &Selection::WholeHunk, false), None);
+    }
+
+    // ---- patch_for(): positions, line endings, encodings, file headers ----------------------
+
+    /// `git <cmd> <DIFF_ARGS> <rest>`, parsed: the argv every caller of `parse` pins.
+    fn diff_of(repo: &TempRepo, cmd: &str, rest: &[&str]) -> Vec<FileDiff> {
+        let mut args = vec![cmd];
+        args.extend_from_slice(DIFF_ARGS);
+        args.extend_from_slice(rest);
+        parse(&repo.git_raw(&args))
+    }
+
+    fn staged_bytes(repo: &TempRepo, path: &str) -> Vec<u8> {
+        repo.git_raw(&["show", &format!(":{path}")])
+    }
+
+    fn worktree_bytes(repo: &TempRepo, path: &str) -> Vec<u8> {
+        std::fs::read(repo.path().join(path)).expect("read")
+    }
+
+    /// `c1 c2 c3 <mid> c4 c5 c6`, one per line.
+    fn block(mid: &str) -> String {
+        format!("c1\nc2\nc3\n{mid}\nc4\nc5\nc6\n")
+    }
+
+    /// Two identical blocks, with the second one's `KEEP` changed to `NEW` and 30 lines inserted
+    /// above both: hunk 1 is `@@ -17,7 +47,7 @@`, and in the patched file the first block (at
+    /// 32) sits nearer the hunk's old line (17) than the hunk itself does (47).
+    fn shifted_repeated_blocks() -> (String, String, String) {
+        let filler: String = (1..=8).map(|n| format!("f{n}\n")).collect();
+        let inserted: String = (1..=30).map(|n| format!("ins{n}\n")).collect();
+        let old = format!("top\n{}{filler}{}", block("NEW"), block("KEEP"));
+        let new = format!("top\n{inserted}{}{filler}{}", block("NEW"), block("NEW"));
+        let new_without_hunk_1 = format!("top\n{inserted}{}{filler}{}", block("NEW"), block("KEEP"));
+        (old, new, new_without_hunk_1)
+    }
+
+    #[test]
+    fn patch_for_discard_hunk_after_line_shifting_hunk_reverts_that_hunk() {
+        let (old, new, expected) = shifted_repeated_blocks();
+        let mut repo = TempRepo::new();
+        repo.commit_file("f.txt", &old, "init");
+        repo.write("f.txt", &new);
+        let files = diff_of(&repo, "diff", &[]);
+        assert_eq!((files[0].hunks[1].old_start, files[0].hunks[1].new_start), (17, 47));
+        let patch = patch_for(&files[0], 1, &Selection::WholeHunk, true).expect("patch");
+        discard(&repo, &patch);
+        assert_eq!(String::from_utf8(worktree_bytes(&repo, "f.txt")).expect("utf8"), expected);
+    }
+
+    #[test]
+    fn patch_for_unstage_hunk_after_line_shifting_hunk_reverts_that_hunk() {
+        let (old, new, expected) = shifted_repeated_blocks();
+        let mut repo = TempRepo::new();
+        repo.commit_file("f.txt", &old, "init");
+        repo.write("f.txt", &new);
+        repo.git(&["add", "-A"]);
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        let patch = patch_for(&files[0], 1, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "f.txt")).expect("utf8"), expected);
+    }
+
+    /// Index `a\nb` (no final newline), worktree `a\nb\nc\n`: ` a`, `-b`, `\`, `+b`, `+c`.
+    fn appended_after_missing_newline() -> (TempRepo, FileDiff) {
+        let mut repo = TempRepo::new();
+        std::fs::write(repo.path().join("nn.txt"), "a\nb").expect("write");
+        repo.git(&["add", "-A"]);
+        repo.commit("init");
+        repo.write("nn.txt", "a\nb\nc\n");
+        let file = diff_of(&repo, "diff", &[]).remove(0);
+        let kinds: Vec<LineKind> = file.hunks[0].lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            [LineKind::Context, LineKind::Del, LineKind::NoNewline, LineKind::Add, LineKind::Add]
+        );
+        (repo, file)
+    }
+
+    #[test]
+    fn patch_for_stage_line_appended_after_last_line_without_newline() {
+        let (repo, file) = appended_after_missing_newline();
+        // `+c` alone: `b` stays, so it needs its newline before `c` can follow it.
+        let patch = patch_for(&file, 0, &Selection::Lines(4..=4), false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "nn.txt"), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn patch_for_stage_added_lines_but_not_deleted_last_line_without_newline() {
+        let (repo, file) = appended_after_missing_newline();
+        // `+b`, `+c` without `-b`: the old `b` is kept and the two lines follow it.
+        let patch = patch_for(&file, 0, &Selection::Lines(3..=4), false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "nn.txt"), b"a\nb\nb\nc\n");
+    }
+
+    #[test]
+    fn patch_for_discard_deleted_last_line_without_newline_before_kept_lines() {
+        let (repo, file) = appended_after_missing_newline();
+        // Discarding only `-b` restores the old `b`; the kept `b`, `c` follow it, so it is no
+        // longer the last line and takes a newline.
+        let patch = patch_for(&file, 0, &Selection::Lines(1..=1), true).expect("patch");
+        discard(&repo, &patch);
+        assert_eq!(worktree_bytes(&repo, "nn.txt"), b"a\nb\nb\nc\n");
+    }
+
+    #[test]
+    fn parse_keeps_line_bytes_and_display_decodes_them() {
+        let diff = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n same\r\n-caf\xe9\r\n+cafe\r\n";
+        let lines = &parse(diff)[0].hunks[0].lines;
+        assert_eq!(lines[0].text, b"same\r");
+        assert_eq!(lines[1].text, b"caf\xe9\r");
+        assert_eq!(lines[0].display(), "same");
+        assert_eq!(lines[1].display(), "caf\u{FFFD}");
+        assert_eq!(lines[2].display(), "cafe");
+    }
+
+    #[test]
+    fn patch_for_crlf_file_stages_hunk_and_line_with_line_endings_intact() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("f.txt", "one\r\ntwo\r\nthree\r\nfour\r\n", "init");
+        repo.write("f.txt", "one\r\nTWO\r\nthree\r\nFOUR\r\n");
+        let files = diff_of(&repo, "diff", &[]);
+        let h = &files[0].hunks[0];
+        let idx = h.lines.iter().position(|l| l.kind == LineKind::Add).expect("add");
+        let patch = patch_for(&files[0], 0, &Selection::Lines(idx - 1..=idx), false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "f.txt"), b"one\r\nTWO\r\nthree\r\nfour\r\n");
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "f.txt"), b"one\r\nTWO\r\nthree\r\nFOUR\r\n");
+    }
+
+    #[test]
+    fn patch_for_crlf_new_file_keeps_line_endings() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("keep.txt", "x\n", "init");
+        repo.write("n.txt", "alpha\r\nbeta\r\n");
+        repo.git(&["add", "-N", "n.txt"]);
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "n.txt"), b"alpha\r\nbeta\r\n");
+    }
+
+    #[test]
+    fn patch_for_non_utf8_lines_are_staged_byte_exact() {
+        let mut repo = TempRepo::new();
+        std::fs::write(repo.path().join("l1.txt"), b"caf\xe9\nsame\nold\n").expect("write");
+        repo.git(&["add", "-A"]);
+        repo.commit("init");
+        // Latin-1 in a context line and in the added line.
+        std::fs::write(repo.path().join("l1.txt"), b"caf\xe9\nsame\nna\xefve\n").expect("write");
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "l1.txt"), b"caf\xe9\nsame\nna\xefve\n");
+    }
+
+    #[test]
+    fn patch_for_non_utf8_new_file_is_staged_byte_exact() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("keep.txt", "x\n", "init");
+        std::fs::write(repo.path().join("new.txt"), b"caf\xe9\n").expect("write");
+        repo.git(&["add", "-N", "new.txt"]);
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "new.txt"), b"caf\xe9\n");
+    }
+
+    fn forty_lines(edit: &[u32]) -> String {
+        (1..=40).map(|n| if edit.contains(&n) { format!("EDIT{n}\n") } else { format!("{n}\n") }).collect()
+    }
+
+    #[test]
+    fn patch_for_unstage_hunk_of_staged_rename_keeps_the_rename() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("orig.txt", &forty_lines(&[]), "init");
+        repo.git(&["mv", "orig.txt", "renamed.txt"]);
+        repo.write("renamed.txt", &forty_lines(&[3, 37]));
+        repo.git(&["add", "-A"]);
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        assert_eq!(files[0].old_path.as_deref(), Some("orig.txt"));
+        assert_eq!(files[0].hunks.len(), 2);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        let status = repo.git(&["diff", "--cached", "--name-status", "-M"]);
+        assert!(status.starts_with('R') && status.ends_with("\torig.txt\trenamed.txt"), "{status}");
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "renamed.txt")).expect("utf8"), forty_lines(&[37]));
+    }
+
+    #[test]
+    fn patch_for_hunk_of_rename_with_space_and_quoted_names() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("old name.txt", &forty_lines(&[]), "init");
+        let new_name = "späce ñew.txt";
+        repo.git(&["mv", "old name.txt", new_name]);
+        repo.write(new_name, &forty_lines(&[3, 37]));
+        repo.git(&["add", "-A"]);
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        assert_eq!(files[0].old_path.as_deref(), Some("old name.txt"));
+        assert_eq!(files[0].new_path.as_deref(), Some(new_name));
+        let patch = patch_for(&files[0], 1, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        assert_eq!(String::from_utf8(staged_bytes(&repo, new_name)).expect("utf8"), forty_lines(&[3]));
+        // A plain modification of a name with a space (git ends its `---`/`+++` with a tab).
+        let mut repo = TempRepo::new();
+        repo.commit_file("my file.txt", &forty_lines(&[]), "init");
+        repo.write("my file.txt", &forty_lines(&[3, 37]));
+        let files = diff_of(&repo, "diff", &[]);
+        assert!(files[0].header.ends_with(b"\n+++ b/my file.txt\t\n"));
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "my file.txt")).expect("utf8"), forty_lines(&[3]));
+    }
+
+    #[test]
+    fn patch_for_stage_hunk_of_intent_to_add_rename_patches_the_old_name() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("orig.txt", &forty_lines(&[]), "init");
+        std::fs::rename(repo.path().join("orig.txt"), repo.path().join("renamed.txt")).expect("mv");
+        repo.write("renamed.txt", &forty_lines(&[3, 37]));
+        repo.git(&["add", "-N", "renamed.txt"]);
+        let files = diff_of(&repo, "diff", &[]);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].old_path.as_deref(), Some("orig.txt"));
+        assert_eq!(files[0].new_path.as_deref(), Some("renamed.txt"));
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "orig.txt")).expect("utf8"), forty_lines(&[3]));
+    }
+
+    #[test]
+    fn patch_for_unstage_submodule_pointer_hunk() {
+        // The rewritten header drops the `index … 160000` line; git takes the gitlink mode from
+        // the index entry instead.
+        let mut repo = TempRepo::new();
+        let a = repo.commit_file("keep.txt", "x\n", "init");
+        let b = repo.commit_file("keep.txt", "y\n", "second");
+        repo.git(&["update-index", "--add", "--cacheinfo", &format!("160000,{a},sub")]);
+        repo.commit("sub");
+        repo.git(&["update-index", "--cacheinfo", &format!("160000,{b},sub")]);
+        let files = diff_of(&repo, "diff", &["--cached", "--", "sub"]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        assert_eq!(repo.git(&["ls-files", "-s", "sub"]), format!("160000 {a} 0\tsub"));
+    }
+
+    #[test]
+    fn patch_for_refuses_a_header_without_side_prefixes() {
+        // `diff.noprefix` output (what DIFF_ARGS prevents): `git apply` would strip `src/` and
+        // patch a top-level `x.rs` instead.
+        let diff = "diff --git src/x.rs src/x.rs\nindex 1..2 100644\n--- src/x.rs\n+++ src/x.rs\n\
+                    @@ -1,1 +1,1 @@\n-a\n+b\n";
+        let files = parse(diff.as_bytes());
+        assert_eq!(patch_for(&files[0], 0, &Selection::WholeHunk, false), None);
+    }
+
+    #[test]
+    fn patch_for_hunk_actions_leave_the_mode_change_alone() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("f.sh", &forty_lines(&[]), "init");
+        repo.write("f.sh", &forty_lines(&[3, 37]));
+        repo.git(&["add", "-A"]);
+        repo.git(&["update-index", "--chmod=+x", "f.sh"]);
+        // Staged: mode 100644 → 100755 and two hunks. Unstaging one hunk keeps the mode staged.
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        assert!(String::from_utf8_lossy(&files[0].header).contains("new mode 100755"));
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        assert!(repo.git(&["ls-files", "-s", "f.sh"]).starts_with("100755 "));
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "f.sh")).expect("utf8"), forty_lines(&[37]));
+        // Unstaged: the worktree's 100644 against the index's 100755. Staging a hunk keeps 100755.
+        let files = diff_of(&repo, "diff", &[]);
+        assert!(String::from_utf8_lossy(&files[0].header).contains("new mode 100644"));
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert!(repo.git(&["ls-files", "-s", "f.sh"]).starts_with("100755 "));
+        assert_eq!(String::from_utf8(staged_bytes(&repo, "f.sh")).expect("utf8"), forty_lines(&[3, 37]));
+    }
+
+    #[test]
+    fn parse_binary_paths_containing_and() {
+        let mut repo = TempRepo::new();
+        std::fs::write(repo.path().join("Terms and Conditions.pdf"), [0u8, 1, 2]).expect("write");
+        std::fs::write(repo.path().join("x and y.bin"), [0u8, 1, 2]).expect("write");
+        repo.git(&["add", "-A"]);
+        repo.commit("init");
+        std::fs::write(repo.path().join("Terms and Conditions.pdf"), [0u8, 9, 9]).expect("write");
+        std::fs::remove_file(repo.path().join("x and y.bin")).expect("rm");
+        let files = diff_of(&repo, "diff", &[]);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.binary));
+        assert_eq!(files[0].old_path.as_deref(), Some("Terms and Conditions.pdf"));
+        assert_eq!(files[0].new_path.as_deref(), Some("Terms and Conditions.pdf"));
+        assert_eq!(files[1].old_path.as_deref(), Some("x and y.bin"));
+        assert_eq!(files[1].new_path, None);
+    }
+
+    #[test]
+    fn patch_for_stage_some_lines_of_deleted_file() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("gone.txt", "a\nb\nc\n", "init");
+        std::fs::remove_file(repo.path().join("gone.txt")).expect("rm");
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::Lines(1..=1), false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "gone.txt"), b"a\nc\n");
+        // The rest, as a whole hunk, stages the deletion itself.
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(repo.git(&["ls-files", "--", "gone.txt"]), "");
+    }
+
+    #[test]
+    fn patch_for_discard_some_lines_of_deleted_file_restores_them() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("gone.txt", "a\nb\nc\n", "init");
+        std::fs::remove_file(repo.path().join("gone.txt")).expect("rm");
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::Lines(1..=1), true).expect("patch");
+        discard(&repo, &patch);
+        assert_eq!(worktree_bytes(&repo, "gone.txt"), b"b\n");
+    }
+
+    #[test]
+    fn patch_for_discard_some_lines_of_new_file() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("keep.txt", "x\n", "init");
+        repo.write("new.txt", "alpha\nbeta\ngamma\n");
+        repo.git(&["add", "-N", "new.txt"]);
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::Lines(1..=1), true).expect("patch");
+        discard(&repo, &patch);
+        assert_eq!(worktree_bytes(&repo, "new.txt"), b"alpha\ngamma\n");
+        // The rest, as a whole hunk, discards the file itself.
+        let files = diff_of(&repo, "diff", &[]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
+        discard(&repo, &patch);
+        assert!(!repo.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn patch_for_unstage_some_lines_of_staged_new_file() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("keep.txt", "x\n", "init");
+        repo.write("new.txt", "alpha\nbeta\ngamma\n");
+        repo.git(&["add", "-A"]);
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        let patch = patch_for(&files[0], 0, &Selection::Lines(1..=1), true).expect("patch");
+        unstage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "new.txt"), b"alpha\ngamma\n");
+        // The rest, as a whole hunk, unstages the file itself.
+        let files = diff_of(&repo, "diff", &["--cached"]);
+        let patch = patch_for(&files[0], 0, &Selection::WholeHunk, true).expect("patch");
+        unstage(&repo, &patch);
+        assert_eq!(repo.git(&["ls-files", "--", "new.txt"]), "");
+        assert_eq!(worktree_bytes(&repo, "new.txt"), b"alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn patch_for_untracked_file_from_no_index_diff() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("keep.txt", "x\n", "init");
+        repo.write("u.txt", "alpha\nbeta\ngamma\n");
+        // `diff --no-index` exits 1 when the files differ, so it can't go through `repo.git`.
+        let mut args = vec!["diff", "--no-index"];
+        args.extend_from_slice(DIFF_ARGS);
+        args.extend_from_slice(&["--", "/dev/null", "u.txt"]); // portability: allow
+        let out = hermetic_git(repo.path()).args(&args).output().expect("spawn git");
+        assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+        let files = parse(&out.stdout);
+        assert_eq!(files[0].new_path.as_deref(), Some("u.txt"));
+        let patch = patch_for(&files[0], 0, &Selection::Lines(1..=1), false).expect("patch");
+        stage(&repo, &patch);
+        assert_eq!(staged_bytes(&repo, "u.txt"), b"beta\n");
+    }
+
+    #[test]
+    fn diff_args_override_user_diff_config() {
+        for config in [["diff.noprefix", "true"], ["diff.mnemonicPrefix", "true"]] {
+            let mut repo = TempRepo::new();
+            repo.write(".gitattributes", "*.rs diff=conv\n");
+            repo.write("x.rs", "top level\n");
+            repo.commit_file("src/x.rs", "one\ntwo\nthree\n", "init");
+            repo.git(&["config", config[0], config[1]]);
+            repo.git(&["config", "color.ui", "always"]);
+            repo.git(&["config", "diff.external", "amalgum-no-such-diff-tool"]);
+            repo.git(&["config", "diff.conv.textconv", "amalgum-no-such-textconv"]);
+            repo.write("src/x.rs", "one\nTWO\nthree\n");
+
+            let files = diff_of(&repo, "diff", &[]);
+            assert_eq!(files.len(), 1, "{config:?}");
+            assert_eq!(files[0].old_path.as_deref(), Some("src/x.rs"), "{config:?}");
+            assert_eq!(files[0].new_path.as_deref(), Some("src/x.rs"), "{config:?}");
+            let patch = patch_for(&files[0], 0, &Selection::WholeHunk, false).expect("patch");
+            stage(&repo, &patch);
+            assert_eq!(staged_bytes(&repo, "src/x.rs"), b"one\nTWO\nthree\n", "{config:?}");
+            assert_eq!(staged_bytes(&repo, "x.rs"), b"top level\n", "{config:?}");
+
+            let commit = repo.commit("edit");
+            let files = diff_of(&repo, "show", &["--format=", &commit, "--", "src/x.rs"]);
+            assert_eq!(files.len(), 1, "{config:?}");
+            assert_eq!(files[0].new_path.as_deref(), Some("src/x.rs"), "{config:?}");
+            assert_eq!(files[0].hunks.len(), 1, "{config:?}");
+        }
     }
 
     // ---- parse_raw_numstat() -------------------------------------------------------------

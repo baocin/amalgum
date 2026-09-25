@@ -5,7 +5,8 @@
 //! Exit codes: 0 success; 1 query-type command with no app ("Amalgum is not running") or an
 //! error response; 2 usage error (clap). Notification-type commands (`notify`, `set-status`,
 //! `clear-status`, `agent-event`) always exit 0 so a missing app never blocks an agent: with
-//! no app they are appended to the offline queue when `queue::should_queue`, else dropped.
+//! no app, or no answer within `NOTIFY_TIMEOUT`, they are appended to the offline queue when
+//! `queue::should_queue`, else dropped.
 
 use super::protocol::{self, SplitDir, StatusArg};
 use super::{queue, socket};
@@ -15,6 +16,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// How long a notification-type command waits for the app's answer. Hooks run it under a 1 s
+/// timeout (§5.29), so it must give up, and queue, well before the agent kills it.
+const NOTIFY_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a query-type command waits for the app's answer.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(name = "amalgum", version, about = "Workspace shell for coding agents, with git built in")]
@@ -71,6 +78,10 @@ pub enum Cmd {
         run: Option<String>,
     },
     /// Open a new terminal running a command.
+    ///
+    /// One argument is a shell command line (`run "npm start"`); several are the command's
+    /// words, each kept intact (`run -- git commit -m "fix the bug"`: `--` lets words that start
+    /// with `-` through). Flags may come before or after the command.
     Run {
         #[arg(long)]
         split: Option<SplitDir>,
@@ -78,7 +89,7 @@ pub enum Cmd {
         tab: Option<String>,
         #[arg(long)]
         workspace: Option<String>,
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(required = true)]
         command: Vec<String>,
     },
     /// List workspaces, tabs, statuses, cwds, and ports.
@@ -142,8 +153,10 @@ pub struct Env {
     pub tab: Option<String>,
     pub home: Option<PathBuf>,
     pub cwd: PathBuf,
-    /// How hooks should invoke this binary (the current executable path).
+    /// How hooks should invoke this binary: see [`hook_exe`].
     pub exe: String,
+    /// This process's parent: for `agent-event`, the agent that ran the hook.
+    pub parent_pid: Option<u32>,
 }
 
 impl Env {
@@ -155,12 +168,31 @@ impl Env {
             tab: std::env::var("AMALGUM_TAB").ok(),
             home: paths::home(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            exe: std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "amalgum".to_string()),
+            exe: hook_exe(
+                std::env::current_exe().ok(),
+                std::env::var_os("APPIMAGE").map(PathBuf::from),
+                std::env::var_os("APPDIR").map(PathBuf::from),
+            ),
+            parent_pid: Some(std::os::unix::process::parent_id()),
         }
     }
+}
+
+/// The executable path written into agent hooks. It must outlive this process and not depend on
+/// how this binary was launched, since `hooks status` compares it byte for byte:
+/// - inside an AppImage, `exe` sits under a per-launch mount (`$APPDIR`) that vanishes on exit,
+///   so the AppImage file itself (`$APPIMAGE`) is used;
+/// - otherwise `exe` with symlinks resolved (macOS reports the path it was launched by, e.g.
+///   the `/usr/local/bin` shim rather than the app bundle);
+/// - `amalgum` (found on `$PATH`) when there is no usable path.
+fn hook_exe(exe: Option<PathBuf>, appimage: Option<PathBuf>, appdir: Option<PathBuf>) -> String {
+    let resolve = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    let exe = exe.map(resolve);
+    let path = match (exe, appimage, appdir.map(resolve)) {
+        (Some(exe), Some(appimage), Some(appdir)) if exe.starts_with(&appdir) => Some(appimage),
+        (exe, ..) => exe,
+    };
+    path.and_then(|p| p.to_str().map(str::to_string)).unwrap_or_else(|| "amalgum".to_string())
 }
 
 /// Execute one subcommand. `stdin` is read only by `agent-event`; human output goes to `out`,
@@ -199,7 +231,7 @@ pub fn run(cmd: Cmd, env: &Env, stdin: &mut dyn Read, out: &mut dyn Write) -> i3
         }
         Cmd::Run { split, tab, workspace, command } => {
             let command = protocol::Command::Run {
-                command: command.join(" "),
+                command: shell_command_line(&command),
                 split,
                 workspace: workspace.or_else(|| env.workspace.clone()),
                 tab: tab.or_else(|| env.tab.clone()),
@@ -223,7 +255,8 @@ fn dispatch(cmd: protocol::Command, env: &Env) -> (i32, Option<protocol::Respons
         return (handle_no_app(&cmd, env), None);
     };
     let request = protocol::Request::new(cmd.clone());
-    match socket::send(&sock, &request, Duration::from_secs(2)) {
+    let timeout = if cmd.is_notification() { NOTIFY_TIMEOUT } else { QUERY_TIMEOUT };
+    match socket::send(&sock, &request, timeout) {
         Ok(resp) => {
             if resp.ok {
                 (0, Some(resp))
@@ -237,7 +270,11 @@ fn dispatch(cmd: protocol::Command, env: &Env) -> (i32, Option<protocol::Respons
         Err(e) if is_connect_failure(&e) => (handle_no_app(&cmd, env), None),
         Err(e) => {
             eprintln!("amalgum: {e}");
-            (if cmd.is_notification() { 0 } else { 1 }, None)
+            // A reverse-forwarded socket accepts even when the app behind it is gone or
+            // unreachable (sshd answers the connect itself), so for an event a hang-up or a
+            // timeout means "no app" just as much as a refused connect does: queue it rather
+            // than lose it. The price is a rare duplicate, if a slow app did handle it.
+            if cmd.is_notification() { (handle_no_app(&cmd, env), None) } else { (1, None) }
         }
     }
 }
@@ -247,7 +284,7 @@ fn resolve_sock(env: &Env) -> Option<PathBuf> {
 }
 
 /// `ConnectionRefused`/`NotFound` (or no socket path at all, folded in by the caller) mean no
-/// app is running.
+/// app is running. Query-type commands treat every other failure as an error, not "no app".
 fn is_connect_failure(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
 }
@@ -280,7 +317,13 @@ fn agent_event(agent: AgentKind, json: Option<String>, env: &Env, stdin: &mut dy
         }
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(event) => {
+        Ok(mut event) => {
+            // No agent's payload carries its pid, but session capture needs it (§5.29): the
+            // agent runs this hook (directly, or through a `sh -c` that execs it), so it is
+            // this process's parent.
+            if let (Some(fields), Some(pid)) = (event.as_object_mut(), env.parent_pid) {
+                fields.entry("pid").or_insert(pid.into());
+            }
             let command = protocol::Command::AgentEvent {
                 agent,
                 event,
@@ -294,6 +337,15 @@ fn agent_event(agent: AgentKind, json: Option<String>, env: &Env, stdin: &mut dy
             eprintln!("amalgum: invalid agent-event JSON: {e}");
             0
         }
+    }
+}
+
+/// `run`'s words as the line the app types into a shell: a single word is already a command
+/// line; several are quoted one by one so the shell splits them back into the same words.
+fn shell_command_line(words: &[String]) -> String {
+    match words {
+        [line] => line.clone(),
+        _ => words.iter().map(|w| crate::ssh::quote(w)).collect::<Vec<_>>().join(" "),
     }
 }
 
@@ -338,7 +390,19 @@ fn print_list(data: Option<serde_json::Value>, as_json: bool, out: &mut dyn Writ
         let name = ws.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
         let location = ws.get("location").and_then(serde_json::Value::as_str).unwrap_or("");
         let status = ws.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
-        let _ = writeln!(out, "{name}\t{location}\t{status}");
+        let ports: Vec<String> = ws
+            .get("ports")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_u64)
+            .map(|port| format!(":{port}"))
+            .collect();
+        if ports.is_empty() {
+            let _ = writeln!(out, "{name}\t{location}\t{status}");
+        } else {
+            let _ = writeln!(out, "{name}\t{location}\t{status}\t{}", ports.join(","));
+        }
         let Some(tabs) = ws.get("tabs").and_then(serde_json::Value::as_array) else { continue };
         for tab in tabs {
             let title = tab.get("title").and_then(serde_json::Value::as_str).unwrap_or("?");
@@ -476,7 +540,22 @@ mod tests {
             home: home.map(Path::to_path_buf),
             cwd: PathBuf::from("/cwd"), // portability: allow
             exe: "amalgum".to_string(),
+            parent_pid: None,
         }
+    }
+
+    /// A fake app socket that records every request and answers `ok`.
+    fn recording_server(
+        dir: &Path,
+    ) -> (socket::ServerHandle, std::sync::Arc<std::sync::Mutex<Vec<Command>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_bg = std::sync::Arc::clone(&seen);
+        let server = socket::serve(&dir.join("app.sock"), move |req| {
+            seen_bg.lock().unwrap().push(req.cmd);
+            protocol::Response::ok()
+        })
+        .unwrap();
+        (server, seen)
     }
 
     fn run_cmd(cmd: Cmd, env: &Env) -> (i32, String) {
@@ -575,6 +654,68 @@ mod tests {
         assert!(lines[0].contains("queued"));
     }
 
+    /// On a remote host sshd owns the forwarded socket: it accepts every connection and only
+    /// then tries to reach the app. With the app gone (the ControlMaster persists after it
+    /// quits) it hangs up without an answer, which is "no app" too, not a reason to drop.
+    #[test]
+    fn notify_queues_when_the_forwarded_socket_hangs_up_without_answering() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = paths::remote_root(home.path()).join("run").join("app.sock");
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let sshd = std::thread::spawn(move || drop(listener.accept().unwrap()));
+
+        let e = env(Some(home.path()), Some(sock));
+        let (code, _) = run_cmd(Cmd::Notify { title: "while away".into(), body: None, tab: None }, &e);
+        assert_eq!(code, 0);
+        sshd.join().unwrap();
+
+        let lines = queue::drain(&paths::queue_file(home.path())).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("while away"));
+    }
+
+    /// Laptop asleep: sshd accepts and never answers. The CLI must give up and queue inside the
+    /// agents' 1 s hook timeout (§5.29), or the agent kills it first and the event is lost.
+    #[test]
+    fn notify_queues_within_the_hook_budget_when_the_forwarded_socket_never_answers() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = paths::remote_root(home.path()).join("run").join("app.sock");
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let sshd = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let _ = wait.recv(); // hold the connection open, silent, until the test is done
+            drop(conn);
+        });
+
+        let e = env(Some(home.path()), Some(sock));
+        let started = std::time::Instant::now();
+        let (code, _) = run_cmd(Cmd::SetStatus { status: StatusArg::Idle, message: None }, &e);
+        let took = started.elapsed();
+        drop(done);
+        sshd.join().unwrap();
+
+        assert_eq!(code, 0);
+        assert!(took < Duration::from_millis(900), "took {took:?}, over the 1 s hook budget");
+        assert_eq!(queue::drain(&paths::queue_file(home.path())).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn query_with_a_silent_forwarded_socket_still_exits_1_and_queues_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let sock = paths::remote_root(home.path()).join("run").join("app.sock");
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let sshd = std::thread::spawn(move || drop(listener.accept().unwrap()));
+
+        let e = env(Some(home.path()), Some(sock));
+        assert_eq!(run_cmd(Cmd::Focus { target: "w1".into() }, &e).0, 1);
+        sshd.join().unwrap();
+        assert!(queue::drain(&paths::queue_file(home.path())).unwrap().is_empty());
+    }
+
     #[test]
     fn notify_does_not_queue_when_socket_is_local() {
         let home = tempfile::tempdir().unwrap();
@@ -649,6 +790,74 @@ mod tests {
         }
     }
 
+    /// No agent's hook payload carries a pid, yet §5.29 session capture (and §5.30 hibernation)
+    /// needs one: the hook's parent is the agent, so the CLI adds it.
+    #[test]
+    fn agent_event_adds_the_agent_pid_when_the_payload_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, seen) = recording_server(dir.path());
+        let mut e = env(None, Some(server.path().to_path_buf()));
+        e.parent_pid = Some(4242);
+
+        for (payload, want) in [
+            (r#"{"hook_event_name":"SessionStart","session_id":"s1"}"#, 4242),
+            (r#"{"hook_event_name":"SessionStart","pid":7}"#, 7),
+        ] {
+            let cmd =
+                Cmd::AgentEvent { agent: AgentKind::Claude, hook_version: None, json: Some(payload.into()) };
+            assert_eq!(run_cmd(cmd, &e).0, 0);
+            match seen.lock().unwrap().pop() {
+                Some(Command::AgentEvent { event, .. }) => assert_eq!(event["pid"], want, "{payload}"),
+                other => panic!("expected AgentEvent, got {other:?}"),
+            }
+        }
+    }
+
+    // --- hooks: the command written into agent configs --------------------------------------
+
+    /// Hooks outlive this process, and `hooks status` compares the command byte for byte: the
+    /// path must not depend on how this binary happened to be launched.
+    #[test]
+    fn hook_exe_resolves_a_symlinked_launch_to_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("Amalgum.app").join("amalgum");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"binary").unwrap();
+        let shim = dir.path().join("amalgum");
+        std::os::unix::fs::symlink(&real, &shim).unwrap();
+
+        let want = std::fs::canonicalize(&real).unwrap().to_str().unwrap().to_string();
+        assert_eq!(hook_exe(Some(shim), None, None), want);
+        assert_eq!(hook_exe(Some(real), None, None), want);
+    }
+
+    /// Inside an AppImage the executable lives under a per-launch mount (`$APPDIR`) that is gone
+    /// once this process exits; the AppImage file itself (`$APPIMAGE`) is what stays.
+    #[test]
+    fn hook_exe_inside_an_appimage_is_the_appimage_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join(".mount_AmalgX");
+        let exe = mount.join("usr").join("bin").join("amalgum");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"binary").unwrap();
+        let appimage = dir.path().join("Amalgum.AppImage");
+
+        let got = hook_exe(Some(exe.clone()), Some(appimage.clone()), Some(mount));
+        assert_eq!(got, appimage.to_str().unwrap());
+
+        // `$APPIMAGE` leaks into every shell the AppImage app spawns; a different binary run
+        // from one of them keeps its own path.
+        let other = dir.path().join("amalgum");
+        std::fs::write(&other, b"binary").unwrap();
+        let want = std::fs::canonicalize(&other).unwrap().to_str().unwrap().to_string();
+        assert_eq!(hook_exe(Some(other), Some(appimage), Some(dir.path().join(".mount_AmalgX"))), want);
+    }
+
+    #[test]
+    fn hook_exe_without_a_known_executable_falls_back_to_path_lookup() {
+        assert_eq!(hook_exe(None, None, None), "amalgum");
+    }
+
     #[test]
     fn agent_event_invalid_json_exits_0_and_sends_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -687,6 +896,26 @@ mod tests {
         assert!(out.contains("conduit"));
         assert!(out.contains("claude"));
         assert!(out.contains("needs-input"));
+    }
+
+    /// §5.31: `list` shows ports too. The app reports them per workspace.
+    #[test]
+    fn list_text_shows_each_workspaces_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("app.sock");
+        let data = serde_json::json!({"workspaces": [
+            {"name": "conduit", "location": "~/w/conduit", "status": "running", "ports": [3000, 8080],
+             "tabs": [{"id": "t1", "title": "vite", "status": "running", "cwd": "~/w/conduit"}]},
+            {"name": "quiet", "location": "~/w/quiet", "status": "idle", "ports": null, "tabs": []}
+        ]});
+        let server = socket::serve(&sock, move |_req| protocol::Response::with_data(data.clone())).unwrap();
+
+        let e = env(None, Some(server.path().to_path_buf()));
+        let (code, out) = run_cmd(Cmd::List { json: false }, &e);
+        assert_eq!(code, 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "conduit\t~/w/conduit\trunning\t:3000,:8080");
+        assert_eq!(lines[2], "quiet\t~/w/quiet\tidle");
     }
 
     #[test]
@@ -752,6 +981,49 @@ mod tests {
             Some(Command::Run { command, .. }) => assert_eq!(command, "cargo test --lib"),
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    /// Several words are an argv: the shell the app types the command into must see exactly
+    /// those words, so each is quoted. One word is a shell command line, sent as written.
+    #[test]
+    fn run_command_keeps_each_word_intact_for_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, seen) = recording_server(dir.path());
+        let e = env(None, Some(server.path().to_path_buf()));
+
+        for (words, want) in [
+            (vec!["git", "commit", "-m", "fix the bug"], "git commit -m 'fix the bug'"),
+            (vec!["pytest", "-k", "a and b"], "pytest -k 'a and b'"),
+            (vec!["npm start && open http://localhost:3000"], "npm start && open http://localhost:3000"),
+        ] {
+            let command = words.iter().map(|w| w.to_string()).collect();
+            run_cmd(Cmd::Run { split: None, tab: None, workspace: None, command }, &e);
+            match seen.lock().unwrap().pop() {
+                Some(Command::Run { command, .. }) => assert_eq!(command, want, "{words:?}"),
+                other => panic!("expected Run, got {other:?}"),
+            }
+        }
+    }
+
+    /// §5.31 writes the usage as `run <cmd> [--split right|down] [--tab ID] [--workspace ID]`:
+    /// flags after the command are amalgum's, and `--` passes flag-like words to the command.
+    #[test]
+    fn run_flags_after_the_command_are_parsed_as_flags() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").command {
+            Some(Cmd::Run { split, tab, workspace, command }) => (split, tab, workspace, command),
+            other => panic!("expected Run, got {other:?}"),
+        };
+        let (split, tab, workspace, command) =
+            parse(&["amalgum", "run", "npm start", "--split", "right", "--tab", "t1", "--workspace", "w2"]);
+        assert_eq!(split, Some(SplitDir::Right));
+        assert_eq!(tab.as_deref(), Some("t1"));
+        assert_eq!(workspace.as_deref(), Some("w2"));
+        assert_eq!(command, ["npm start"]);
+
+        let (split, _, _, command) =
+            parse(&["amalgum", "run", "--split", "down", "--", "cargo", "test", "--lib"]);
+        assert_eq!(split, Some(SplitDir::Down));
+        assert_eq!(command, ["cargo", "test", "--lib"]);
     }
 
     // --- drain: prints queued lines, doesn't touch the socket ------------------------------

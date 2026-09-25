@@ -43,8 +43,14 @@ Unattended runs belong in a container or VM without credentials.
 - Codex and other tools read `AGENTS.md`; enforcement for them is the pre-commit hook and CI.
 
 ## Verifying the harness itself
-- `scripts/test-hooks` exercises the guard's block and allow paths (run by the gate whenever harness files
-  change).
+- `scripts/test-hooks` exercises the guard's block and allow paths; `scripts/test-verify-scope` checks the
+  gate's scoping regexes against paths that must and must not trigger the cargo legs;
+  `scripts/test-check-secrets` exercises the secrets scanner's working-tree and history modes;
+  `scripts/test-stop-gate` checks the Stop hook's cache key; `scripts/test-workflow-outputs` statically
+  rejects patterns in the workflows that hide a failing command from `bash -e {0}` (GitHub's default
+  `run:` shell, which also has no pipefail): `echo "x=$(cmd)" >> "$GITHUB_OUTPUT"` directly, and
+  `x="$(cmd | head -1)"` unless that step sets `shell: bash`. All run by the gate whenever harness files
+  change.
 - To check the Stop hook live: break a test, ask the agent to finish, and watch it get blocked with the
   failing output; fix, and it stops cleanly.
 - Measure: CI failures the local gate could have caught should be zero; gate wall-clock under 60 s warm.

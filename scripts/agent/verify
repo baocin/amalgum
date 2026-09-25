@@ -27,7 +27,7 @@ CHANGED="$( { [ -n "$BASE" ] && git diff --name-only "$BASE"...HEAD
               git ls-files --others --exclude-standard; } 2>/dev/null | sort -u)"
 if [ -z "$BASE" ] || [ -z "$CHANGED" ]; then FULL=1; fi
 
-RUST_RE='^(src/|tests/|build\.rs|Cargo\.(toml|lock)$|rust-toolchain\.toml$|clippy\.toml$|rustfmt\.toml$|assets/|\.cargo/)'
+RUST_RE='^(src/|tests/|build\.rs|Cargo\.(toml|lock)$|rust-toolchain\.toml$|clippy\.toml$|rustfmt\.toml$|assets/|\.cargo/|docs/SPEC\.md$)'
 HARNESS_RE='^(scripts/|\.github/|\.claude/|\.opencode/|packaging/)'
 rust=0; harness=0
 if [ "$FULL" = 1 ]; then rust=1; harness=1; echo "verify: full gate"
@@ -70,6 +70,10 @@ if [ "$harness" = 1 ]; then
       || fail "shellcheck — fix the warnings above"
   fi
   scripts/test-hooks >/dev/null || fail "guardrail hook tests — run scripts/test-hooks to see which case broke"
+  scripts/test-verify-scope >/dev/null || fail "verify-scope tests — run scripts/test-verify-scope to see which case broke"
+  scripts/test-check-secrets >/dev/null || fail "check-secrets tests — run scripts/test-check-secrets to see which case broke"
+  scripts/test-stop-gate >/dev/null || fail "stop-gate tests — run scripts/test-stop-gate to see which case broke"
+  scripts/test-workflow-outputs >/dev/null || fail "workflow-outputs test — run scripts/test-workflow-outputs to see which line broke"
   ok "harness scripts + guardrail tests"
 else
   skip "harness legs — no scripts/.github/.claude paths changed"

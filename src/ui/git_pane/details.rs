@@ -116,9 +116,10 @@ impl GitPane {
         }
         let git = self.git.clone();
         crate::ui::jobs::spawn(ctx, &self.tx, move || {
-            let result = git
-                .run(&["show", "--format=", "--no-color", &details_id, "--", &path])
-                .map(|o| diff::parse(&String::from_utf8_lossy(&o)));
+            let mut args = vec!["show", "--format="];
+            args.extend_from_slice(diff::DIFF_ARGS);
+            args.extend([details_id.as_str(), "--", path.as_str()]);
+            let result = git.run(&args).map(|o| diff::parse(&o));
             worker::Reply::DetailsDiff { req, result }
         });
     }
@@ -381,8 +382,8 @@ pub(super) fn render_diff_file(
             let paired = pair_for_word_diff(&hunk.lines, i);
             match paired {
                 Some((del, add)) => {
-                    render_line(ui, colors, &hunk.lines[del], Some(&hunk.lines[add].text));
-                    render_line(ui, colors, &hunk.lines[add], Some(&hunk.lines[del].text));
+                    render_line(ui, colors, &hunk.lines[del], Some(&hunk.lines[add].display()));
+                    render_line(ui, colors, &hunk.lines[add], Some(&hunk.lines[del].display()));
                     i += 2;
                     drawn += 2;
                 }
@@ -428,9 +429,10 @@ pub(super) fn render_line(ui: &mut egui::Ui, colors: &Colors, line: &Line, pair_
         }
         _ => (None, colors.get(Token::FgPrimary), colors.get(Token::BgHover)),
     };
+    let text = line.display();
     let highlight: Vec<Range<usize>> = match pair_text {
-        Some(other) if line.kind == LineKind::Del => diff::word_diff(&line.text, other).0,
-        Some(other) if line.kind == LineKind::Add => diff::word_diff(other, &line.text).1,
+        Some(other) if line.kind == LineKind::Del => diff::word_diff(&text, other).0,
+        Some(other) if line.kind == LineKind::Add => diff::word_diff(other, &text).1,
         _ => Vec::new(),
     };
 
@@ -450,7 +452,7 @@ pub(super) fn render_line(ui: &mut egui::Ui, colors: &Colors, line: &Line, pair_
         egui::FontId::monospace(11.0),
         gutter,
     );
-    let job = line_job(&line.text, fg, &highlight, word_bg);
+    let job = line_job(&text, fg, &highlight, word_bg);
     let galley = painter.layout_job(job);
     painter.galley(rect.left_center() + egui::vec2(80.0, -galley.size().y / 2.0), galley, fg);
 }
@@ -541,7 +543,7 @@ mod tests {
     // ---- pair_for_word_diff -----------------------------------------------------------------
 
     fn line(kind: LineKind, text: &str) -> Line {
-        Line { kind, old_no: None, new_no: None, text: text.to_string() }
+        Line { kind, old_no: None, new_no: None, text: text.into() }
     }
 
     #[test]

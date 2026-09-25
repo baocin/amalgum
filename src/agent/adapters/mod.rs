@@ -8,10 +8,11 @@
 //! - `uninstall(text)`: pure text transform removing exactly our block
 //! - `state(text, command)`: [`HookState`] for `amalgum hooks status`
 //! - `resume(session_id)`: the shell command that resumes a session (§5.30)
+//! - `CLI_OPTIONS`: its long options, what each takes, and which a resume never replays (§5.30)
 //!
 //! This module does the file I/O around those pure functions: read (missing file = empty),
-//! write atomically (temp file + rename, preserving permissions), create parent dirs.
-//! Tests must pass a temp `home`; nothing here may touch the real `$HOME` under test.
+//! write atomically (temp file + rename, preserving permissions, through symlinks), create
+//! parent dirs. Tests must pass a temp `home`; nothing here may touch the real `$HOME` under test.
 
 pub mod claude;
 pub mod codex;
@@ -20,9 +21,11 @@ pub mod opencode;
 
 use super::AgentKind;
 use super::status::Status;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Bump when the installed hook block changes; older blocks then report `Outdated`.
@@ -77,6 +80,8 @@ pub enum HookState {
 pub struct HookReport {
     pub agent: AgentKind,
     pub state: HookState,
+    /// The agent's config file. For `setup` and `remove` that is the file they write: through
+    /// a symlinked config, the file the link points at.
     pub path: PathBuf,
 }
 
@@ -96,9 +101,10 @@ pub fn hook_command(exe: &str, agent: AgentKind) -> String {
     format!("{} agent-event --agent {} --hook-version {}", crate::ssh::quote(exe), agent.name(), HOOK_VERSION)
 }
 
-/// Install or update our hook block for `agent` under `home`.
+/// Install or update our hook block for `agent` under `home`. A config already as it would be
+/// written is left alone.
 pub fn setup(agent: AgentKind, home: &Path, exe: &str) -> io::Result<HookReport> {
-    let path = config_path_for(agent, home);
+    let path = resolve_symlinks(&config_path_for(agent, home))?;
     let text = read_to_string_opt(&path)?.unwrap_or_default();
     let command = hook_command(exe, agent);
 
@@ -109,7 +115,9 @@ pub fn setup(agent: AgentKind, home: &Path, exe: &str) -> io::Result<HookReport>
 
     let new_text =
         install_for(agent, &text, &command).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_atomic(&path, &new_text)?;
+    if new_text != text {
+        write_atomic(&path, &new_text)?;
+    }
 
     let state = state_for(agent, &new_text, &command);
     Ok(HookReport { agent, state, path })
@@ -122,7 +130,9 @@ pub fn status(agent: AgentKind, home: &Path, exe: &str) -> io::Result<HookReport
     Ok(HookReport { agent, state: state_for(agent, &text, &command), path })
 }
 
-/// Remove our block; leaves the rest of the file byte-for-byte intact.
+/// Remove our block; leaves the rest of the file intact. JSON configs keep their key order and
+/// indentation, though other formatting (an inline array, say) comes back pretty-printed; a
+/// config with nothing of ours in it is not rewritten at all.
 pub fn remove(agent: AgentKind, home: &Path) -> io::Result<HookReport> {
     let path = config_path_for(agent, home);
 
@@ -136,12 +146,15 @@ pub fn remove(agent: AgentKind, home: &Path) -> io::Result<HookReport> {
         return Ok(HookReport { agent, state: HookState::Missing, path });
     }
 
+    let path = resolve_symlinks(&path)?;
     let Some(text) = read_to_string_opt(&path)? else {
         return Ok(HookReport { agent, state: HookState::Missing, path });
     };
 
     let new_text = uninstall_for(agent, &text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_atomic(&path, &new_text)?;
+    if new_text != text {
+        write_atomic(&path, &new_text)?;
+    }
 
     // No `exe` here to rebuild the exact expected command; conflict/missing detection doesn't
     // need it, and after a clean uninstall we never land on `Installed`/`Outdated` anyway.
@@ -156,6 +169,50 @@ pub fn resume_command(agent: AgentKind, session_id: &str) -> String {
         AgentKind::Codex => codex::resume(session_id),
         AgentKind::Opencode => opencode::resume(session_id),
         AgentKind::Gemini => gemini::resume(session_id),
+    }
+}
+
+/// An agent's CLI long options, for replaying its original argv on resume (§5.30).
+#[derive(Debug)]
+pub struct CliOptions {
+    /// The long options of the agent's interactive command, as its `--help` lists them, with the
+    /// words each takes. Only these are replayed: an option missing here (a newer CLI's, a typo)
+    /// is dropped, and so is the word after it unless that is an option, since without knowing
+    /// whether it takes a value, replaying it could leave it without one and the agent would
+    /// reject the whole line.
+    pub options: &'static [(&'static str, Takes)],
+    /// Listed options never replayed, value and all: they pick or start the session (the resume
+    /// command picks its own), or submit a prompt the session has already run.
+    pub not_replayed: &'static [&'static str],
+}
+
+/// The argv words a long option takes after it (`--name=value` carries its value inline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Takes {
+    /// None: a switch (`--verbose`).
+    Nothing,
+    /// The next word, whatever it looks like (`--model opus`, `--append-system-prompt "-x"`).
+    One,
+    /// The next word unless it is an option (`--debug api`, or a bare `--debug`).
+    Optional,
+    /// The next word, then every word after it up to the next option (`--add-dir a b`).
+    Many,
+}
+
+impl CliOptions {
+    /// What `option` (a `--name`, without any `=value`) takes; `None` for an unlisted option.
+    pub fn takes(&self, option: &str) -> Option<Takes> {
+        self.options.iter().find(|(name, _)| *name == option).map(|&(_, takes)| takes)
+    }
+}
+
+/// `agent`'s [`CliOptions`], from its adapter file.
+pub fn cli_options(agent: AgentKind) -> &'static CliOptions {
+    match agent {
+        AgentKind::Claude => &claude::CLI_OPTIONS,
+        AgentKind::Codex => &codex::CLI_OPTIONS,
+        AgentKind::Opencode => &opencode::CLI_OPTIONS,
+        AgentKind::Gemini => &gemini::CLI_OPTIONS,
     }
 }
 
@@ -211,7 +268,18 @@ fn read_to_string_opt(path: &Path) -> io::Result<Option<String>> {
 
 /// Write `contents` atomically: a temp file in the same directory, then rename over `path`.
 /// Creates parent directories if needed and preserves the target's existing permissions.
+/// A symlinked `path` (dotfiles managers link agent configs into a repo) is written through:
+/// the link stays, and the file it points at is the one replaced. The temp file is never more
+/// readable than the target, not even before its permissions are copied (a 0600 config may
+/// hold API keys), and it is removed again if anything fails. An error names the file being
+/// replaced: through a link, its target (home-manager's, say, in the read-only Nix store).
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let path = resolve_symlinks(path)?;
+    replace_file(&path, contents).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+/// [`write_atomic`] once `path` is no symlink.
+fn replace_file(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -223,12 +291,42 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     tmp_name.push(format!(".amalgum-tmp-{}", std::process::id()));
     let tmp_path = path.with_file_name(tmp_name);
 
-    fs::write(&tmp_path, contents)?;
-    if let Ok(meta) = fs::metadata(path) {
-        fs::set_permissions(&tmp_path, meta.permissions())?;
+    let perms = fs::metadata(path).ok().map(|meta| meta.permissions());
+    // A new file gets the usual 0666 less the umask.
+    let mode = perms.as_ref().map_or(0o666, |p| p.mode() & 0o777);
+    // A temp file left by a killed run with our pid would make `create_new` fail.
+    let _ = fs::remove_file(&tmp_path);
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp_path)?;
+    let result = file
+        .write_all(contents.as_bytes())
+        // Exact bits: the umask may have cleared some of `mode`.
+        .and_then(|()| perms.map_or(Ok(()), |perms| file.set_permissions(perms)))
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    result
+}
+
+/// Follow `path` through any symlinks to the file they finally name, which need not exist yet
+/// (a dangling link names the file to create). Anything that isn't a link is returned as is.
+fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    // Linux's MAXSYMLINKS: past it, a link loop.
+    for _ in 0..40 {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(&path)?;
+                // A relative target is relative to the link's own directory.
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+    Err(io::Error::other(format!("{}: too many levels of symbolic links", path.display())))
 }
 
 // --- shared JSON hook-block plumbing (Claude/Gemini share this shape) --------------------
@@ -299,7 +397,7 @@ fn json_install(
         hooks_map.insert(event.to_string(), Value::Array(filtered));
     }
 
-    serde_json::to_string_pretty(&root).map(|s| format!("{s}\n")).map_err(|e| e.to_string())
+    to_json_like(&root, text)
 }
 
 /// Shared uninstaller matching [`json_install`]'s shape.
@@ -314,11 +412,13 @@ fn json_uninstall(text: &str, agent_name: &str, events: &[&str]) -> Result<Strin
     };
     let marker = marker(agent_name);
 
+    let mut removed = false;
     if let Some(Value::Object(hooks_map)) = root_map.get_mut("hooks") {
         let mut remove_keys = Vec::new();
         for &event in events {
             let Some(Value::Array(existing)) = hooks_map.get(event) else { continue };
             let filtered = strip_marker_groups(existing, &marker);
+            removed |= filtered != *existing;
             if filtered.is_empty() {
                 remove_keys.push(event.to_string());
             } else {
@@ -326,14 +426,38 @@ fn json_uninstall(text: &str, agent_name: &str, events: &[&str]) -> Result<Strin
             }
         }
         for k in remove_keys {
-            hooks_map.remove(&k);
+            hooks_map.shift_remove(&k);
         }
         if hooks_map.is_empty() {
-            root_map.remove("hooks");
+            root_map.shift_remove("hooks");
         }
     }
 
-    serde_json::to_string_pretty(&root).map(|s| format!("{s}\n")).map_err(|e| e.to_string())
+    // Nothing of ours: the file stays exactly as it is, formatting and all.
+    if !removed {
+        return Ok(text.to_string());
+    }
+    to_json_like(&root, text)
+}
+
+/// Pretty-print `root` (keys in the order read, serde_json's `preserve_order`) indented like
+/// `original`: by its first indented line's leading whitespace, or two spaces (the agents' own
+/// style) for a new or one-line file. Key order and indentation are kept; the rest is
+/// serde_json's layout (an inline array or object is spread over lines, a final newline added,
+/// an escape such as `\/` written plainly), so only a file already in it comes back byte for byte.
+fn to_json_like(root: &Value, original: &str) -> Result<String, String> {
+    let indent = original
+        .lines()
+        .skip(1)
+        .map(|line| &line[..line.len() - line.trim_start().len()])
+        .find(|ws| !ws.is_empty())
+        .unwrap_or("  ");
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    root.serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))
+        .map_err(|e| e.to_string())?;
+    out.push(b'\n');
+    String::from_utf8(out).map_err(|e| e.to_string())
 }
 
 /// Shared state check matching [`json_install`]'s shape: installed only when every owned event
@@ -531,6 +655,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_setup_and_remove_keep_what_codex_wrote_inside_an_older_block() {
+        // An older install into an empty config.toml, then Codex's own toml_edit writes (its
+        // model and a folder trust), which landed before our END marker (recorded output).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let path = config_path_for(AgentKind::Codex, home);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let codex_wrote = "model = \"gpt-5\"\n\n[projects.\"/work/proj\"]\ntrust_level = \"trusted\"\n";
+        let notify = r#"notify = ["amalgum", "agent-event", "--agent", "codex", "--hook-version", "1"]"#;
+        fs::write(
+            &path,
+            format!("# >>> amalgum hooks >>>\n{notify}\n{codex_wrote}# <<< amalgum hooks <<<\n"),
+        )
+        .expect("write");
+        assert_eq!(status(AgentKind::Codex, home, "amalgum").expect("status").state, HookState::Outdated);
+
+        assert_eq!(setup(AgentKind::Codex, home, "amalgum").expect("setup").state, HookState::Installed);
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).expect("read")).expect("toml");
+        assert_eq!(parsed.get("model").and_then(toml::Value::as_str), Some("gpt-5"));
+        let trust =
+            parsed.get("projects").and_then(|p| p.get("/work/proj")).and_then(|p| p.get("trust_level"));
+        assert_eq!(trust.and_then(toml::Value::as_str), Some("trusted"));
+
+        remove(AgentKind::Codex, home).expect("remove");
+        assert_eq!(fs::read_to_string(&path).expect("read"), codex_wrote);
+    }
+
+    #[test]
     fn write_atomic_preserves_permissions_and_creates_parent_dirs() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -543,6 +695,158 @@ mod tests {
         let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "existing permissions must survive an atomic rewrite");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+    }
+
+    #[test]
+    fn setup_and_remove_write_through_a_symlinked_config() {
+        // Dotfiles managers (stow, home-manager) link the agent's config into a repo; the link
+        // must survive, and the repo's file must be the one that changes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let repo = dir.path().join("dotfiles");
+        fs::create_dir_all(home.join(".claude")).expect("mkdir");
+        fs::create_dir_all(repo.join("claude")).expect("mkdir");
+        let target = repo.join("claude").join("settings.json");
+        fs::write(&target, "{\n  \"model\": \"opus\"\n}\n").expect("write");
+        let link = home.join(".claude").join("settings.json");
+        std::os::unix::fs::symlink("../../dotfiles/claude/settings.json", &link).expect("symlink");
+
+        let report = setup(AgentKind::Claude, &home, "amalgum").expect("setup");
+        assert_eq!(report.state, HookState::Installed);
+        assert!(fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink(), "link replaced");
+        // The report names the file written, not the link: the output says where it went.
+        assert_eq!(fs::canonicalize(&report.path).ok(), fs::canonicalize(&target).ok());
+        assert!(!fs::symlink_metadata(&report.path).expect("lstat").file_type().is_symlink());
+        let installed = fs::read_to_string(&target).expect("read target");
+        assert_eq!(
+            claude::state(&installed, &hook_command("amalgum", AgentKind::Claude)),
+            HookState::Installed
+        );
+
+        let report = remove(AgentKind::Claude, &home).expect("remove");
+        assert_eq!(fs::canonicalize(&report.path).ok(), fs::canonicalize(&target).ok());
+        assert!(fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink(), "link replaced");
+        assert_eq!(fs::read_to_string(&target).expect("read target"), "{\n  \"model\": \"opus\"\n}\n");
+        let leftovers: Vec<_> = fs::read_dir(home.join(".claude")).expect("ls").collect();
+        assert_eq!(leftovers.len(), 1, "only the link: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_failed_write_through_a_symlink_names_the_file_it_tried_to_replace() {
+        // home-manager links into the read-only Nix store: the bare "Read-only file system"
+        // must say which file. (A directory in the way fails the rename even for root.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("store").join("settings.json");
+        fs::create_dir_all(&target).expect("mkdir");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = write_atomic(&link, "{}\n").expect_err("a directory is in the way");
+        assert!(err.to_string().contains(&target.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn remove_leaves_a_json_config_with_nothing_of_ours_byte_for_byte() {
+        // Hand-edited settings: inline arrays and objects, an escape, no final newline.
+        let original = "{\n  \"permissions\": {\"allow\": [\"Bash(ls)\", \"Read\"]},\n  \"env\": {\"URL\": \"https:\\/\\/x\"}\n}";
+        for agent in [AgentKind::Claude, AgentKind::Gemini] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = config_path_for(agent, dir.path());
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(&path, original).expect("write");
+            assert_eq!(remove(agent, dir.path()).expect("remove").state, HookState::Missing);
+            assert_eq!(fs::read_to_string(&path).expect("read"), original, "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn setup_through_a_dangling_symlink_creates_its_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        fs::create_dir_all(home.join(".codex")).expect("mkdir");
+        let target = home.join("config.toml");
+        let link = home.join(".codex").join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        setup(AgentKind::Codex, home, "amalgum").expect("setup");
+        assert!(fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink(), "link replaced");
+        assert!(fs::read_to_string(&target).expect("read target").contains("notify"));
+    }
+
+    #[test]
+    fn write_atomic_through_a_symlink_loop_fails_and_keeps_the_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink("settings.json", &link).expect("symlink");
+        assert!(write_atomic(&link, "{}\n").is_err());
+        assert!(fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink(), "link replaced");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_copy_behind_when_it_fails() {
+        // A directory where the file should be makes the final rename fail; the temp copy (with
+        // the whole config in it) must not stay behind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::create_dir(&path).expect("mkdir");
+        assert!(write_atomic(&path, "{\"env\":{\"API_KEY\":\"secret\"}}\n").is_err());
+        let names: Vec<_> =
+            fs::read_dir(dir.path()).expect("ls").map(|e| e.expect("entry").file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
+    }
+
+    #[test]
+    fn write_atomic_replaces_a_stale_temp_file_from_an_earlier_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let stale = dir.path().join(format!("config.toml.amalgum-tmp-{}", std::process::id()));
+        fs::write(&stale, "stale").expect("write");
+        write_atomic(&path, "model = \"o3\"\n").expect("write_atomic");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "model = \"o3\"\n");
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn setup_then_remove_restores_an_untouched_json_config_byte_for_byte() {
+        // Key order and indentation are the user's (tracked in a dotfiles repo, a reordered file
+        // is a whole-file diff); only our hook entries come and go.
+        let two_spaces = "{\n  \"permissions\": {\n    \"deny\": [],\n    \"allow\": [\n      \"Bash(ls)\"\n    ]\n  },\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"lint\"\n          }\n        ]\n      }\n    ]\n  },\n  \"env\": {\n    \"Z\": \"1\",\n    \"A\": \"2\"\n  }\n}\n";
+        let four_spaces = "{\n    \"theme\": \"dark\",\n    \"env\": {\n        \"Z\": \"1\",\n        \"A\": \"2\"\n    }\n}\n";
+        for agent in [AgentKind::Claude, AgentKind::Gemini] {
+            for original in [two_spaces, four_spaces] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = config_path_for(agent, dir.path());
+                fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                fs::write(&path, original).expect("write");
+
+                setup(agent, dir.path(), "amalgum").expect("setup");
+                let installed = fs::read_to_string(&path).expect("read");
+                let first_key = original.lines().nth(1).expect("a key line");
+                assert_eq!(installed.lines().nth(1), Some(first_key), "{agent:?}: order or indent changed");
+
+                remove(agent, dir.path()).expect("remove");
+                assert_eq!(fs::read_to_string(&path).expect("read"), original, "{agent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_options_list_each_option_once_and_skip_only_listed_ones() {
+        for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Opencode, AgentKind::Gemini] {
+            let table = cli_options(agent);
+            for (i, (name, _)) in table.options.iter().enumerate() {
+                assert!(name.starts_with("--") && !name.contains('='), "{agent:?}: {name}");
+                assert!(
+                    table.options[i + 1..].iter().all(|(other, _)| other != name),
+                    "{agent:?}: {name} twice"
+                );
+            }
+            for name in table.not_replayed {
+                assert!(
+                    table.takes(name).is_some(),
+                    "{agent:?}: {name} is not listed, so its words are unknown"
+                );
+            }
+        }
     }
 
     #[test]

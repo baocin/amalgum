@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Regression check for .github/workflows/*.yml: a `run:` step must never write a step output
+# straight from a command substitution — `echo "x=$(cmd)" >> "$GITHUB_OUTPUT"`. GitHub's
+# default `bash -e` shell does not fail the step when `cmd` fails there: echo itself still
+# exits 0, only its argument is empty. That leaves the step green and blames the *next* step
+# (check-linkage, upload-artifact) for what was really a build or package failure. Assigning to
+# a variable first — `x="$(cmd)"; echo "x=$x" >> "$GITHUB_OUTPUT"` — lets `bash -e` see it.
+#
+# Assigning to a variable first is necessary but not sufficient: `x="$(cmd | head -1)"` still
+# hides a failing `cmd` under the default `bash -e {0}` shell, which has no pipefail — the
+# assignment's exit status is `head`'s (0), not `cmd`'s. The fix is `shell: bash` on that step
+# (GitHub then runs it as `bash --noprofile --norc -eo pipefail {0}`), or `set -o pipefail`, or
+# dropping the pipe.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+fail=0
+
+pattern='echo "[a-zA-Z_]+=\$\('
+hits="$(grep -nE -- "$pattern" .github/workflows/*.yml || true)"
+if [ -n "$hits" ]; then
+  printf '%s\n' "$hits" >&2
+  echo "✗ a run: step writes \$GITHUB_OUTPUT straight from a command substitution — assign to a variable first" >&2
+  fail=1
+fi
+
+# A piped command substitution assigned to a variable (`x="$(cmd | othercmd)"`) needs `bash -eo
+# pipefail` to fail correctly. Track step boundaries (a step starts at the `- ` list marker) and
+# whether the current step has `shell: bash`; a `head`-piped assignment before that is unsafe.
+for f in .github/workflows/*.yml; do
+  awk '
+    /^      - / {
+      if (bad && !shell) { print FILENAME ":" step_line ": piped command substitution assigned to a variable, but no shell: bash on this step" > "/dev/stderr"; failed = 1 }
+      bad = 0; shell = 0; step_line = NR
+    }
+    /shell:[ \t]*bash/ { shell = 1 }
+    $0 ~ /=\"\$\(/ && $0 ~ /\|[ \t]*head/ { if (!bad) step_line = NR; bad = 1 }
+    END {
+      if (bad && !shell) { print FILENAME ":" step_line ": piped command substitution assigned to a variable, but no shell: bash on this step" > "/dev/stderr"; failed = 1 }
+      exit failed ? 1 : 0
+    }
+  ' "$f" || fail=1
+done
+
+if [ "$fail" != 0 ]; then
+  echo "✗ a run: step pipes into a variable assignment without shell: bash — GitHub's default shell has no pipefail" >&2
+  exit 1
+fi
+echo "workflow-outputs test: 0 unguarded step-output command substitutions found"

@@ -6,7 +6,10 @@
 //! - OSC 7 `file://host/path` → [`OscEvent::Cwd`] (path percent-decoded)
 //! - OSC 0 / OSC 2 → [`OscEvent::Title`]
 //! - OSC 9 `<body>` → Notify without title. `9;4;…` is ConEmu progress: ignored.
-//! - OSC 99 `<metadata>;<body>` (kitty) → Notify with the payload as body
+//! - OSC 99 `<metadata>;<payload>` (kitty) → Notify. The metadata picks the payload's part
+//!   (`p=title`, the default, or `p=body`; queries and other parts are ignored), its encoding
+//!   (`e=1`: base64), and chunking (`d=0`: more chunks with the same `i=` follow). A lone title
+//!   becomes the body, as with OSC 9.
 //! - OSC 777 `notify;<title>;<body>` → Notify
 //! - OSC 133 `A` / `B` / `C` / `D[;exit]` → [`OscEvent::Prompt`]
 //! - a bare BEL outside any sequence → [`OscEvent::Bell`]
@@ -14,9 +17,9 @@
 //! Anything longer than [`MAX_OSC`] bytes is discarded (never buffered without bound).
 //! Invalid UTF-8 is replaced lossily.
 //!
-//! The 8-bit C1 forms are also recognised (cheap: one extra byte match each): `0x9d` as an
-//! OSC introducer (equivalent to `ESC ]`) and `0x9c` as a String Terminator (equivalent to
-//! `ESC \`).
+//! The 8-bit C1 forms (`0x9d` OSC, `0x9c` ST) are deliberately *not* recognised: PTY output is
+//! UTF-8, where those bytes are continuation bytes of ordinary characters (`✳`, `✅`, `”`), and
+//! alacritty's parser does not treat them as controls either.
 
 pub const MAX_OSC: usize = 8192;
 
@@ -54,10 +57,6 @@ enum State {
 
 const BEL: u8 = 0x07;
 const ESC: u8 = 0x1b;
-/// 8-bit C1 OSC introducer, equivalent to `ESC ]`. Cheap to recognise alongside the 7-bit form.
-const C1_OSC: u8 = 0x9d;
-/// 8-bit C1 String Terminator, equivalent to `ESC \`.
-const C1_ST: u8 = 0x9c;
 
 #[derive(Debug, Default)]
 pub struct Scanner {
@@ -66,6 +65,16 @@ pub struct Scanner {
     /// Set once `buf` would exceed [`MAX_OSC`]; further bytes for this sequence are discarded
     /// and no event is emitted when it terminates.
     overflowed: bool,
+    /// A kitty OSC 99 notification whose last chunk has not arrived yet.
+    kitty: Option<KittyNotification>,
+}
+
+/// The text of OSC 99 chunks sharing one `i=` id, each part capped at [`MAX_OSC`] bytes.
+#[derive(Debug, Default)]
+struct KittyNotification {
+    id: String,
+    title: String,
+    body: String,
 }
 
 impl Scanner {
@@ -83,7 +92,6 @@ impl Scanner {
             State::Ground => match b {
                 ESC => self.state = State::Esc,
                 BEL => out.push(OscEvent::Bell),
-                C1_OSC => self.start_osc(),
                 _ => {}
             },
             State::Esc => match b {
@@ -93,7 +101,7 @@ impl Scanner {
                 _ => self.state = State::Ground,
             },
             State::Osc => match b {
-                BEL | C1_ST => self.finish(out),
+                BEL => self.finish(out),
                 ESC => self.state = State::OscEsc,
                 _ => self.push_byte(b),
             },
@@ -124,7 +132,11 @@ impl Scanner {
     fn finish(&mut self, out: &mut Vec<OscEvent>) {
         if !self.overflowed {
             let payload = String::from_utf8_lossy(&self.buf);
-            if let Some(ev) = parse_payload(&payload) {
+            let ev = match payload.split_once(';') {
+                Some(("99", rest)) => parse_99(rest, &mut self.kitty),
+                _ => parse_payload(&payload),
+            };
+            if let Some(ev) = ev {
                 out.push(ev);
             }
         }
@@ -134,7 +146,8 @@ impl Scanner {
     }
 }
 
-/// Parse one complete OSC payload (the bytes between the introducer and the terminator).
+/// Parse one complete OSC payload (the bytes between the introducer and the terminator), except
+/// OSC 99, whose chunks need the scanner's state ([`parse_99`]).
 fn parse_payload(payload: &str) -> Option<OscEvent> {
     let (code, rest) = payload.split_once(';').unwrap_or((payload, ""));
     match code {
@@ -148,13 +161,79 @@ fn parse_payload(payload: &str) -> Option<OscEvent> {
                 Some(OscEvent::Notify { title: None, body: rest.to_string() })
             }
         }
-        // Kitty OSC 99: body is everything after the first `;`; any leading metadata segment
-        // is not parsed out further (§ module docs: "metadata ignored").
-        "99" => Some(OscEvent::Notify { title: None, body: rest.to_string() }),
         "777" => parse_777(rest),
         "133" => parse_133(rest),
         _ => None,
     }
+}
+
+/// Kitty OSC 99 `<metadata>;<payload>`, the metadata being `key=value` pairs joined by `:`. Adds
+/// this chunk to `pending` and returns the notification once its last chunk (`d=1`, the default)
+/// arrives. Only the `title` (default) and `body` parts carry text; `?` queries, `close`,
+/// `alive`, `icon`, and `buttons` don't. A lone title becomes the body, as with OSC 9.
+fn parse_99(rest: &str, pending: &mut Option<KittyNotification>) -> Option<OscEvent> {
+    let (metadata, payload) = rest.split_once(';').unwrap_or((rest, ""));
+    let (mut id, mut done, mut part, mut base64) = ("", true, "title", false);
+    for (key, value) in metadata.split(':').filter_map(|kv| kv.split_once('=')) {
+        match key {
+            "i" => id = value,
+            "d" => done = value != "0",
+            "p" => part = value,
+            "e" => base64 = value == "1",
+            _ => {}
+        }
+    }
+
+    let mut n = pending
+        .take()
+        .filter(|n| n.id == id)
+        .unwrap_or_else(|| KittyNotification { id: id.to_string(), ..KittyNotification::default() });
+    let field = match part {
+        "title" => Some(&mut n.title),
+        "body" => Some(&mut n.body),
+        _ => None,
+    };
+    if let Some(field) = field {
+        let text = if base64 { decode_base64(payload) } else { payload.to_string() };
+        if field.len() + text.len() <= MAX_OSC {
+            field.push_str(&text);
+        }
+    }
+    if !done {
+        *pending = Some(n);
+        return None;
+    }
+    match (n.title.is_empty(), n.body.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(OscEvent::Notify { title: None, body: n.title }),
+        (true, false) => Some(OscEvent::Notify { title: None, body: n.body }),
+        (false, false) => Some(OscEvent::Notify { title: Some(n.title), body: n.body }),
+    }
+}
+
+/// Decode standard base64 (padding optional; bytes outside the alphabet are skipped) as UTF-8,
+/// replacing invalid sequences lossily.
+fn decode_base64(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 2);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for b in input.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_cwd(rest: &str) -> Option<OscEvent> {
@@ -316,11 +395,49 @@ mod tests {
     }
 
     #[test]
-    fn osc99_body_is_text_after_first_semicolon() {
+    fn osc99_text_is_the_payload_after_the_metadata() {
+        // Kitty: `99 ; <metadata> ; <payload>`, the payload being the title unless `p=body`.
         assert_eq!(
-            feed_all(b"\x1b]99;i=1:d=0;hello there\x07"),
-            vec![OscEvent::Notify { title: None, body: "i=1:d=0;hello there".into() }]
+            feed_all(b"\x1b]99;;Hello world\x1b\\"),
+            vec![OscEvent::Notify { title: None, body: "Hello world".into() }]
         );
+        assert_eq!(
+            feed_all(b"\x1b]99;i=1:d=1;hello; there\x07"),
+            vec![OscEvent::Notify { title: None, body: "hello; there".into() }]
+        );
+        assert_eq!(
+            feed_all(b"\x1b]99;p=body;just a body\x07"),
+            vec![OscEvent::Notify { title: None, body: "just a body".into() }]
+        );
+    }
+
+    #[test]
+    fn osc99_chunks_are_joined_into_one_notification_by_id() {
+        // `d=0`: more chunks follow for the same `i`; the title and body arrive separately.
+        let seq = b"\x1b]99;i=7:d=0:p=title;Build\x1b\\\x1b]99;i=7:d=0:p=body;3 errors,\x1b\\\
+                    \x1b]99;i=7:p=body; see log\x1b\\\x1b]99;i=7:d=1:a=focus;\x1b\\";
+        let want = vec![OscEvent::Notify { title: Some("Build".into()), body: "3 errors, see log".into() }];
+        assert_eq!(feed_all(seq), want);
+        for seed in [3u64, 17, 4242] {
+            assert_eq!(feed_deterministic_splits(seq, seed), want);
+        }
+    }
+
+    #[test]
+    fn osc99_base64_payload_is_decoded() {
+        // `e=1`: base64 UTF-8 ("✅ done" and "Tests").
+        assert_eq!(
+            feed_all(b"\x1b]99;i=2:d=0:e=1;VGVzdHM=\x1b\\\x1b]99;i=2:e=1:p=body;4pyFIGRvbmU=\x1b\\"),
+            vec![OscEvent::Notify { title: Some("Tests".into()), body: "✅ done".into() }]
+        );
+    }
+
+    #[test]
+    fn osc99_queries_and_non_text_payloads_are_not_notifications() {
+        assert_eq!(feed_all(b"\x1b]99;i=1:p=?;\x1b\\"), vec![]);
+        assert_eq!(feed_all(b"\x1b]99;i=1:p=close;\x1b\\"), vec![]);
+        assert_eq!(feed_all(b"\x1b]99;i=1:p=alive;\x1b\\"), vec![]);
+        assert_eq!(feed_all(b"\x1b]99;;\x1b\\"), vec![], "no text, no notification");
     }
 
     #[test]
@@ -389,9 +506,25 @@ mod tests {
     }
 
     #[test]
-    fn c1_osc_and_c1_st_are_recognised() {
-        // 0x9d ... 0x9c is the 8-bit equivalent of `ESC ] ... ESC \`.
-        assert_eq!(feed_all(b"\x9d0;c1 title\x9c"), vec![OscEvent::Title("c1 title".into())]);
+    fn utf8_continuation_bytes_are_not_8bit_c1_controls() {
+        // ✳ (E2 9C B3) and ✅ (E2 9C 85) carry 0x9c, the 8-bit ST; ” (E2 80 9D) carries 0x9d,
+        // the 8-bit OSC introducer. PTY output is UTF-8, so none of them ends or starts an OSC.
+        assert_eq!(
+            feed_all("\x1b]0;✳ Claude Code\x07".as_bytes()),
+            vec![OscEvent::Title("✳ Claude Code".into())]
+        );
+        assert_eq!(
+            feed_all("\x1b]777;notify;Build;✅ tests passed\x07".as_bytes()),
+            vec![OscEvent::Notify { title: Some("Build".into()), body: "✅ tests passed".into() }]
+        );
+        assert_eq!(feed_all("He said “done” now\x07".as_bytes()), vec![OscEvent::Bell]);
+    }
+
+    #[test]
+    fn bare_8bit_c1_bytes_are_not_controls() {
+        // Like alacritty's parser: 0x9d does not open an OSC and 0x9c does not end one.
+        assert_eq!(feed_all(b"\x9d0;c1 title\x9c\x07"), vec![OscEvent::Bell]);
+        assert_eq!(feed_all(b"\x1b]0;a\x9cb\x07"), vec![OscEvent::Title("a\u{fffd}b".into())]);
     }
 
     #[test]
@@ -457,6 +590,7 @@ mod tests {
         seq.extend_from_slice(b"\x1b]9;notify body\x07");
         seq.extend_from_slice(b"\x1b]777;notify;title here;body with ; semicolons\x07");
         seq.extend_from_slice(b"\x1b]133;D;1\x07");
+        seq.extend_from_slice("\x1b]0;✳ “quoted” title\x07".as_bytes());
         seq.extend_from_slice(b"\x1b]0;final title\x1b\\");
 
         let whole = feed_all(&seq);

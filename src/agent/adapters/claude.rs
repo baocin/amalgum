@@ -9,6 +9,7 @@
 //! NeedsInput; Stop → Idle, or NeedsInput when the last assistant message ends with `?`;
 //! SessionEnd → Status::None. Resume: `claude --resume <id>`.
 
+use super::Takes::{Many, Nothing, One, Optional};
 use super::{AgentEvent, AgentKind, EventKind, HookState, Status};
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,97 @@ pub fn state(text: &str, command: &str) -> HookState {
 pub fn resume(session_id: &str) -> String {
     format!("claude --resume {}", crate::ssh::quote(session_id))
 }
+
+/// `claude --help` (2.1), plus the `--*-file` prompt options and `--permission-prompt-tool` it
+/// names in passing.
+pub const CLI_OPTIONS: super::CliOptions = super::CliOptions {
+    options: &[
+        ("--add-dir", Many),
+        ("--agent", One),
+        ("--agents", One),
+        ("--allow-dangerously-skip-permissions", Nothing),
+        ("--allowed-tools", Many),
+        ("--allowedTools", Many),
+        ("--append-system-prompt", One),
+        ("--append-system-prompt-file", One),
+        ("--autocompact", One),
+        ("--ax-screen-reader", Nothing),
+        ("--background", Nothing),
+        ("--bare", Nothing),
+        ("--betas", Many),
+        ("--bg", Nothing),
+        ("--brief", Nothing),
+        ("--chrome", Nothing),
+        ("--cloud", Optional),
+        ("--continue", Nothing),
+        ("--dangerously-skip-permissions", Nothing),
+        ("--debug", Optional),
+        ("--debug-file", One),
+        ("--disable-slash-commands", Nothing),
+        ("--disallowed-tools", Many),
+        ("--disallowedTools", Many),
+        ("--effort", One),
+        ("--environment", One),
+        ("--exclude-dynamic-system-prompt-sections", Nothing),
+        ("--fallback-model", One),
+        ("--file", Many),
+        ("--fork-session", Nothing),
+        ("--forward-subagent-text", Nothing),
+        ("--from-pr", Optional),
+        ("--ide", Nothing),
+        ("--include-hook-events", Nothing),
+        ("--include-partial-messages", Nothing),
+        ("--input-format", One),
+        ("--json-schema", One),
+        ("--max-budget-usd", One),
+        ("--mcp-config", Many),
+        ("--model", One),
+        ("--name", One),
+        ("--no-chrome", Nothing),
+        ("--no-session-persistence", Nothing),
+        ("--output-format", One),
+        ("--permission-mode", One),
+        ("--permission-prompt-tool", One),
+        ("--permission-prompts", One),
+        ("--plugin-dir", One),
+        ("--plugin-url", One),
+        ("--print", Nothing),
+        ("--prompt-suggestions", Optional),
+        ("--remote-control", Optional),
+        ("--remote-control-session-name-prefix", One),
+        ("--replay-user-messages", Nothing),
+        ("--restricted", Nothing),
+        ("--resume", Optional),
+        ("--safe-mode", Nothing),
+        ("--session-id", One),
+        ("--setting-sources", One),
+        ("--settings", One),
+        ("--strict-mcp-config", Nothing),
+        ("--system-prompt", One),
+        ("--system-prompt-file", One),
+        ("--system-prompt-snapshot", One),
+        ("--teleport", Optional),
+        ("--tmux", Nothing),
+        ("--tools", Many),
+        ("--verbose", Nothing),
+        ("--worktree", Optional),
+    ],
+    // `--worktree <name>` is replayed: an existing worktree of that name is reused, and the
+    // session lives there. `--bg` would take the resumed session out of the tab.
+    not_replayed: &[
+        "--background",
+        "--bg",
+        "--cloud",
+        "--continue",
+        "--environment",
+        "--fork-session",
+        "--from-pr",
+        "--print",
+        "--resume",
+        "--session-id",
+        "--teleport",
+    ],
+};
 
 #[cfg(test)]
 mod tests {

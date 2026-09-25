@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Exercise .claude/hooks/stop-gate.sh's cache key in a scratch repo: renaming an untracked file
+# (same bytes, no tracked change) must invalidate the cached "green" result, not be silently
+# treated as "nothing changed".
+set -uo pipefail
+repo_root="$(git rev-parse --show-toplevel)" || exit 1
+hook="$repo_root/.claude/hooks/stop-gate.sh"
+pass=0; failed=0
+
+tmp="$(mktemp -d)"
+marker_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$marker_dir"' EXIT
+marker="$marker_dir/verify-runs"
+: > "$marker"
+
+git -C "$tmp" init -q -b main
+git -C "$tmp" config user.email test@example.com
+git -C "$tmp" config user.name test
+mkdir -p "$tmp/.claude" "$tmp/scripts/agent"
+printf 'tracked\n' > "$tmp/tracked.txt"
+# Match the real repo: the stamp file itself must not feed back into the next state hash.
+printf '/.claude/.gate-stamp\n' > "$tmp/.gitignore"
+# A tracked, constant verify stub: it records each invocation to a marker OUTSIDE the repo
+# (so recording an invocation never itself perturbs the untracked-file scan under test) and
+# always exits 0, so only the marker — not the hook's exit code — tells us whether the second
+# stop actually re-ran the gate.
+printf '#!/usr/bin/env bash\necho run >> %q\nexit 0\n' "$marker" > "$tmp/scripts/agent/verify"
+chmod +x "$tmp/scripts/agent/verify"
+git -C "$tmp" -c commit.gpgsign=false add tracked.txt .gitignore scripts/agent/verify
+git -C "$tmp" -c commit.gpgsign=false commit -q -m init
+printf 'same content\n' > "$tmp/old-name.txt"
+
+run_hook() { (cd "$tmp" && printf '{}' | "$hook"); }
+# BSD/macOS `wc -l` right-pads its count (`       1`, not `1`); `grep -c .` prints a bare digit
+# on both it and GNU wc, so the numeric comparison below doesn't depend on which one ran.
+runs() { grep -c . "$marker"; }
+
+# First stop: no cached state yet, so the gate runs (the stub verify) once.
+run_hook >/dev/null 2>&1
+got1=$?
+runs_after_1=$(runs)
+
+# Same bytes, different name — only the untracked file's path changed, nothing tracked did.
+mv "$tmp/old-name.txt" "$tmp/new-name.txt"
+
+run_hook >/dev/null 2>&1
+got2=$?
+runs_after_2=$(runs)
+
+if [ "$got1" = 0 ] && [ "$got2" = 0 ] && [ "$runs_after_1" = 1 ] && [ "$runs_after_2" = 2 ]; then
+  pass=$((pass + 1))
+else
+  failed=$((failed + 1))
+  echo "✗ renaming an untracked file must re-run the gate instead of hitting a stale cache" \
+       "(got1=$got1 [want 0], got2=$got2 [want 0], verify runs: $runs_after_1 then $runs_after_2 [want 1 then 2])"
+fi
+
+echo "stop-gate tests: $pass passed, $failed failed"
+[ "$failed" = 0 ]

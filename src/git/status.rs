@@ -204,16 +204,20 @@ pub enum RepoOp {
     Rebase,
     CherryPick,
     Revert,
+    /// `git am`. Uses the same `rebase-apply/` directory as a `rebase --apply`, but must never
+    /// be offered `rebase --continue`/`--abort`: git refuses both mid-`am` (§5.17).
+    Am,
 }
 
 impl RepoOp {
-    /// "Merge", "Rebase", "Cherry-pick", "Revert" — for "Merge in progress · 3 conflicts".
+    /// "Merge", "Rebase", "Cherry-pick", "Revert", "Am" — for "Merge in progress · 3 conflicts".
     pub fn name(self) -> &'static str {
         match self {
             RepoOp::Merge => "Merge",
             RepoOp::Rebase => "Rebase",
             RepoOp::CherryPick => "Cherry-pick",
             RepoOp::Revert => "Revert",
+            RepoOp::Am => "Am",
         }
     }
     pub fn continue_args(self) -> &'static [&'static str] {
@@ -222,6 +226,7 @@ impl RepoOp {
             RepoOp::Rebase => &["rebase", "--continue"],
             RepoOp::CherryPick => &["cherry-pick", "--continue"],
             RepoOp::Revert => &["revert", "--continue"],
+            RepoOp::Am => &["am", "--continue"],
         }
     }
     pub fn abort_args(self) -> &'static [&'static str] {
@@ -230,6 +235,7 @@ impl RepoOp {
             RepoOp::Rebase => &["rebase", "--abort"],
             RepoOp::CherryPick => &["cherry-pick", "--abort"],
             RepoOp::Revert => &["revert", "--abort"],
+            RepoOp::Am => &["am", "--abort"],
         }
     }
 }
@@ -237,8 +243,15 @@ impl RepoOp {
 /// Detect an in-progress operation from files in the git dir (`MERGE_HEAD`, `rebase-merge/`,
 /// `rebase-apply/`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`). `exists` answers for a path relative
 /// to the git dir, so this works locally and over ssh alike.
+///
+/// `git am` and the apply-backend `git rebase` both stop inside `rebase-apply/`; they are told
+/// apart by `rebase-apply/applying`, which only an `am` session writes (a rebase writes
+/// `rebase-apply/rebasing` instead). Getting this wrong matters: `rebase --continue`/`--abort`
+/// on a conflicted `am` session is refused by git.
 pub fn detect_op(exists: impl Fn(&str) -> bool) -> Option<RepoOp> {
-    if exists("rebase-merge") || exists("rebase-apply") {
+    if exists("rebase-apply/applying") {
+        Some(RepoOp::Am)
+    } else if exists("rebase-merge") || exists("rebase-apply") {
         Some(RepoOp::Rebase)
     } else if exists("MERGE_HEAD") {
         Some(RepoOp::Merge)
@@ -482,17 +495,27 @@ mod tests {
         assert_eq!(RepoOp::Rebase.name(), "Rebase");
         assert_eq!(RepoOp::CherryPick.name(), "Cherry-pick");
         assert_eq!(RepoOp::Revert.name(), "Revert");
+        assert_eq!(RepoOp::Am.name(), "Am");
         assert_eq!(RepoOp::Merge.continue_args(), &["merge", "--continue"]);
         assert_eq!(RepoOp::Rebase.abort_args(), &["rebase", "--abort"]);
+        assert_eq!(RepoOp::Am.continue_args(), &["am", "--continue"]);
+        assert_eq!(RepoOp::Am.abort_args(), &["am", "--abort"]);
     }
 
     #[test]
     fn detect_op_precedence() {
-        // rebase-merge/rebase-apply > MERGE_HEAD > CHERRY_PICK_HEAD > REVERT_HEAD.
+        // rebase-apply/applying (am) > rebase-merge/rebase-apply (rebase) > MERGE_HEAD >
+        // CHERRY_PICK_HEAD > REVERT_HEAD.
         let all = |present: &[&str]| {
             let present: Vec<String> = present.iter().map(|s| s.to_string()).collect();
             move |p: &str| present.iter().any(|s| s == p)
         };
+        assert_eq!(
+            detect_op(all(&["rebase-apply", "rebase-apply/applying"])),
+            Some(RepoOp::Am),
+            "rebase-apply/applying means an am session, not a rebase"
+        );
+        assert_eq!(detect_op(all(&["rebase-apply"])), Some(RepoOp::Rebase), "no applying marker: a rebase");
         assert_eq!(detect_op(all(&["rebase-merge", "MERGE_HEAD"])), Some(RepoOp::Rebase));
         assert_eq!(detect_op(all(&["MERGE_HEAD", "CHERRY_PICK_HEAD"])), Some(RepoOp::Merge));
         assert_eq!(detect_op(all(&["CHERRY_PICK_HEAD", "REVERT_HEAD"])), Some(RepoOp::CherryPick));
@@ -516,6 +539,35 @@ mod tests {
         let git_dir = repo.path().join(".git");
         let op = detect_op(|p| git_dir.join(p).exists());
         assert_eq!(op, Some(RepoOp::Merge));
+    }
+
+    #[test]
+    fn detect_op_finds_real_mid_am_repo() {
+        // Regression: a conflicted `git am` must be reported as `Am`, not `Rebase` — git
+        // refuses `rebase --continue`/`--abort` mid-`am` ("It looks like 'git am' is in
+        // progress. Cannot rebase.").
+        let mut repo = TempRepo::new();
+        repo.commit_file("f.txt", "line1\n", "init");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.commit_file("f.txt", "line1-feat\n", "feat change");
+        let patch_out = crate::testutil::hermetic_git(repo.path())
+            .args(["format-patch", "-q", "-1", "--stdout"])
+            .output()
+            .expect("spawn git");
+        assert!(patch_out.status.success());
+        repo.write("feat.patch", &String::from_utf8_lossy(&patch_out.stdout));
+
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit_file("f.txt", "line1-main\n", "main change"); // conflicts with the patch
+
+        let _ = crate::testutil::hermetic_git(repo.path())
+            .args(["am", "feat.patch"])
+            .output()
+            .expect("spawn git");
+
+        let git_dir = repo.path().join(".git");
+        let op = detect_op(|p| git_dir.join(p).exists());
+        assert_eq!(op, Some(RepoOp::Am));
     }
 
     /// Minimal helper so `parses_ahead_behind_upstream` can drive a clone of a real bare remote

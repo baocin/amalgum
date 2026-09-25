@@ -208,18 +208,29 @@ impl AppState {
         removed
     }
 
-    /// Removes the repo group entirely (all its remotes and workspaces). Clears `active` if it
-    /// pointed inside the removed repo.
+    /// Removes the repo group entirely (all its remotes and workspaces). If `active` pointed
+    /// inside it, the new active workspace follows [`remove_workspace`](Self::remove_workspace):
+    /// the next one in sidebar order after the repo, else the previous one, else `None`.
     pub fn forget_repo(&mut self, repo_id: &str) {
         let Some(pos) = self.repos.iter().position(|r| r.id == repo_id) else { return };
-        let repo = self.repos.remove(pos);
-        let active_was_inside = self
-            .active
-            .as_deref()
-            .is_some_and(|active| repo.remotes.iter().any(|g| g.workspaces.iter().any(|w| w.id == active)));
-        if active_was_inside {
-            self.active = None;
+        // Sidebar order before the removal, each id flagged with whether it is in the repo.
+        let order: Vec<(&str, bool)> = self
+            .repos
+            .iter()
+            .flat_map(|r| {
+                r.remotes.iter().flat_map(|g| &g.workspaces).map(move |w| (w.id.as_str(), r.id == repo_id))
+            })
+            .collect();
+        let active_idx = order.iter().position(|(id, _)| Some(*id) == self.active.as_deref());
+        if let Some(idx) = active_idx
+            && order[idx].1
+        {
+            let outside = |(id, inside): &(&str, bool)| (!inside).then(|| id.to_string());
+            let next_active =
+                order[idx..].iter().find_map(outside).or_else(|| order[..idx].iter().rev().find_map(outside));
+            self.active = next_active;
         }
+        self.repos.remove(pos);
     }
 
     pub fn workspace(&self, id: &str) -> Option<&Workspace> {
@@ -573,16 +584,44 @@ mod tests {
 
     // --- forget_repo -----------------------------------------------------
 
+    /// Same rule as `remove_workspace`: active moves to the next workspace in sidebar order
+    /// past the forgotten repo, so the sidebar never lists workspaces with none active.
     #[test]
-    fn forget_repo_removes_repo_and_clears_active_if_inside() {
+    fn forget_repo_moves_active_to_the_next_workspace_after_the_repo() {
         let mut state = AppState::default();
         state.add_workspace("r1", "conduit", "origin", None, ws("w0"));
-        state.add_workspace("r2", "amalgum", "origin", None, ws("w1"));
+        state.add_workspace("r1", "conduit", "upstream", None, ws("w1"));
+        state.add_workspace("r2", "amalgum", "origin", None, ws("w2"));
         state.active = Some("w0".to_string());
 
         state.forget_repo("r1");
         assert_eq!(state.repos.len(), 1);
         assert_eq!(state.repos[0].id, "r2");
+        assert_eq!(state.active.as_deref(), Some("w2"));
+    }
+
+    #[test]
+    fn forget_last_repo_moves_active_to_the_previous_workspace() {
+        let mut state = AppState::default();
+        state.add_workspace("r1", "conduit", "origin", None, ws("w0"));
+        state.add_workspace("r2", "amalgum", "origin", None, ws("w1"));
+        state.add_workspace("r2", "amalgum", "origin", None, ws("w2"));
+        state.active = Some("w2".to_string());
+
+        state.forget_repo("r2");
+        assert_eq!(state.active.as_deref(), Some("w0"));
+    }
+
+    #[test]
+    fn forget_repo_clears_active_when_no_workspace_remains() {
+        let mut state = AppState::default();
+        state.add_workspace("r1", "conduit", "origin", None, ws("w0"));
+        state.add_workspace("r2", "amalgum", "origin", None, ws("w1"));
+        state.remove_workspace("w1");
+        state.active = Some("w0".to_string());
+
+        state.forget_repo("r1");
+        assert_eq!(state.repos.len(), 1, "r2 survives, empty");
         assert_eq!(state.active, None);
     }
 

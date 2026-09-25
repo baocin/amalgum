@@ -1,7 +1,7 @@
 //! macOS implementations. Native menu bar, vibrancy, and UNUserNotification can land here
 //! later; today every function shells out to a stock macOS tool.
 
-use super::{Decorations, capture, spawn_detached};
+use super::{Decorations, capture, shim_is_current, spawn_detached};
 use crate::ports;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,13 @@ pub fn open_terminal_at(path: &Path) -> io::Result<()> {
     spawn_detached(Command::new("open").args(["-a", "Terminal"]).arg(path))
 }
 
-/// `/usr/local/bin` is root-owned, so the link is made through an admin prompt.
+/// `/usr/local/bin` is root-owned, so the link is made through an admin prompt. Launched via
+/// the shim, `exe` is the shim itself: `shim_is_current` stops `ln -sf` looping it onto itself.
 pub fn install_cli_shim(exe: &Path) -> io::Result<PathBuf> {
     let link = PathBuf::from("/usr/local/bin/amalgum");
+    if shim_is_current(exe, &link)? {
+        return Ok(link);
+    }
     let script = format!(
         "do shell script \"mkdir -p /usr/local/bin && ln -sf \" & quoted form of \"{}\" & \" {}\" \
          with administrator privileges",

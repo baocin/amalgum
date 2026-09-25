@@ -109,6 +109,10 @@ impl Layout {
 
         for parent in parents.iter().skip(1) {
             let target = self.lanes.iter().position(|l| l.as_ref().is_some_and(|(cid, _)| cid == parent));
+            // A lane already waiting for `parent` before this row (i.e. active in `old`) keeps
+            // its own vertical through the bottom half too, in addition to this parent's new
+            // diagonal into it — otherwise that lane's column stops dead at the row's middle.
+            let already_waiting = target.is_some_and(|t| old.get(t).is_some_and(Option::is_some));
             let target =
                 target.or_else(|| self.lanes.iter().position(Option::is_none)).unwrap_or(self.lanes.len());
             if target >= self.lanes.len() {
@@ -118,6 +122,9 @@ impl Layout {
                 self.lanes[target] = Some((parent.clone(), target % LANE_COLORS));
             }
             let color = self.lanes[target].as_ref().map(|(_, c)| *c).unwrap_or_default();
+            if already_waiting {
+                segments.push(Segment { half: Half::Bottom, from: target, to: target, color });
+            }
             segments.push(Segment { half: Half::Bottom, from: node, to: target, color });
             touched.push(target);
         }
@@ -329,6 +336,29 @@ mod tests {
         // Base is awaited by whatever lanes A1 and B1 folded into, and is a root.
         let base = rows.last().unwrap();
         assert!(base.segments.iter().all(|s| s.half == Half::Top), "Base is a root: no bottom segments");
+    }
+
+    #[test]
+    fn merges_second_parent_into_a_lane_already_waiting_for_it_keeps_its_vertical() {
+        // Regression: F's next commit is P2 (lane 0 becomes, and stays, "waiting for P2"). M's
+        // second parent is also P2, reusing that same lane — the pre-existing lane must keep
+        // its own top-to-bottom vertical *in addition to* M's new diagonal into it, not lose it
+        // to the diagonal. This is the shape of "merge main into feature" once main's tip has
+        // already been laid out, or of `--all` where a merged branch keeps going.
+        let rows = push_all(&[("F", &["P2"], None), ("M", &["P1", "P2"], None)]);
+        assert_invariants(&rows);
+
+        let m = &rows[1];
+        assert!(
+            m.segments.contains(&Segment { half: Half::Bottom, from: 0, to: 0, color: 0 }),
+            "lane 0 must keep its own vertical through the bottom half: {:?}",
+            m.segments
+        );
+        assert!(
+            m.segments.iter().any(|s| s.half == Half::Bottom && s.from == m.node && s.to == 0),
+            "M's second parent must still draw its diagonal into lane 0: {:?}",
+            m.segments
+        );
     }
 
     #[test]

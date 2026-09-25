@@ -26,7 +26,7 @@ use super::chrome::Toast;
 use super::jobs;
 use super::theme::Colors;
 use crate::git::cmd::{Git, GitError, Location};
-use crate::git::journal::Journal;
+use crate::git::journal::{Failed, Journal};
 use crate::git::log::Commit;
 use crate::git::refs::{
     FOR_EACH_REF_ARGS, REMOTE_ARGS, Ref, Remote, STASH_ARGS, Stash, WORKTREE_ARGS, Worktree,
@@ -529,11 +529,9 @@ impl GitPane {
         let Some(entry) = peeked else {
             return; // nothing recorded yet; `journal.undo/redo` would say NothingToDo anyway
         };
-        let touched: Vec<String> = if is_undo {
-            entry.after.refs.keys().cloned().collect()
-        } else {
-            entry.before.refs.keys().cloned().collect()
-        };
+        let guard = if is_undo { &entry.after } else { &entry.before };
+        let touched: Vec<String> = guard.refs.keys().cloned().collect();
+        let want_stashes = !guard.stashes.is_empty();
         self.undo_busy = true;
         let journal = std::mem::take(&mut self.journal);
         let git = self.git.clone();
@@ -545,15 +543,18 @@ impl GitPane {
                     refs.insert(name.clone(), String::from_utf8_lossy(&out).trim().to_string());
                 }
             }
-            let current = crate::git::journal::Snapshot { head, branch, refs, stashes: vec![] };
-            let mut journal = journal;
-            let plan_result = if is_undo { journal.undo(&current) } else { journal.redo(&current) };
-            let result = match plan_result {
-                Ok(plan) => {
-                    worker::run_plan(&git, &plan).map_err(|_| crate::git::journal::Refused::NothingToDo)
-                }
-                Err(refused) => Err(refused),
+            let stashes = if want_stashes {
+                git.run(STASH_ARGS)
+                    .map(|o| gitrefs::parse_stashes(&o).into_iter().map(|s| s.oid).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
             };
+            let current = crate::git::journal::Snapshot { head, branch, refs, stashes };
+            let mut journal = journal;
+            // The journal marks the entry undone/redone only if the plan succeeds.
+            let run = |plan: &crate::git::journal::Plan| worker::run_plan(&git, plan);
+            let result = if is_undo { journal.undo(&current, run) } else { journal.redo(&current, run) };
             let outcome = worker::JournalRunOutcome { journal, result };
             if is_undo { Reply::Undo(outcome) } else { Reply::Redo(outcome) }
         });
@@ -571,10 +572,17 @@ impl GitPane {
         let _ = self.journal.save(&self.journal_path);
         match outcome.result {
             Ok(()) => self.refresh_now(ctx),
-            Err(refused) => events.push(GitEvent::Toast(Toast::error(
+            Err(Failed::Refused(refused)) => events.push(GitEvent::Toast(Toast::error(
                 worker::refusal_message(action, &refused),
                 String::new(),
             ))),
+            Err(Failed::Run(e)) => {
+                events.push(GitEvent::Toast(Toast::error(
+                    format!("Can't {action}: {}", e.summary()),
+                    e.stderr.clone(),
+                )));
+                self.refresh_now(ctx); // a plan of several commands may have stopped part-way
+            }
         }
     }
 

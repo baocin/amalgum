@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Exercise scripts/agent/verify's scoping regexes (RUST_RE, HARNESS_RE) against paths that must,
+# and must not, trigger the cargo/harness legs of the scoped gate. Run by the gate itself when
+# harness files change.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Pull the patterns straight out of the script under test, so this can't silently drift from it.
+RUST_RE="$(sed -n "s/^RUST_RE='\(.*\)'\$/\1/p" scripts/agent/verify)"
+HARNESS_RE="$(sed -n "s/^HARNESS_RE='\(.*\)'\$/\1/p" scripts/agent/verify)"
+[ -n "$RUST_RE" ] || { echo "✗ could not extract RUST_RE from scripts/agent/verify"; exit 1; }
+[ -n "$HARNESS_RE" ] || { echo "✗ could not extract HARNESS_RE from scripts/agent/verify"; exit 1; }
+
+pass=0; failed=0
+expect() { # <RUST_RE|HARNESS_RE> <match|no-match> <path>
+  local name="$1" want="$2" path="$3" re got
+  case "$name" in
+    RUST_RE) re="$RUST_RE" ;;
+    HARNESS_RE) re="$HARNESS_RE" ;;
+  esac
+  if printf '%s\n' "$path" | grep -Eq -- "$re"; then got=match; else got=no-match; fi
+  if [ "$got" = "$want" ]; then pass=$((pass + 1)); else failed=$((failed + 1)); echo "✗ $name: expected $want, got $got: $path"; fi
+}
+
+# src/model/theme.rs reads docs/SPEC.md at test time (spec_semantic_tokens_table_matches,
+# spec_ansi_table_matches, spec_lane_table_matches), so a branch that only edits it must still
+# run the cargo legs — otherwise the scoped gate reports green on a change that breaks `cargo test`.
+expect RUST_RE match docs/SPEC.md
+expect RUST_RE match src/main.rs
+expect RUST_RE match src/model/theme.rs
+expect RUST_RE match tests/cli.rs
+expect RUST_RE match build.rs
+expect RUST_RE match Cargo.toml
+expect RUST_RE match Cargo.lock
+expect RUST_RE no-match docs/STATUS.md
+expect RUST_RE no-match docs/HARNESS.md
+expect RUST_RE no-match README.md
+
+expect HARNESS_RE match scripts/agent/verify
+expect HARNESS_RE match .claude/hooks/guard-bash.sh
+expect HARNESS_RE match .github/workflows/ci.yml
+expect HARNESS_RE no-match src/main.rs
+expect HARNESS_RE no-match docs/SPEC.md
+
+echo "verify-scope tests: $pass passed, $failed failed"
+[ "$failed" = 0 ]

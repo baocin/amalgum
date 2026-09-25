@@ -6,6 +6,7 @@
 //! `agent-event --agent gemini`. Resume: `gemini --resume <id>`.
 //! Gemini's hook schema is young; keep this file the only place that knows it.
 
+use super::Takes::{Many, Nothing, One, Optional};
 use super::{AgentEvent, AgentKind, EventKind, HookState, Status};
 use std::path::{Path, PathBuf};
 
@@ -62,6 +63,38 @@ pub fn state(text: &str, command: &str) -> HookState {
 pub fn resume(session_id: &str) -> String {
     format!("gemini --resume {}", crate::ssh::quote(session_id))
 }
+
+/// `gemini --help` (yargs: an `[array]` option takes the words up to the next option).
+pub const CLI_OPTIONS: super::CliOptions = super::CliOptions {
+    options: &[
+        ("--allowed-mcp-server-names", Many),
+        ("--allowed-tools", Many),
+        ("--approval-mode", One),
+        ("--debug", Nothing),
+        ("--delete-session", One),
+        ("--extensions", Many),
+        ("--include-directories", Many),
+        ("--list-extensions", Nothing),
+        ("--list-sessions", Nothing),
+        ("--model", One),
+        ("--output-format", One),
+        ("--prompt", One),
+        ("--prompt-interactive", One),
+        ("--proxy", One),
+        ("--resume", Optional),
+        ("--sandbox", Nothing),
+        ("--screen-reader", Nothing),
+        ("--yolo", Nothing),
+    ],
+    not_replayed: &[
+        "--delete-session",
+        "--list-extensions",
+        "--list-sessions",
+        "--prompt",
+        "--prompt-interactive",
+        "--resume",
+    ],
+};
 
 #[cfg(test)]
 mod tests {

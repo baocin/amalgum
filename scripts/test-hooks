@@ -2,11 +2,15 @@
 # Exercise the guardrail hook's block AND allow paths. Run by the gate when harness files change.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 1
-hook=.claude/hooks/guard-bash.sh
+hook="$(pwd)/.claude/hooks/guard-bash.sh"
 pass=0; failed=0
-expect() { # <block|allow> <command>
-  local want="$1" cmd="$2" got
-  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(printf '%s' "$cmd" | jq -Rs .)" | "$hook" 2>/dev/null
+expect() { # <block|allow> <command> [GUARD_BRANCH override; "-" = let the hook auto-detect]
+  local want="$1" cmd="$2" branch="${3-agent/test}" got
+  if [ "$branch" = "-" ]; then
+    printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(printf '%s' "$cmd" | jq -Rs .)" | "$hook" 2>/dev/null
+  else
+    printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(printf '%s' "$cmd" | jq -Rs .)" | GUARD_BRANCH="$branch" "$hook" 2>/dev/null
+  fi
   case $? in 2) got=block ;; 0) got=allow ;; *) got=error ;; esac
   if [ "$got" = "$want" ]; then pass=$((pass + 1)); else failed=$((failed + 1)); echo "✗ expected $want, got $got: $cmd"; fi
 }
@@ -19,9 +23,11 @@ expect block 'git push origin feature:refs/heads/master'
 expect block 'git push -u origin +main'
 expect block 'git push --force origin agent/x'
 expect block 'git push -f origin agent/x'
+expect block 'git push -fu origin agent/x'
 expect block 'git push origin +agent/x'
 expect block 'git push origin v1.2.0'
 expect block 'git push --tags'
+expect block 'git push --follow-tags'
 expect block 'git commit --no-verify -m wip'
 expect block 'git commit -am wip -n'
 expect block 'git -c core.hooksPath=/dev/null commit -m x'
@@ -34,6 +40,49 @@ expect block 'tmux -L amalgum kill-server'
 expect block 'echo {} > ~/.claude/settings.json'
 expect block 'cat ~/.ssh/id_ed25519'
 expect block 'security find-generic-password -s x'
+
+# Global options between `git` and the subcommand (agents type `git -C <abs path> …` because
+# cwd resets between Bash calls) must not let a push or commit slip past the checks below.
+expect block 'git -C /home/user/amalgum push origin main'
+expect block 'git -C /home/user/amalgum push --force origin agent/x'
+expect block 'git --no-pager push origin main'
+expect block 'git -c color.ui=always commit -n -m wip'
+expect allow 'git -C /home/user/amalgum push origin agent/x'
+
+# A quoted `-C` value is ordinary shell hygiene and must not make the value (and so the whole
+# rest of the checks below) disappear — quote-stripping the command before looking for it is
+# exactly what used to make it disappear.
+expect block 'git -C "/home/user/amalgum" push origin main'
+expect block "git -C '/home/user/amalgum' push origin main"
+expect block 'git -C "$repo" push origin main'
+expect block 'git -C "/home/user/amalgum" push --force origin agent/x'
+expect block 'git -C "/home/user/amalgum" push --tags'
+expect block 'git -C "/home/user/amalgum" commit -n -m wip'
+expect block 'git -P push origin main'
+
+# A push wrapped in an outer shell's own quoting must stay visible too — quote-stripping the
+# whole command before looking for "git … push" makes the entire statement disappear, not just
+# a value inside it.
+expect block "git commit -am \"it's done\" && git push origin main 2>&1 | grep -v 'remote:'"
+expect block "git commit -am \"it's done\" && git push origin 2>&1 | grep -v 'remote:'" main
+expect block 'git push origin "refs/tags/v1.2.0"'
+expect block "bash -c 'git push origin main && echo ok'"
+expect block 'sh -c "git push origin main --tags"'
+
+# A push split across lines with a `\` continuation must be scanned as one line.
+expect block $'git push \\\n  origin main'
+expect block $'git push \\\n  --force origin agent/x'
+expect block $'git push \\\n  --tags'
+
+# `-n` can be combined into any short-flag cluster, in any order, not just as its own token.
+expect block 'git commit -nm wip'
+expect block 'git commit -anm wip'
+expect block 'git commit -m wip -n; echo done'
+
+# On main/master, every push is blocked regardless of destination (finding: this must not
+# depend on which branch the *test runner's* checkout happens to be on).
+expect block 'git push origin agent/foo' main
+expect allow 'git push origin agent/foo' agent/other
 
 expect allow 'git push -u origin claude/bold-carson-is8dec'
 expect allow 'git push --force-with-lease origin agent/x'
@@ -49,8 +98,48 @@ expect allow 'cat src/main.rs'
 expect allow "$(printf 'cat > docs/x.md <<%sEOF%s\nRun amalgum hooks setup with git push origin main\nEOF\necho done' "'" "'")"
 expect block "$(printf 'cat > x <<EOF\nnotes\nEOF\ngit push origin main')"
 
+# The main/master and tag checks apply to the push segment only, not to the whole command —
+# a rebase target, an earlier diff argument, or a quoted commit message that mentions "main"
+# must not block a push to a feature branch.
+expect allow 'git fetch origin && git rebase origin/main && git push -u origin agent/foo'
+expect allow 'git diff --stat origin/main && git push origin agent/x'
+expect allow 'git commit -am "fix main loop" && git push origin agent/x'
+expect block 'git diff origin/main; git push origin main'
+
+# The commit -n rule must stay inside the commit segment: a later -n-shaped flag on a chained
+# or piped command (tail -n, head -n, sort -rn) is not "git commit -n".
+expect allow 'git add -A && git commit -m "wip" 2>&1 | tail -n 5'
+expect allow 'git commit -m "feat: x" && git log --oneline | head -n 3'
+expect allow 'git commit -m wip && sort -rn x'
+expect block 'git commit -m wip -n'
+expect block 'git commit -an -m wip'
+
+# `-C <dir>` must be honored when it is the harness's own auto-detected branch check (no
+# GUARD_BRANCH override), not just when a test forces the branch.
+tmp_repo="$(mktemp -d)"
+trap 'rm -rf "$tmp_repo"' EXIT
+git -C "$tmp_repo" init -q -b main
+git -C "$tmp_repo" config user.email test@example.com
+git -C "$tmp_repo" config user.name test
+git -C "$tmp_repo" -c commit.gpgsign=false commit -q --allow-empty -m init
+expect block "git -C $tmp_repo push origin agent/x" -
+git -C "$tmp_repo" switch -q -c agent/work
+expect allow "git -C $tmp_repo push origin agent/work" -
+
+# A `-C <dir>` this process cannot resolve (nonexistent path, unexpanded `$VAR`, …) must fall
+# back to the cwd branch check, not leave the branch empty and fail open — from a main checkout,
+# a bare push through a bogus -C must still be blocked.
+fallback_repo="$(mktemp -d)"
+trap 'rm -rf "$tmp_repo" "$fallback_repo"' EXIT
+git -C "$fallback_repo" init -q -b main
+git -C "$fallback_repo" config user.email test@example.com
+git -C "$fallback_repo" config user.name test
+git -C "$fallback_repo" -c commit.gpgsign=false commit -q --allow-empty -m init
+(cd "$fallback_repo" && printf '{"tool_name":"Bash","tool_input":{"command":"git -C /no/such/dir push origin agent/x"}}' | "$hook") >/dev/null 2>&1
+if [ $? = 2 ]; then pass=$((pass + 1)); else failed=$((failed + 1)); echo "✗ a -C this process cannot resolve must fall back to the cwd branch check"; fi
+
 # Unparseable payloads fail closed (raw scan still blocks).
-printf 'not json git push origin main' | "$hook" 2>/dev/null; [ $? = 2 ] && pass=$((pass + 1)) || { failed=$((failed + 1)); echo "✗ raw payload not blocked"; }
+printf 'not json git push origin main' | GUARD_BRANCH=agent/test "$hook" 2>/dev/null; [ $? = 2 ] && pass=$((pass + 1)) || { failed=$((failed + 1)); echo "✗ raw payload not blocked"; }
 
 echo "guardrail tests: $pass passed, $failed failed"
 [ "$failed" = 0 ]

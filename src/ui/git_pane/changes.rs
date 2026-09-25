@@ -332,15 +332,16 @@ impl GitPane {
         let git = self.git.clone();
         crate::ui::jobs::spawn(ctx, &self.tx, move || {
             let result = if is_untracked {
-                worker::diff_no_index(&git, &path).map(|o| diff::parse(&String::from_utf8_lossy(&o)))
+                worker::diff_no_index(&git, &path).map(|o| diff::parse(&o))
             } else {
-                let mut args = vec!["diff", "--no-color"];
+                let mut args = vec!["diff"];
+                args.extend_from_slice(diff::DIFF_ARGS);
                 if side == Side::Staged {
                     args.push("--cached");
                 }
                 args.push("--");
                 args.push(&path);
-                git.run(&args).map(|o| diff::parse(&String::from_utf8_lossy(&o)))
+                git.run(&args).map(|o| diff::parse(&o))
             };
             worker::Reply::ChangesDiff { req, result }
         });
@@ -360,7 +361,7 @@ impl GitPane {
         let git = self.git.clone();
         let req = self.next_req_id();
         crate::ui::jobs::spawn(ctx, &self.tx, move || {
-            let result = git.run_with_stdin(args, patch.as_bytes()).map(|_| ());
+            let result = git.run_with_stdin(args, &patch).map(|_| ());
             worker::Reply::ActionDone { req, result }
         });
     }
@@ -574,8 +575,8 @@ fn render_changes_diff_file(
         while i < hunk.lines.len() {
             match super::details::pair_for_word_diff(&hunk.lines, i) {
                 Some((d, a)) => {
-                    super::details::render_line(ui, colors, &hunk.lines[d], Some(&hunk.lines[a].text));
-                    super::details::render_line(ui, colors, &hunk.lines[a], Some(&hunk.lines[d].text));
+                    super::details::render_line(ui, colors, &hunk.lines[d], Some(&hunk.lines[a].display()));
+                    super::details::render_line(ui, colors, &hunk.lines[a], Some(&hunk.lines[d].display()));
                     i += 2;
                 }
                 None => {

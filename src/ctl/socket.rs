@@ -3,11 +3,12 @@
 //! The socket lives at `Dirs::socket()`, mode 0600 in a 0700 directory; filesystem permissions
 //! are the only auth. One app instance per user: binding over a socket that a live app answers
 //! fails with `ErrorKind::AddrInUse` (the caller then forwards its args and exits); a stale
-//! socket file with nobody listening is removed and re-bound.
+//! socket file with nobody listening is removed and re-bound. Launches take an advisory lock on
+//! `<socket>.lock` around that check-and-rebind, so racing launches cannot both win.
 
 use super::protocol::{Request, Response};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,6 +86,10 @@ where
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
 
+    // Launches serialize check-unlink-bind: otherwise two of them that both found the same
+    // stale file could each unlink it, the second removing the first's fresh socket, leaving
+    // two apps, one listening where nothing can reach it.
+    let launch_lock = lock_beside(path)?;
     if path.exists() {
         match UnixStream::connect(path) {
             // A live server answered: this is a real second instance, not a stale file.
@@ -95,7 +100,13 @@ where
                 ));
             }
             // Nobody home: leftover from a crash or unclean shutdown.
-            Err(_) => std::fs::remove_file(path)?,
+            Err(_) => {
+                if let Err(e) = std::fs::remove_file(path)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -103,6 +114,7 @@ where
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let meta = std::fs::metadata(path)?;
     let identity = (meta.dev(), meta.ino());
+    drop(launch_lock); // bound and listening: the next launch's connect now succeeds.
 
     let stop = Arc::new(AtomicBool::new(false));
     let handler: Arc<Handler> = Arc::new(handler);
@@ -110,6 +122,16 @@ where
     let join = thread::spawn(move || accept_loop(listener, &stop_bg, &handler));
 
     Ok(ServerHandle { path: path.to_path_buf(), stop, join: Some(join), identity })
+}
+
+/// An exclusive advisory lock on `<socket>.lock` (0600, created if needed, never removed so
+/// every launch locks the same inode), released when the returned file is dropped.
+fn lock_beside(socket: &Path) -> io::Result<std::fs::File> {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).mode(0o600).open(name)?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn accept_loop(listener: UnixListener, stop: &AtomicBool, handler: &Arc<Handler>) {
@@ -229,6 +251,42 @@ mod tests {
         let req = Request::new(Command::List);
         let resp = send(server.path(), &req, Duration::from_secs(2)).expect("send");
         assert!(resp.ok);
+    }
+
+    /// Launches racing over a socket left by a crash: exactly one may serve, and it must be the
+    /// one reachable at the path, not one listening on an inode another launch unlinked.
+    #[test]
+    fn racing_launches_over_a_stale_socket_leave_exactly_one_reachable_server() {
+        for _ in 0..100 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sock = dir.path().join("app.sock");
+            drop(UnixListener::bind(&sock).expect("bind")); // the file stays, nobody listens
+            let racers = 4;
+            let barrier = Arc::new(std::sync::Barrier::new(racers));
+            let results: Vec<io::Result<ServerHandle>> = (0..racers)
+                .map(|_| {
+                    let (sock, barrier) = (sock.clone(), Arc::clone(&barrier));
+                    thread::spawn(move || {
+                        barrier.wait();
+                        serve(&sock, |_| Response::ok())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("racer thread"))
+                .collect();
+
+            let outcome: Vec<Option<io::ErrorKind>> =
+                results.iter().map(|r| r.as_ref().err().map(io::Error::kind)).collect();
+            let winners = outcome.iter().filter(|k| k.is_none()).count();
+            let reachable = send(&sock, &Request::new(Command::List), Duration::from_secs(2)).is_ok();
+            let losers_saw_a_live_app = outcome.iter().flatten().all(|k| *k == io::ErrorKind::AddrInUse);
+            if winners != 1 || !reachable || !losers_saw_a_live_app {
+                // An orphaned server's `Drop` would wait forever on an accept() nobody can reach.
+                std::mem::forget(results);
+                panic!("racing launches: {outcome:?}, reachable at path: {reachable}");
+            }
+        }
     }
 
     #[test]

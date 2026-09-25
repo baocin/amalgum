@@ -1,9 +1,11 @@
-//! Running git. Local: `git -C <path> <args>`. Remote: `ssh -o ControlPath=<dir>/%C <host> --
-//! git -C <path> <args>` over the shared ControlMaster (§5.28), each argument shell-quoted with
-//! `ssh::quote` because ssh hands the remote shell one string.
+//! Running git. Local: `git -C <path> <args>`. Remote: `ssh -o ControlPath=… <host> -- env
+//! <K=V…> git -C <path> <args>` over the shared ControlMaster (§5.28), each argument
+//! shell-quoted with `ssh::quote` because ssh hands the remote shell one string.
 //!
-//! Every invocation sets `GIT_TERMINAL_PROMPT=0` (the app has no TTY), `LC_ALL=C` (stable
-//! messages), and `GIT_OPTIONAL_LOCKS=0` (status polling must not fight the user's git).
+//! Every invocation runs git with `GIT_TERMINAL_PROMPT=0` (the app has no TTY), `LC_ALL=C`
+//! (stable messages), and `GIT_OPTIONAL_LOCKS=0` (status polling must not fight the user's
+//! git). Locally they are set on the process; ssh forwards none of them, so remotely they are
+//! part of the command itself (`env K=V…` above).
 
 use std::fmt;
 use std::io::Write;
@@ -11,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::ssh::{self, Conn};
+
+/// The environment every git we run gets (see the module doc).
+const GIT_ENV: &[(&str, &str)] =
+    &[("GIT_TERMINAL_PROMPT", "0"), ("LC_ALL", "C"), ("GIT_OPTIONAL_LOCKS", "0")];
 
 /// Environment variables that redirect git to a different repository, index, or object store
 /// (`git rev-parse --local-env-vars`). Git exports several of them to hooks, so anything run
@@ -188,7 +194,10 @@ impl Git {
                 v
             }
             Location::Remote { host, path } => {
-                let mut remote_argv: Vec<String> = vec!["git".to_string(), "-C".to_string(), path.clone()];
+                // sshd does not pass our environment through: `env K=V … git …` on the host.
+                let mut remote_argv: Vec<String> = vec!["env".to_string()];
+                remote_argv.extend(GIT_ENV.iter().map(|(k, v)| format!("{k}={v}")));
+                remote_argv.extend(["git".to_string(), "-C".to_string(), path.clone()]);
                 remote_argv.extend(args.iter().map(|a| a.to_string()));
                 let remote_refs: Vec<&str> = remote_argv.iter().map(String::as_str).collect();
 
@@ -219,9 +228,7 @@ impl Git {
         for var in REPO_ENV_VARS {
             cmd.env_remove(var);
         }
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        cmd.env("LC_ALL", "C");
-        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        cmd.envs(GIT_ENV.iter().copied());
         cmd.stdin(Stdio::null());
         cmd
     }
@@ -377,7 +384,15 @@ mod tests {
             ssh_bin: "ssh".into(),
             control_dir: None,
         };
-        assert_eq!(git.argv(&["status"]), vec!["ssh", "gpu-box", "--", "git -C ~/g status"]);
+        assert_eq!(
+            git.argv(&["status"]),
+            vec![
+                "ssh",
+                "gpu-box",
+                "--",
+                "env GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_OPTIONAL_LOCKS=0 git -C ~/g status"
+            ]
+        );
     }
 
     #[test]
@@ -396,8 +411,51 @@ mod tests {
         assert_eq!(argv[4], "ControlMaster=no");
         assert_eq!(argv[5], "gpu-box");
         assert_eq!(argv[6], "--");
-        assert_eq!(argv[7], "git -C /srv/app log -1"); // portability: allow
+        assert_eq!(argv[7], "env GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_OPTIONAL_LOCKS=0 git -C /srv/app log -1"); // portability: allow
         assert_eq!(argv.len(), 8);
+    }
+
+    /// A remote host for [`Git::argv`]'s `<ssh_bin> <host> -- <command>` with `ssh_bin = "sh"`
+    /// and the returned script as `<host>`: it runs `<command>` in a fresh environment, as sshd
+    /// does (it forwards none of our variables by default). `sh` only reads the script, so it is
+    /// never exec'd right after being written (ETXTBSY while other test threads fork).
+    fn fake_host(dir: &Path) -> String {
+        let path = dir.join("fake-host.sh");
+        let script = format!(
+            "while [ \"$1\" != -- ]; do shift; done\n\
+             exec env -i PATH=\"$PATH\" HOME={} GIT_CONFIG_NOSYSTEM=1 sh -c \"$2\"\n",
+            ssh::quote(&dir.display().to_string())
+        );
+        std::fs::write(&path, script).expect("write fake host");
+        path.display().to_string()
+    }
+
+    /// The environment the module doc promises must reach the *remote* git, not just the local
+    /// ssh process. Observed through its effect: without `GIT_OPTIONAL_LOCKS=0`, `status` on a
+    /// stat-dirty index takes index.lock and rewrites the index, colliding with agents' git.
+    #[test]
+    fn remote_git_runs_with_the_same_environment_as_local_git() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("a.txt", "hello\n", "first");
+        let file = std::fs::File::options().write(true).open(repo.path().join("a.txt")).expect("open");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        file.set_modified(an_hour_ago).expect("touch a.txt: same content, stale index stat");
+        let index = repo.path().join(".git").join("index");
+        let before = std::fs::read(&index).expect("read index");
+
+        let host_dir = tempfile::tempdir().expect("tempdir");
+        let git = Git {
+            location: Location::Remote {
+                host: fake_host(host_dir.path()),
+                path: repo.path().display().to_string(),
+            },
+            git_bin: "git".into(),
+            ssh_bin: "sh".into(),
+            control_dir: None,
+        };
+        let out = git.run(&["status", "--porcelain=v2"]).expect("remote status");
+        assert!(out.is_empty(), "clean tree: {:?}", String::from_utf8_lossy(&out));
+        assert!(std::fs::read(&index).expect("read index") == before, "remote status rewrote the index");
     }
 
     // --- Git::command ----------------------------------------------------------------------

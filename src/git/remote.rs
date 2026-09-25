@@ -188,11 +188,14 @@ pub fn permalink(url: &str, hash: &str, path: &str, line: Option<u32>) -> Option
 }
 
 /// Percent-encodes the unsafe characters that would otherwise break a permalink URL (space,
-/// `#`, `?`), leaving `/` and everything else, including non-ASCII path characters, untouched.
+/// `#`, `?`, and a literal `%` itself — left alone, an existing `%XX`-looking sequence would be
+/// decoded again by the server), leaving `/` and everything else, including non-ASCII path
+/// characters, untouched.
 fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for ch in path.chars() {
         match ch {
+            '%' => out.push_str("%25"),
             ' ' => out.push_str("%20"),
             '#' => out.push_str("%23"),
             '?' => out.push_str("%3F"),
@@ -404,6 +407,22 @@ mod tests {
         assert_eq!(
             permalink(url, "ab12cd3", "a dir/file #1?.rs", None).as_deref(),
             Some("https://github.com/acme/conduit/blob/ab12cd3/a%20dir/file%20%231%3F.rs")
+        );
+    }
+
+    #[test]
+    fn permalink_percent_encodes_a_literal_percent_sign() {
+        // Regression: an un-encoded '%' makes the next two characters look like an escape to
+        // the server (`%.m` is invalid; `%20` would be decoded back to a space, opening the
+        // wrong file).
+        let url = "git@github.com:acme/conduit.git";
+        assert_eq!(
+            permalink(url, "ab12cd3", "docs/100%.md", None).as_deref(),
+            Some("https://github.com/acme/conduit/blob/ab12cd3/docs/100%25.md")
+        );
+        assert_eq!(
+            permalink(url, "ab12cd3", "a%20b.md", None).as_deref(),
+            Some("https://github.com/acme/conduit/blob/ab12cd3/a%2520b.md")
         );
     }
 

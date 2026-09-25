@@ -180,31 +180,42 @@ impl Query {
         true
     }
 
-    /// Equivalent `git log` filters for remote workspaces (no local index): `--author`,
-    /// `--grep` (with `--regexp-ignore-case --all-match`), `--before/--after`, `-- <paths>`.
-    /// Filters git cannot express (hash/branch/tag) are left for [`Query::matches`].
+    /// `git log` filters for remote workspaces (no local index) that git can express *exactly*:
+    /// `--author`, `--grep` for `msg:` terms (both `--fixed-strings --regexp-ignore-case`, so
+    /// they match the same way [`contains_ci`] does locally), `--before/--after` as explicit
+    /// UTC instants, `-- <paths>`. Plain words are deliberately left out: they also match
+    /// hash/branch/tag names and changed file paths (§5.8), which `--grep` cannot see, so —
+    /// like hash/branch/tag filters — they are left entirely to [`Query::matches`] on whatever
+    /// commits this fetches.
     pub fn git_log_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+
+        if !self.author.is_empty() || !self.msg.is_empty() {
+            args.push("--fixed-strings".to_string());
+        }
+        if !self.msg.is_empty() {
+            args.push("--regexp-ignore-case".to_string());
+        }
         for a in &self.author {
             args.push(format!("--author={a}"));
         }
-
-        let grep_terms: Vec<&str> = self.words.iter().chain(&self.msg).map(String::as_str).collect();
-        if !grep_terms.is_empty() {
-            args.push("--regexp-ignore-case".to_string());
-            if grep_terms.len() > 1 {
+        if !self.msg.is_empty() {
+            if self.msg.len() > 1 {
                 args.push("--all-match".to_string());
             }
-            for term in grep_terms {
+            for term in &self.msg {
                 args.push(format!("--grep={term}"));
             }
         }
 
+        // Explicit UTC midnight instants: a bare `YYYY-MM-DD` is filled in by git with the
+        // *current* time of day, not midnight, which can wrongly exclude or include commits
+        // made earlier that same day depending on when the query happens to run.
         if let Some(before) = self.before {
-            args.push(format!("--before={}", format_ymd(before)));
+            args.push(format!("--before={} 00:00:00 +0000", format_ymd(before)));
         }
         if let Some(after) = self.after {
-            args.push(format!("--after={}", format_ymd(after)));
+            args.push(format!("--after={} 00:00:00 +0000", format_ymd(after)));
         }
 
         if !self.path.is_empty() {
@@ -241,6 +252,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempRepo;
 
     #[test]
     fn parse_plain_words_and_phrase() {
@@ -387,28 +399,40 @@ mod tests {
     #[test]
     fn git_log_args_basic() {
         let q = Query::parse("author:mp path:src/auth");
-        assert_eq!(q.git_log_args(), vec!["--author=mp", "--", "src/auth"]);
+        assert_eq!(q.git_log_args(), vec!["--fixed-strings", "--author=mp", "--", "src/auth"]);
     }
 
     #[test]
-    fn git_log_args_grep_words_and_msg() {
-        let q = Query::parse(r#"fix msg:"login bug""#);
+    fn git_log_args_plain_words_are_not_sent_to_git() {
+        // Regression: plain words also match hash/branch/tag/path, which `--grep` cannot see,
+        // so sending them as `--grep` used to make git drop commits that only matched one of
+        // those other fields. They are left entirely to `Query::matches` now.
+        let q = Query::parse("fix login");
+        assert!(q.git_log_args().is_empty());
+    }
+
+    #[test]
+    fn git_log_args_msg_uses_fixed_strings_and_ignore_case() {
+        let q = Query::parse(r#"msg:"login bug""#);
+        assert_eq!(q.git_log_args(), vec!["--fixed-strings", "--regexp-ignore-case", "--grep=login bug"]);
+    }
+
+    #[test]
+    fn git_log_args_multiple_msg_terms_use_all_match() {
+        let q = Query::parse(r#"msg:fix msg:"login bug""#);
         assert_eq!(
             q.git_log_args(),
-            vec!["--regexp-ignore-case", "--all-match", "--grep=fix", "--grep=login bug"]
+            vec!["--fixed-strings", "--regexp-ignore-case", "--all-match", "--grep=fix", "--grep=login bug"]
         );
-    }
-
-    #[test]
-    fn git_log_args_single_grep_has_no_all_match() {
-        let q = Query::parse("fix");
-        assert_eq!(q.git_log_args(), vec!["--regexp-ignore-case", "--grep=fix"]);
     }
 
     #[test]
     fn git_log_args_dates_and_paths_last() {
         let q = Query::parse("before:2024-06-01 after:2024-01-15 path:src");
-        assert_eq!(q.git_log_args(), vec!["--before=2024-06-01", "--after=2024-01-15", "--", "src"]);
+        assert_eq!(
+            q.git_log_args(),
+            vec!["--before=2024-06-01 00:00:00 +0000", "--after=2024-01-15 00:00:00 +0000", "--", "src"]
+        );
     }
 
     #[test]
@@ -416,6 +440,72 @@ mod tests {
         // These filters cannot be expressed by `git log`; left entirely to `Query::matches`.
         let q = Query::parse("hash:ab12 branch:feat tag:v1");
         assert!(q.git_log_args().is_empty());
+    }
+
+    #[test]
+    fn git_log_args_msg_filter_is_literal_against_real_git() {
+        // Regression: an un-escaped `--grep` treats the query as a regex, so `[WIP]` matches
+        // any commit whose message contains W, I, or P (case-insensitively), not the literal
+        // bracketed text.
+        let mut repo = TempRepo::new();
+        repo.commit_file("a.txt", "a", "unrelated commit"); // contains 'i' -> would match [WIP]
+        let wip = repo.commit_file("b.txt", "b", "[WIP] fix login");
+
+        let q = Query::parse(r#"msg:"[WIP]""#);
+        let mut cmd: Vec<&str> = vec!["log", "-z", "--format=%H"];
+        let filter_args = q.git_log_args();
+        cmd.extend(filter_args.iter().map(String::as_str));
+
+        let out = repo.git_raw(&cmd);
+        let ids: Vec<&str> = out
+            .split(|&b| b == 0)
+            .filter(|r| !r.is_empty())
+            .map(|r| std::str::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![wip.as_str()],
+            "the literal '[WIP]' must match only the bracketed commit, not everything with a W, I or P"
+        );
+    }
+
+    #[test]
+    fn git_log_args_date_bounds_use_explicit_utc_instants_against_real_git() {
+        // Regression: a bare `--after=2024-06-01`/`--before=2024-06-01` is filled in by git
+        // with the current wall-clock time of day, not midnight, so whether an early-morning
+        // commit is included used to depend on what time the query happened to run.
+        let repo = TempRepo::new();
+        repo.write("a.txt", "x");
+        repo.git(&["add", "-A"]);
+        let commit_out = crate::testutil::hermetic_git(repo.path())
+            .env("GIT_AUTHOR_DATE", "2024-06-01T01:00:00+00:00")
+            .env("GIT_COMMITTER_DATE", "2024-06-01T01:00:00+00:00")
+            .args(["commit", "-q", "-m", "early commit"])
+            .output()
+            .expect("spawn git");
+        assert!(commit_out.status.success());
+        let hash = repo.git(&["rev-parse", "HEAD"]);
+
+        // `after:2024-06-01` (an inclusive lower bound at UTC midnight) must include a commit
+        // from 01:00 UTC that day, no matter what time of day this test happens to run.
+        let after_args = Query::parse("after:2024-06-01").git_log_args();
+        let mut cmd: Vec<&str> = vec!["log", "-z", "--format=%H"];
+        cmd.extend(after_args.iter().map(String::as_str));
+        let out = repo.git_raw(&cmd);
+        let ids: Vec<&str> = out
+            .split(|&b| b == 0)
+            .filter(|r| !r.is_empty())
+            .map(|r| std::str::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(ids, vec![hash.as_str()]);
+
+        // `before:2024-06-01` is an exclusive bound at UTC midnight, so the same commit must be
+        // excluded.
+        let before_args = Query::parse("before:2024-06-01").git_log_args();
+        let mut cmd: Vec<&str> = vec!["log", "-z", "--format=%H"];
+        cmd.extend(before_args.iter().map(String::as_str));
+        let out = repo.git_raw(&cmd);
+        assert!(out.split(|&b| b == 0).all(|r| r.is_empty()));
     }
 
     #[test]

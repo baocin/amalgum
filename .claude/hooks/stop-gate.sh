@@ -4,7 +4,8 @@
 #   2. same code as the last green run (HEAD + working-tree content hash) → allow
 #   3. already blocked once on exactly this state and nothing changed → allow, to avoid a
 #      loop the agent cannot break; the red gate is still reported to the human
-# Otherwise run scripts/agent/verify (itself scoped: docs-only changes cost nothing) and block
+# Otherwise run scripts/agent/verify (itself scoped to what changed — most docs-only changes
+# cost nothing, but docs/SPEC.md is a product contract and runs the full cargo legs) and block
 # with the last 20 lines of its output, so the agent gets the error, not just the fact.
 set -uo pipefail
 input="$(cat)"
@@ -13,7 +14,13 @@ cd "$root" || exit 0
 command -v cargo >/dev/null 2>&1 || exit 0
 
 state="$( { git rev-parse HEAD 2>/dev/null; git diff HEAD --binary 2>/dev/null
-            git ls-files -o --exclude-standard -z | xargs -0 cat 2>/dev/null; } | cksum | cut -d' ' -f1)"
+            # Print each untracked file's path before its bytes, so renaming or moving one
+            # (same content, e.g. between src/ and docs/) changes the state instead of hashing
+            # identically to before.
+            git ls-files -o --exclude-standard -z | while IFS= read -r -d '' f; do
+              printf '%s\n' "$f"
+              cat "$f" 2>/dev/null
+            done; } | cksum | cut -d' ' -f1)"
 stamp=".claude/.gate-stamp"
 [ -f "$stamp" ] && [ "$(sed -n 1p "$stamp")" = "green $state" ] && exit 0
 if printf '%s' "$input" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true' \

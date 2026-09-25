@@ -3,9 +3,11 @@
 //! shown greyed as "Cannot be undone from the client"). Stored per repo as JSON, capped at
 //! [`CAP`] entries (oldest dropped), surviving restarts.
 //!
-//! Guard: undo runs only if the refs the entry touched still equal its `after` snapshot (and
-//! redo only if they equal `before`); otherwise the repo moved underneath us (a terminal or an
+//! Guard: undo runs only if the repo still matches the entry's `after` snapshot — HEAD, the
+//! branch HEAD is on, the refs the entry touched, and the stash list if it recorded one — (and
+//! redo only if it matches `before`); otherwise the repo moved underneath us (a terminal or an
 //! agent ran git) and the caller shows "Can't undo: `main` has moved since. Open reflog?".
+//! An entry is marked undone (or redone) only once its plan has run successfully.
 //! Recording a new operation discards any undone entries (the redo tail).
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,8 @@ pub struct Snapshot {
     pub branch: Option<String>,
     /// Full ref name → hash, only for refs the operation touched.
     pub refs: BTreeMap<String, String>,
+    /// Stash commit hashes, newest (`stash@{0}`) first; empty when the operation doesn't depend
+    /// on the stash list, and then the guard ignores it.
     pub stashes: Vec<String>,
 }
 
@@ -46,8 +50,26 @@ pub enum Refused {
     NothingToDo,
     /// The entry cannot be undone (push).
     Irreversible(String),
-    /// Named ref (or `HEAD`) no longer matches the journal.
+    /// Named ref no longer matches the journal: a touched ref, `HEAD` (its commit or branch), or
+    /// `refs/stash` (the stash list).
     Moved(String),
+}
+
+/// Why [`Journal::undo`] or [`Journal::redo`] did not complete. Either way the entry keeps its
+/// undone state, so the same action can be retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failed<E> {
+    /// Refused before anything ran.
+    Refused(Refused),
+    /// A command of the plan failed. A multi-command plan may have stopped part-way, in which
+    /// case the guard refuses the next attempt.
+    Run(E),
+}
+
+impl<E> From<Refused> for Failed<E> {
+    fn from(refused: Refused) -> Self {
+        Failed::Refused(refused)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -99,7 +121,10 @@ impl Journal {
         }
         Some(start)
     }
-    /// Check the guard against `current` and return the inverse plan; marks it undone.
+    /// `Mod+Z`: check the guard against `current`, hand the inverse plan of the entry
+    /// [`Journal::peek_undo`] names to `run`, and mark that entry undone only if `run` succeeds.
+    /// A failed command (an agent holding a lock, say) leaves the journal as it was, so the
+    /// undo can be retried.
     ///
     /// The spec (§5.18) says undo runs "if `before` still matches", but that reads as shorthand
     /// for "the repo is still in the state the operation produced": undo replays the *inverse* of
@@ -108,28 +133,38 @@ impl Journal {
     /// `before` would let undo fire even after unrelated commits landed on top, silently
     /// discarding them. Redo is symmetrical against `before`, since it is only safe to replay the
     /// forward command from the exact state that preceded it.
-    pub fn undo(&mut self, current: &Snapshot) -> Result<Plan, Refused> {
+    pub fn undo<E>(
+        &mut self,
+        current: &Snapshot,
+        run: impl FnOnce(&Plan) -> Result<(), E>,
+    ) -> Result<(), Failed<E>> {
         let idx = self.entries.iter().rposition(|e| !e.undone).ok_or(Refused::NothingToDo)?;
         let entry = &self.entries[idx];
         let Some(inverse) = &entry.inverse else {
-            return Err(Refused::Irreversible(entry.description.clone()));
+            return Err(Refused::Irreversible(entry.description.clone()).into());
         };
         if let Some(name) = mismatch(&entry.after, current) {
-            return Err(Refused::Moved(name));
+            return Err(Refused::Moved(name).into());
         }
-        let inverse = inverse.clone();
+        run(inverse).map_err(Failed::Run)?;
         self.entries[idx].undone = true;
-        Ok(inverse)
+        Ok(())
     }
-    pub fn redo(&mut self, current: &Snapshot) -> Result<Plan, Refused> {
+    /// `Mod+Shift+Z`: like [`Journal::undo`], for the entry [`Journal::peek_redo`] names, guarded
+    /// against its `before` snapshot and running its forward plan.
+    pub fn redo<E>(
+        &mut self,
+        current: &Snapshot,
+        run: impl FnOnce(&Plan) -> Result<(), E>,
+    ) -> Result<(), Failed<E>> {
         let idx = self.redo_run_start().ok_or(Refused::NothingToDo)?;
         let entry = &self.entries[idx];
         if let Some(name) = mismatch(&entry.before, current) {
-            return Err(Refused::Moved(name));
+            return Err(Refused::Moved(name).into());
         }
-        let forward = entry.forward.clone();
+        run(&entry.forward).map_err(Failed::Run)?;
         self.entries[idx].undone = false;
-        Ok(forward)
+        Ok(())
     }
     /// Newest first, for the Undo panel.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
@@ -159,18 +194,22 @@ impl Journal {
 }
 
 /// The first ref name in `snapshot.refs` whose value `current` disagrees with (a ref missing
-/// from `current` counts as a mismatch), else `"HEAD"` if `snapshot.head` is set and disagrees,
-/// else `None`.
+/// from `current` counts as a mismatch), else `"HEAD"` if `snapshot.head` is set and disagrees
+/// or HEAD is on a different branch (or detached vs. on one) than `snapshot.branch` — inverses
+/// like `reset --soft` move whichever branch HEAD is on — else `"refs/stash"` if `snapshot`
+/// recorded a stash list and `current`'s differs, else `None`.
 fn mismatch(snapshot: &Snapshot, current: &Snapshot) -> Option<String> {
     for (name, hash) in &snapshot.refs {
         if current.refs.get(name) != Some(hash) {
             return Some(name.clone());
         }
     }
-    if let Some(head) = &snapshot.head
-        && current.head.as_ref() != Some(head)
-    {
+    let head_moved = snapshot.head.as_ref().is_some_and(|head| current.head.as_ref() != Some(head));
+    if head_moved || snapshot.branch != current.branch {
         return Some("HEAD".to_string());
+    }
+    if !snapshot.stashes.is_empty() && snapshot.stashes != current.stashes {
+        return Some("refs/stash".to_string());
     }
     None
 }
@@ -178,6 +217,7 @@ fn mismatch(snapshot: &Snapshot, current: &Snapshot) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
 
     /// A snapshot with `HEAD` and `refs/heads/main` both at `hash`.
     fn snap(hash: &str) -> Snapshot {
@@ -217,6 +257,69 @@ mod tests {
         }
     }
 
+    /// Undo with a runner that always succeeds; returns the plan it was handed.
+    fn undo_ok(j: &mut Journal, current: &Snapshot) -> Result<Plan, Refused> {
+        let mut ran = Plan::new();
+        match j.undo(current, |plan| -> Result<(), Infallible> {
+            ran = plan.clone();
+            Ok(())
+        }) {
+            Ok(()) => Ok(ran),
+            Err(Failed::Refused(refused)) => Err(refused),
+            Err(Failed::Run(never)) => match never {},
+        }
+    }
+
+    /// Redo with a runner that always succeeds; returns the plan it was handed.
+    fn redo_ok(j: &mut Journal, current: &Snapshot) -> Result<Plan, Refused> {
+        let mut ran = Plan::new();
+        match j.redo(current, |plan| -> Result<(), Infallible> {
+            ran = plan.clone();
+            Ok(())
+        }) {
+            Ok(()) => Ok(ran),
+            Err(Failed::Refused(refused)) => Err(refused),
+            Err(Failed::Run(never)) => match never {},
+        }
+    }
+
+    /// Runs `plan` in `repo`, stopping at the first failing command and returning its stderr.
+    fn run_in(repo: &crate::testutil::TempRepo, plan: &Plan) -> Result<(), String> {
+        for cmd in plan {
+            let out = crate::testutil::hermetic_git(repo.path()).args(cmd).output().expect("spawn git");
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_undo_leaves_the_entry_to_undo_again() {
+        let mut j = Journal::default();
+        j.record(entry("commit a", "h0", "h1"));
+
+        assert_eq!(j.undo(&snap("h1"), |_| Err("index.lock exists")), Err(Failed::Run("index.lock exists")));
+        assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("commit a"));
+        assert_eq!(j.peek_redo(), None, "nothing was undone, so nothing to redo");
+
+        // The repo is still in `after`, so the retry passes the guard.
+        assert!(undo_ok(&mut j, &snap("h1")).is_ok());
+    }
+
+    #[test]
+    fn failed_redo_leaves_the_entry_to_redo_again() {
+        let mut j = Journal::default();
+        j.record(entry("commit a", "h0", "h1"));
+        undo_ok(&mut j, &snap("h1")).expect("undo succeeds");
+
+        assert_eq!(j.redo(&snap("h0"), |_| Err("index.lock exists")), Err(Failed::Run("index.lock exists")));
+        assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit a"));
+        assert_eq!(j.peek_undo(), None);
+
+        assert!(redo_ok(&mut j, &snap("h0")).is_ok());
+    }
+
     #[test]
     fn record_assigns_increasing_ids_and_clears_undone() {
         let mut j = Journal::default();
@@ -233,12 +336,12 @@ mod tests {
         let mut j = Journal::default();
         j.record(entry("commit a", "h0", "h1"));
 
-        let inverse = j.undo(&snap("h1")).expect("undo succeeds against `after`");
+        let inverse = undo_ok(&mut j, &snap("h1")).expect("undo succeeds against `after`");
         assert_eq!(inverse, vec![vec!["reset".to_string(), "--soft".to_string(), "h0".to_string()]]);
         assert_eq!(j.peek_undo(), None, "nothing left to undo");
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit a"));
 
-        let forward = j.redo(&snap("h0")).expect("redo succeeds against `before`");
+        let forward = redo_ok(&mut j, &snap("h0")).expect("redo succeeds against `before`");
         assert_eq!(forward, vec![vec!["commit".to_string()]]);
         assert_eq!(j.peek_redo(), None, "nothing left to redo");
         assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("commit a"));
@@ -247,8 +350,8 @@ mod tests {
     #[test]
     fn undo_and_redo_on_empty_journal_are_nothing_to_do() {
         let mut j = Journal::default();
-        assert_eq!(j.undo(&snap("h0")), Err(Refused::NothingToDo));
-        assert_eq!(j.redo(&snap("h0")), Err(Refused::NothingToDo));
+        assert_eq!(undo_ok(&mut j, &snap("h0")), Err(Refused::NothingToDo));
+        assert_eq!(redo_ok(&mut j, &snap("h0")), Err(Refused::NothingToDo));
     }
 
     #[test]
@@ -260,16 +363,16 @@ mod tests {
         j.record(entry("E3", "h2", "h3"));
         j.record(entry("E4", "h3", "h4"));
 
-        j.undo(&snap("h4")).expect("undo E4");
+        undo_ok(&mut j, &snap("h4")).expect("undo E4");
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("E4"));
 
-        j.undo(&snap("h3")).expect("undo E3");
+        undo_ok(&mut j, &snap("h3")).expect("undo E3");
         // Trailing undone run is now [E3, E4]; the oldest of that run (E3) is the one most
         // recently undone, and thus what Mod+Shift+Z brings back first.
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("E3"));
         assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("E2"));
 
-        j.redo(&snap("h2")).expect("redo E3");
+        redo_ok(&mut j, &snap("h2")).expect("redo E3");
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("E4"));
     }
 
@@ -277,7 +380,7 @@ mod tests {
     fn record_discards_the_redo_tail() {
         let mut j = Journal::default();
         j.record(entry("E1", "h0", "h1"));
-        j.undo(&snap("h1")).expect("undo E1");
+        undo_ok(&mut j, &snap("h1")).expect("undo E1");
         assert!(j.peek_redo().is_some());
 
         j.record(entry("E2", "h0", "h2"));
@@ -305,7 +408,7 @@ mod tests {
 
         let mut current = snap("h1");
         current.refs.remove("refs/heads/main");
-        assert_eq!(j.undo(&current), Err(Refused::Moved("refs/heads/main".to_string())));
+        assert_eq!(undo_ok(&mut j, &current), Err(Refused::Moved("refs/heads/main".to_string())));
     }
 
     #[test]
@@ -314,7 +417,7 @@ mod tests {
         j.record(entry("commit a", "h0", "h1"));
 
         let current = snap("other-hash");
-        assert_eq!(j.undo(&current), Err(Refused::Moved("refs/heads/main".to_string())));
+        assert_eq!(undo_ok(&mut j, &current), Err(Refused::Moved("refs/heads/main".to_string())));
     }
 
     #[test]
@@ -326,17 +429,70 @@ mod tests {
         current.head = Some("h1-detached".to_string());
         e.after.refs = current.refs.clone();
         j.record(e);
-        assert_eq!(j.undo(&current), Err(Refused::Moved("HEAD".to_string())));
+        assert_eq!(undo_ok(&mut j, &current), Err(Refused::Moved("HEAD".to_string())));
+    }
+
+    #[test]
+    fn undo_guard_rejects_another_branch_or_detached_head_at_the_same_commit() {
+        // `reset --soft h0` moves whatever branch HEAD is on, so the same hash on another
+        // branch (or detached) is not the state the entry produced.
+        let mut j = Journal::default();
+        j.record(entry("commit a", "h0", "h1"));
+
+        let mut on_wip = snap("h1");
+        on_wip.branch = Some("wip".to_string());
+        assert_eq!(undo_ok(&mut j, &on_wip), Err(Refused::Moved("HEAD".to_string())));
+
+        let mut detached = snap("h1");
+        detached.branch = None;
+        assert_eq!(undo_ok(&mut j, &detached), Err(Refused::Moved("HEAD".to_string())));
+    }
+
+    #[test]
+    fn redo_guard_rejects_another_branch_at_the_same_commit() {
+        let mut j = Journal::default();
+        j.record(entry("commit a", "h0", "h1"));
+        undo_ok(&mut j, &snap("h1")).expect("undo succeeds");
+
+        let mut on_wip = snap("h0");
+        on_wip.branch = Some("wip".to_string());
+        assert_eq!(redo_ok(&mut j, &on_wip), Err(Refused::Moved("HEAD".to_string())));
+    }
+
+    #[test]
+    fn undo_guard_compares_the_stash_list_when_the_entry_recorded_one() {
+        let mut j = Journal::default();
+        let mut e = entry("stash push", "h1", "h1");
+        e.after.stashes = vec!["s1".to_string()];
+        e.inverse = Some(vec![vec!["stash".to_string(), "pop".to_string()]]);
+        j.record(e);
+
+        // A stash pushed from a terminal since: `stash pop` would pop that one instead.
+        let mut current = snap("h1");
+        current.stashes = vec!["s2".to_string(), "s1".to_string()];
+        assert_eq!(undo_ok(&mut j, &current), Err(Refused::Moved("refs/stash".to_string())));
+
+        current.stashes = vec!["s1".to_string()];
+        assert!(undo_ok(&mut j, &current).is_ok());
+    }
+
+    #[test]
+    fn guard_ignores_the_stash_list_when_the_entry_recorded_none() {
+        let mut j = Journal::default();
+        j.record(entry("commit a", "h0", "h1"));
+        let mut current = snap("h1");
+        current.stashes = vec!["s1".to_string()];
+        assert!(undo_ok(&mut j, &current).is_ok());
     }
 
     #[test]
     fn redo_guard_symmetrical_against_before() {
         let mut j = Journal::default();
         j.record(entry("commit a", "h0", "h1"));
-        j.undo(&snap("h1")).expect("undo succeeds");
+        undo_ok(&mut j, &snap("h1")).expect("undo succeeds");
 
         // Something else moved main to h9 in between undo and redo.
-        assert_eq!(j.redo(&snap("h9")), Err(Refused::Moved("refs/heads/main".to_string())));
+        assert_eq!(redo_ok(&mut j, &snap("h9")), Err(Refused::Moved("refs/heads/main".to_string())));
         // The entry stays undone: redo did not fire.
         assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit a"));
     }
@@ -346,7 +502,7 @@ mod tests {
         let mut j = Journal::default();
         j.record(push_entry("h0", "h1"));
 
-        assert_eq!(j.undo(&snap("h1")), Err(Refused::Irreversible("push origin main".to_string())));
+        assert_eq!(undo_ok(&mut j, &snap("h1")), Err(Refused::Irreversible("push origin main".to_string())));
         // Not marked undone, so it is still what Mod+Z would report, and it can never reach the
         // redo tail (redo of an undone push can't happen: push is never marked undone).
         assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("push origin main"));
@@ -358,7 +514,10 @@ mod tests {
         // Even when the guard would also fail, an irreversible entry reports Irreversible.
         let mut j = Journal::default();
         j.record(push_entry("h0", "h1"));
-        assert_eq!(j.undo(&snap("moved")), Err(Refused::Irreversible("push origin main".to_string())));
+        assert_eq!(
+            undo_ok(&mut j, &snap("moved")),
+            Err(Refused::Irreversible("push origin main".to_string()))
+        );
     }
 
     #[test]
@@ -376,7 +535,7 @@ mod tests {
 
         let mut j = Journal::default();
         j.record(entry("commit a", "h0", "h1"));
-        j.undo(&snap("h1")).expect("undo succeeds");
+        undo_ok(&mut j, &snap("h1")).expect("undo succeeds");
         j.save(&path).expect("save");
 
         // The atomic-rename temp file is not left behind.
@@ -415,12 +574,8 @@ mod tests {
         });
 
         // The UI's current snapshot matches `after`: undo is allowed.
-        let plan = j.undo(&snap(&h1)).expect("undo succeeds against the real post-commit state");
-        for cmd in &plan {
-            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            let status = crate::testutil::hermetic_git(repo.path()).args(&args).status().expect("spawn git");
-            assert!(status.success(), "inverse plan {cmd:?} failed");
-        }
+        j.undo(&snap(&h1), |plan| run_in(&repo, plan))
+            .expect("undo succeeds against the real post-commit state");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]), h0, "HEAD moved back to the pre-commit hash");
 
         // A terminal or agent now commits without going through the journal.
@@ -433,7 +588,7 @@ mod tests {
         };
 
         // Redo of the entry we just undid: `before` no longer matches the real repo.
-        assert_eq!(j.redo(&real_current), Err(Refused::Moved("refs/heads/main".to_string())));
+        assert_eq!(redo_ok(&mut j, &real_current), Err(Refused::Moved("refs/heads/main".to_string())));
 
         // A second, not-yet-undone entry whose `after` was invalidated by the same out-of-band
         // commit: undo refuses too, rather than resetting past work it never journaled.
@@ -448,6 +603,66 @@ mod tests {
             inverse: Some(vec![vec!["reset".to_string(), "--soft".to_string(), h0.clone()]]),
             undone: false,
         });
-        assert_eq!(j2.undo(&real_current), Err(Refused::Moved("refs/heads/main".to_string())));
+        assert_eq!(undo_ok(&mut j2, &real_current), Err(Refused::Moved("refs/heads/main".to_string())));
+    }
+
+    /// The repo's HEAD, current branch, and `refs/heads/main`, read from real git the way the UI
+    /// builds its guard snapshot.
+    fn real_snapshot(repo: &crate::testutil::TempRepo) -> Snapshot {
+        let branch = crate::testutil::hermetic_git(repo.path())
+            .args(["symbolic-ref", "--short", "-q", "HEAD"])
+            .output()
+            .expect("spawn git");
+        let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        Snapshot {
+            head: Some(repo.git(&["rev-parse", "HEAD"])),
+            branch: (!branch.is_empty()).then_some(branch),
+            refs: BTreeMap::from([(
+                "refs/heads/main".to_string(),
+                repo.git(&["rev-parse", "refs/heads/main"]),
+            )]),
+            stashes: vec![],
+        }
+    }
+
+    /// An agent creates a branch at the commit the app just made. HEAD and `main` still hold
+    /// the entry's hashes, but its `reset --soft` inverse would now move `wip`, not `main`.
+    #[test]
+    fn integration_undo_refuses_once_head_is_on_another_branch_at_the_same_commit() {
+        let mut repo = crate::testutil::TempRepo::new();
+        let h0 = repo.commit("first");
+        let h1 = repo.commit("second");
+        let mut j = Journal::default();
+        j.record(entry("commit second", &h0, &h1));
+        assert_eq!(real_snapshot(&repo), snap(&h1), "the entry's `after` is the real state");
+
+        repo.git(&["switch", "-q", "-c", "wip"]);
+        assert_eq!(undo_ok(&mut j, &real_snapshot(&repo)), Err(Refused::Moved("HEAD".to_string())));
+
+        repo.git(&["switch", "-q", "--detach"]);
+        assert_eq!(undo_ok(&mut j, &real_snapshot(&repo)), Err(Refused::Moved("HEAD".to_string())));
+    }
+
+    /// Another git process holds `main`'s lock when `Mod+Z` runs `reset --soft`: the command
+    /// fails, the entry stays undoable, and the retry works once the lock is gone.
+    #[test]
+    fn integration_failed_undo_can_be_retried_once_the_lock_is_released() {
+        let mut repo = crate::testutil::TempRepo::new();
+        let h0 = repo.commit("first");
+        let h1 = repo.commit("second");
+        let mut j = Journal::default();
+        j.record(entry("commit second", &h0, &h1));
+
+        let lock = repo.path().join(".git").join("refs").join("heads").join("main.lock");
+        std::fs::write(&lock, "").expect("take the lock");
+        let result = j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan));
+        assert!(matches!(&result, Err(Failed::Run(stderr)) if stderr.contains("main.lock")), "{result:?}");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), h1, "nothing moved");
+        assert_eq!(j.peek_undo().map(|e| e.description.as_str()), Some("commit second"));
+
+        std::fs::remove_file(&lock).expect("release the lock");
+        j.undo(&real_snapshot(&repo), |plan| run_in(&repo, plan)).expect("the retry succeeds");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), h0);
+        assert_eq!(j.peek_redo().map(|e| e.description.as_str()), Some("commit second"));
     }
 }

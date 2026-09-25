@@ -238,11 +238,20 @@ pub struct Remote {
 
 pub const REMOTE_ARGS: &[&str] = &["remote", "-v"];
 
-/// Parse `git remote -v` (one fetch and one push line per remote), in first-seen order.
+/// Parse `git remote -v` (one fetch and one push line per remote), in first-seen order. A
+/// partial clone's fetch line carries an extra ` [<filter>]` suffix after the tag (e.g.
+/// `... (fetch) [blob:none]`); it is stripped before the tag is split off, so the URL is never
+/// swallowed into it.
 pub fn parse_remotes(out: &str) -> Vec<Remote> {
     let mut remotes: Vec<Remote> = Vec::new();
     for line in out.lines() {
         let Some((name, rest)) = line.split_once('\t') else { continue };
+        let rest = match rest.rsplit_once(' ') {
+            Some((before_bracket, bracket)) if bracket.starts_with('[') && bracket.ends_with(']') => {
+                before_bracket
+            }
+            _ => rest,
+        };
         let Some((url, tag)) = rest.rsplit_once(' ') else { continue };
         let tag = tag.trim_matches(|c| c == '(' || c == ')');
 
@@ -523,5 +532,41 @@ mod tests {
     #[test]
     fn parses_remotes_empty_output() {
         assert_eq!(parse_remotes(""), Vec::new());
+    }
+
+    #[test]
+    fn parses_remotes_of_a_partial_clone_keeps_fetch_url_despite_filter_suffix() {
+        // Regression: `git remote -v` prints an extra ` [<filter>]` after the `(fetch)` tag for
+        // a partial clone's fetch line; it must not be swallowed into the URL or the tag.
+        let base = tempfile::tempdir().expect("tempdir");
+        let remote = base.path().join("remote.git");
+        let out = crate::testutil::hermetic_git(base.path())
+            .args(["init", "-q", "-b", "main", "--bare", remote.to_str().expect("utf8 path")])
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success());
+
+        let mut seed = TempRepo::new();
+        seed.git(&["remote", "add", "origin", remote.to_str().expect("utf8 path")]);
+        seed.commit_file("a.txt", "1\n", "c1");
+        seed.git(&["push", "-q", "origin", "main"]);
+
+        let clone_dir = base.path().join("clone");
+        let remote_url = format!("file://{}", remote.to_str().expect("utf8 path"));
+        let out = crate::testutil::hermetic_git(base.path())
+            .args(["clone", "-q", "--filter=blob:none", &remote_url, clone_dir.to_str().expect("utf8 path")])
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "clone failed:\n{}", String::from_utf8_lossy(&out.stderr));
+
+        let out2 = crate::testutil::hermetic_git(&clone_dir).args(REMOTE_ARGS).output().expect("spawn git");
+        assert!(out2.status.success());
+        let text = String::from_utf8_lossy(&out2.stdout);
+        assert!(text.contains("[blob:none]"), "sanity: the filter tag is really in git's output: {text}");
+
+        let remotes = parse_remotes(&text);
+        let origin = remotes.iter().find(|r| r.name == "origin").expect("origin remote");
+        assert_eq!(origin.fetch_url, remote_url);
+        assert_eq!(origin.push_url, remote_url);
     }
 }

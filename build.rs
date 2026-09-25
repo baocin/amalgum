@@ -20,6 +20,10 @@ fn main() {
         for target in TARGETS {
             let bin = dir.join(target).join("amalgum");
             if bin.is_file() {
+                // include_bytes! in the generated file resolves relative to that file's own
+                // location ($OUT_DIR), not to the crate root or AMALGUM_EMBED_CLI_DIR — so a
+                // relative `dir` must be canonicalized before it is written out.
+                let bin = fs::canonicalize(&bin).expect("canonicalize embedded CLI path");
                 println!("cargo:rerun-if-changed={}", bin.display());
                 code.push_str(&format!(
                     "    ({target:?}, include_bytes!({:?})),\n",

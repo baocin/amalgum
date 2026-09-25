@@ -8,6 +8,7 @@
 //! `session.deleted` → Status::None. Resume: `opencode --session <id>`.
 //! `install` returns the whole file; `uninstall` returns "" (the caller deletes the file).
 
+use super::Takes::{Nothing, One};
 use super::{AgentEvent, AgentKind, EventKind, HookState, Status};
 use std::path::{Path, PathBuf};
 
@@ -88,6 +89,22 @@ pub fn state(text: &str, command: &str) -> HookState {
 pub fn resume(session_id: &str) -> String {
     format!("opencode --session {}", crate::ssh::quote(session_id))
 }
+
+/// `opencode --help` (the TUI command, yargs).
+pub const CLI_OPTIONS: super::CliOptions = super::CliOptions {
+    options: &[
+        ("--agent", One),
+        ("--continue", Nothing),
+        ("--hostname", One),
+        ("--log-level", One),
+        ("--model", One),
+        ("--port", One),
+        ("--print-logs", Nothing),
+        ("--prompt", One),
+        ("--session", One),
+    ],
+    not_replayed: &["--continue", "--prompt", "--session"],
+};
 
 #[cfg(test)]
 mod tests {

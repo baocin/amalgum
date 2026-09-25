@@ -93,9 +93,12 @@ fn leftover_draining_files(queue: &Path) -> Vec<PathBuf> {
     found.into_iter().map(|(_, path)| path).collect()
 }
 
-/// Read `path`'s non-empty lines and delete it. The file must already exist.
+/// Read `path`'s non-empty lines and delete it. The file must already exist. Bytes that are
+/// not UTF-8 (a write torn mid-character) are decoded lossily rather than failing, so the file
+/// is always consumed; a damaged line just no longer parses as a request.
 fn take_lines(path: &Path) -> io::Result<Vec<String>> {
-    let content = std::fs::read_to_string(path)?;
+    let bytes = std::fs::read(path)?;
+    let content = String::from_utf8_lossy(&bytes);
     let lines =
         content.lines().map(|l| l.trim_end_matches('\r').to_string()).filter(|l| !l.is_empty()).collect();
     std::fs::remove_file(path)?;
@@ -200,6 +203,30 @@ mod tests {
         assert!(lines[0].contains("stale"));
         assert!(lines[1].contains("fresh"));
         assert!(!crashed.exists());
+    }
+
+    /// A write cut off mid-character (e.g. on ENOSPC) leaves bytes that are not UTF-8. The file
+    /// must still be consumed: every drain reads leftovers first, so failing on it would stop
+    /// the live queue from ever being delivered again.
+    #[test]
+    fn leftover_with_invalid_utf8_is_consumed_not_a_permanent_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = dir.path().join("queue.jsonl");
+        let crashed = queue.with_file_name("queue.jsonl.draining.111.222");
+        let mut bytes = req("stale").to_line().into_bytes();
+        bytes.extend_from_slice(b"{\"v\":1,\"cmd\":\"notify\",\"title\":\"caf\xC3");
+        std::fs::write(&crashed, bytes).expect("write leftover");
+        append(&queue, &req("fresh")).expect("append current");
+
+        let lines = drain(&queue).expect("drain despite the torn write");
+        assert!(lines[0].contains("stale"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("fresh")), "{lines:?}");
+        assert!(!crashed.exists());
+
+        append(&queue, &req("later")).expect("append after");
+        let lines = drain(&queue).expect("next drain");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("later"));
     }
 
     #[test]

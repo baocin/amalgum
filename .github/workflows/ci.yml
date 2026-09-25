@@ -75,7 +75,12 @@ jobs:
           key: ${{ matrix.kind }}-${{ matrix.target }}
       - name: Build
         id: build
-        run: echo "bin=$(scripts/build ${{ matrix.kind }} ${{ matrix.target }})" >> "$GITHUB_OUTPUT"
+        # Assign before echoing: with `bash -e`, a failing command substitution used as an
+        # echo argument does not fail the step (echo itself still exits 0), so a broken build
+        # would otherwise show green here and fail confusingly at the next step instead.
+        run: |
+          bin="$(scripts/build ${{ matrix.kind }} ${{ matrix.target }})"
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
       - name: Linkage (SPEC §1)
         run: scripts/check-linkage "${{ steps.build.outputs.bin }}" ${{ matrix.kind }}
       - name: Smoke
@@ -103,10 +108,14 @@ jobs:
           path: dist/in
       - name: Bundle (ad-hoc signed)
         id: pkg
+        # bash -eo pipefail: without it, a failing `sed` here would still show green (head's
+        # exit status, not sed's, decides the pipeline's) and blame the next step instead.
+        shell: bash
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-ci.${GITHUB_RUN_NUMBER}"
           chmod +x dist/in/*/amalgum
-          echo "dmg=$(scripts/package-macos "$version" dist/in/app-aarch64-apple-darwin/amalgum dist/in/app-x86_64-apple-darwin/amalgum)" >> "$GITHUB_OUTPUT"
+          dmg="$(scripts/package-macos "$version" dist/in/app-aarch64-apple-darwin/amalgum dist/in/app-x86_64-apple-darwin/amalgum)"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
       - name: Launch check
         run: dist/Amalgum.app/Contents/MacOS/amalgum --version
       - uses: actions/upload-artifact@v4
@@ -128,10 +137,15 @@ jobs:
           path: dist/in
       - name: Package
         id: pkg
+        # bash -eo pipefail: without it, a failing `sed`/`scripts/package-linux` here would
+        # still show green (head's exit status, not theirs, decides the pipeline's) and blame
+        # upload-artifact instead.
+        shell: bash
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-ci.${GITHUB_RUN_NUMBER}"
           chmod +x dist/in/amalgum
-          echo "tarball=$(scripts/package-linux "$version" dist/in/amalgum x86_64 | head -1)" >> "$GITHUB_OUTPUT"
+          tarball="$(scripts/package-linux "$version" dist/in/amalgum x86_64 | head -1)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tarball

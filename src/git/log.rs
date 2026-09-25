@@ -39,12 +39,19 @@ pub const LOG_FORMAT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct
 
 /// `git log` argv for the graph: topo order, `-z`, full decorations, [`LOG_FORMAT`], plus
 /// `extra` (revision ranges, `--all`, `-n`, paths).
+///
+/// `--no-show-signature` overrides a user's `log.showSignature=true`: without it, a signed
+/// commit makes git write the signature-verification program's output to stdout ahead of the
+/// record itself, which corrupts [`parse_record`]'s id. `--no-color` is the same defensive
+/// override for `color.ui=always`.
 pub fn log_args(extra: &[&str]) -> Vec<String> {
     let mut args = vec![
         "log".to_string(),
         "--topo-order".to_string(),
         "-z".to_string(),
         "--decorate=full".to_string(),
+        "--no-show-signature".to_string(),
+        "--no-color".to_string(),
         format!("--format={LOG_FORMAT}"),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
@@ -57,10 +64,12 @@ const FIELD_SEP: char = '\u{1f}';
 /// Parse one record (no trailing NUL). `None` if it is malformed.
 ///
 /// Some git versions emit a leading `\n` between `-z` records; it is stripped before parsing.
-/// Exactly 10 `%x1f`-separated fields are required, in [`LOG_FORMAT`] order.
+/// Exactly 10 `%x1f`-separated fields are required, in [`LOG_FORMAT`] order. Bytes that are not
+/// valid UTF-8 (e.g. Latin-1 author names from a commit with no `encoding` header, which git
+/// never re-encodes) are replaced with U+FFFD rather than rejecting the whole record.
 pub fn parse_record(rec: &[u8]) -> Option<Commit> {
     let rec = rec.strip_prefix(b"\n").unwrap_or(rec);
-    let text = std::str::from_utf8(rec).ok()?;
+    let text = String::from_utf8_lossy(rec);
     let mut fields = text.split(FIELD_SEP);
 
     let id = fields.next()?;
@@ -189,6 +198,8 @@ mod tests {
                 "--topo-order",
                 "-z",
                 "--decorate=full",
+                "--no-show-signature",
+                "--no-color",
                 "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%D%x1f%s"
             ]
         );
@@ -197,8 +208,15 @@ mod tests {
     #[test]
     fn log_args_appends_extra_after_format() {
         let args = log_args(&["--all", "-n", "500"]);
-        assert_eq!(args_to_str(&args)[5..], ["--all", "-n", "500"]);
-        assert_eq!(args.len(), 8);
+        assert_eq!(args_to_str(&args)[7..], ["--all", "-n", "500"]);
+        assert_eq!(args.len(), 10);
+    }
+
+    #[test]
+    fn log_args_disables_show_signature() {
+        // Regression: without `--no-show-signature`, a user's `log.showSignature=true` makes a
+        // signed commit's gpg-verification chatter land in stdout ahead of the record.
+        assert!(args_to_str(&log_args(&[])).contains(&"--no-show-signature"));
     }
 
     // ---- parse_record: well-formed ----
@@ -348,7 +366,7 @@ mod tests {
                 v.extend_from_slice(b"extra");
                 v
             },
-            vec![0xff, 0xfe, 0x1f, 0x00, 0x1f], // invalid UTF-8
+            vec![0xff, 0xfe, 0x1f, 0x00, 0x1f], // invalid UTF-8 is lossy-decoded now, but still short on fields
             b"\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f".to_vec(), // all-empty except id (empty id)
             b"a\x1f".to_vec(),                  // truncated after one separator
             b"a\x1fb\x1fc\x1fd\x1fe\x1ff\x1fg\x1fh\x1fi\x1fj\x1fk".to_vec(), // 11 fields
@@ -451,6 +469,83 @@ mod tests {
 
         let m = commits.iter().find(|c| c.id == merge).expect("merge commit");
         assert_eq!(m.parents, vec![on_main, on_topic]);
+    }
+
+    #[test]
+    fn log_args_show_signature_does_not_pollute_commit_id() {
+        // Regression for a user with `log.showSignature=true`: without `--no-show-signature`,
+        // git writes the configured `gpg.program`'s verification chatter to stdout right before
+        // the record, and it has no separator from the id field. A stub `gpg.program` stands in
+        // for real GPG (no key needed); the commit's `gpgsig` header just needs to look enough
+        // like a signature that git invokes it — it never checks whether it's really valid.
+        let repo = TempRepo::new();
+        let tree = repo.git(&["write-tree"]);
+        let commit_text = format!(
+            "tree {tree}\n\
+             author Ada Tester <ada@example.com> 1700000000 +0000\n\
+             committer Ada Tester <ada@example.com> 1700000000 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n\
+             \x20\n\
+             \x20garbagebase64data==\n\
+             \x20-----END PGP SIGNATURE-----\n\
+             \n\
+             signed commit\n"
+        );
+        repo.write("commit-msg.txt", &commit_text);
+        let hash = repo.git(&["hash-object", "-t", "commit", "-w", "commit-msg.txt"]);
+        repo.git(&["update-ref", "refs/heads/main", &hash]);
+
+        let stub_path = repo.write(
+            "stub-gpg.sh",
+            "#!/bin/sh\n\
+             echo 'gpg: Signature made Thu Jan  1 00:00:00 1970 UTC' >&2\n\
+             echo 'gpg: Good signature from \"Test User <test@example.com>\"' >&2\n\
+             exit 0\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let gpg_program_cfg = format!("gpg.program={}", stub_path.display());
+        let mut args: Vec<&str> = vec!["-c", "log.showSignature=true", "-c", &gpg_program_cfg];
+        let fixed_args = log_args(&[]);
+        args.extend(fixed_args.iter().map(String::as_str));
+
+        let out = repo.git_raw(&args);
+        let commits = parse_log(&out);
+
+        assert_eq!(commits.len(), 1, "exactly one commit, not split by the gpg chatter");
+        assert_eq!(commits[0].id, hash, "id must be the real hash, not text glued on by --show-signature");
+    }
+
+    #[test]
+    fn parse_log_tolerates_non_utf8_commit_metadata_from_real_git() {
+        // Regression: a commit object with no `encoding` header carries its raw bytes as-is
+        // (git assumes UTF-8 and never re-encodes), so a legacy CVS/SVN import can have Latin-1
+        // bytes in the author name. Such a commit must survive `parse_log`, not vanish from it.
+        let repo = TempRepo::new();
+        let tree = repo.git(&["write-tree"]);
+
+        let mut commit_bytes = Vec::new();
+        commit_bytes.extend_from_slice(format!("tree {tree}\nauthor Jos").as_bytes());
+        commit_bytes.push(0xE9); // raw Latin-1 'é', not a valid UTF-8 continuation of "Jos"
+        commit_bytes.extend_from_slice(b" <jose@example.com> 1700000000 +0000\ncommitter Jos");
+        commit_bytes.push(0xE9);
+        commit_bytes.extend_from_slice(b" <jose@example.com> 1700000000 +0000\n\nlegacy import\n");
+        std::fs::write(repo.path().join("commit-msg.bin"), &commit_bytes).expect("write");
+
+        let hash = repo.git(&["hash-object", "-t", "commit", "-w", "commit-msg.bin"]);
+        repo.git(&["update-ref", "refs/heads/main", &hash]);
+
+        let args = log_args(&[]);
+        let out = repo.git_raw(&args_to_str(&args));
+        let commits = parse_log(&out);
+
+        assert_eq!(commits.len(), 1, "the commit must not be dropped for having non-UTF-8 metadata");
+        assert_eq!(commits[0].id, hash);
+        assert_eq!(commits[0].author, "Jos\u{FFFD}", "the bad byte becomes U+FFFD, not a rejection");
     }
 
     // ---- split_message ----

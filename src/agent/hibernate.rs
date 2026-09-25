@@ -7,6 +7,7 @@
 //! a captured session id, and no unsaved input on the prompt line.
 
 use super::AgentKind;
+use super::adapters::{Takes, cli_options};
 use super::status::Status;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,25 +82,72 @@ pub fn over_limit<'a>(running: &[(&'a str, u64, bool)], limit: usize) -> Vec<&'a
     eligible.into_iter().take(excess).map(|(id, _)| id).collect()
 }
 
-/// Keep only the `--flag` / `--flag=value` long-option arguments from `argv` (dropping
-/// `argv[0]`, short flags, `VAR=value` env assignments, and positional/prompt text): the parts
-/// of the original invocation worth replaying on resume, e.g.
-/// `["claude", "--dangerously-skip-permissions", "FOO=bar", "fix the bug"]` →
-/// `["--dangerously-skip-permissions"]`.
-pub fn resume_flags(argv: &[String]) -> Vec<String> {
-    argv.iter().skip(1).filter(|a| is_long_flag(a)).cloned().collect()
+/// The parts of the original invocation worth replaying on resume (§5.30): the long options the
+/// agent's [`CliOptions`] lists, each with the words it took (`--model opus`, `--model=opus`,
+/// `--add-dir a b`). Dropped: `argv[0]`, short flags, `VAR=value` env assignments,
+/// positional/prompt text, everything after a bare `--`, the options that pick a session or
+/// submit a prompt ([`CliOptions::not_replayed`]), and any option the agent's list lacks, with
+/// the word after it unless that is an option. E.g. for Claude
+/// `["claude", "--resume", "old", "--model", "opus", "FOO=bar", "fix the bug"]` →
+/// `["--model", "opus"]`.
+///
+/// [`CliOptions`]: super::adapters::CliOptions
+/// [`CliOptions::not_replayed`]: super::adapters::CliOptions::not_replayed
+pub fn resume_flags(agent: AgentKind, argv: &[String]) -> Vec<String> {
+    let options = cli_options(agent);
+    let mut flags = Vec::new();
+    let mut words = argv.iter().skip(1).peekable();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if !is_long_flag(word) {
+            continue;
+        }
+        let (name, inline_value) = match word.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (word.as_str(), false),
+        };
+        let takes = options.takes(name);
+        let mut option = vec![word];
+        // `--name=value` is the whole option, even a variadic one's.
+        if !inline_value {
+            match takes {
+                Some(Takes::Nothing) => {}
+                Some(Takes::One) => option.extend(words.next()),
+                Some(Takes::Many) => {
+                    option.extend(words.next());
+                    while let Some(value) = words.next_if(|w| !is_option(w)) {
+                        option.push(value);
+                    }
+                }
+                // An unlisted option's value, if it took one, goes with it.
+                Some(Takes::Optional) | None => option.extend(words.next_if(|w| !is_option(w))),
+            }
+        }
+        if takes.is_some() && !options.not_replayed.contains(&name) {
+            flags.extend(option.into_iter().cloned());
+        }
+    }
+    flags
 }
 
 fn is_long_flag(a: &str) -> bool {
     a.starts_with("--") && a.len() > 2
 }
 
-/// The command typed into the shell to resume: the agent's resume command plus any `--flag`
-/// arguments from the original argv (e.g. `--dangerously-skip-permissions`), never env
-/// assignments or positional prompt text.
+/// Whether an argv word reads as an option rather than a value (commander's rule: a `-` and
+/// something after it).
+fn is_option(a: &str) -> bool {
+    a.starts_with('-') && a.len() > 1
+}
+
+/// The command typed into the shell to resume: the agent's resume command plus
+/// [`resume_flags`] (e.g. `--dangerously-skip-permissions`, `--model opus`), each word quoted;
+/// never env assignments, positional prompt text, or the original session selection.
 pub fn resume_line(agent: AgentKind, session_id: &str, original_argv: &[String]) -> String {
     let mut line = crate::agent::adapters::resume_command(agent, session_id);
-    for flag in resume_flags(original_argv) {
+    for flag in resume_flags(agent, original_argv) {
         line.push(' ');
         line.push_str(&crate::ssh::quote(&flag));
     }
@@ -313,32 +361,152 @@ mod tests {
             "--model=opus".to_string(),
         ];
         assert_eq!(
-            resume_flags(&argv),
+            resume_flags(AgentKind::Claude, &argv),
             vec!["--dangerously-skip-permissions".to_string(), "--model=opus".to_string()]
         );
     }
 
     #[test]
     fn resume_flags_empty_argv_and_program_name_only() {
-        assert_eq!(resume_flags(&[]), Vec::<String>::new());
-        assert_eq!(resume_flags(&["claude".to_string()]), Vec::<String>::new());
+        assert_eq!(resume_flags(AgentKind::Claude, &[]), Vec::<String>::new());
+        assert_eq!(resume_flags(AgentKind::Claude, &["claude".to_string()]), Vec::<String>::new());
     }
 
     #[test]
-    fn resume_flags_ignores_bare_double_dash() {
-        let argv = vec!["claude".to_string(), "--".to_string(), "--resume".to_string()];
-        assert_eq!(resume_flags(&argv), vec!["--resume".to_string()]);
+    fn resume_flags_stop_at_bare_double_dash() {
+        // Everything after `--` is positional, however it looks.
+        let argv = words(&["claude", "--verbose", "--", "--resume", "--model", "opus"]);
+        assert_eq!(resume_flags(AgentKind::Claude, &argv), words(&["--verbose"]));
+    }
+
+    #[test]
+    fn resume_flags_value_option_without_a_value_is_replayed_alone() {
+        // `--debug [filter]` has an optional value; the next word is another option.
+        let argv = words(&["claude", "--debug", "--model=opus"]);
+        assert_eq!(resume_flags(AgentKind::Claude, &argv), words(&["--debug", "--model=opus"]));
+    }
+
+    fn words(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn resume_line_keeps_each_options_separate_value() {
+        // `--model opus` is one option: replaying `--model` alone makes the agent reject the line.
+        let argv = words(&[
+            "claude",
+            "--model",
+            "opus",
+            "--permission-mode",
+            "acceptEdits",
+            "--add-dir",
+            "../my lib",
+            "--dangerously-skip-permissions",
+            "fix the bug",
+        ]);
+        assert_eq!(
+            resume_line(AgentKind::Claude, "abc", &argv),
+            "claude --resume abc --model opus --permission-mode acceptEdits --add-dir '../my lib' \
+             --dangerously-skip-permissions"
+        );
+        assert_eq!(
+            resume_line(AgentKind::Codex, "abc", &words(&["codex", "--model", "o3", "--full-auto", "go"])),
+            "codex resume abc --model o3 --full-auto"
+        );
+        assert_eq!(
+            resume_line(AgentKind::Gemini, "abc", &words(&["gemini", "--model", "gemini-2.5-pro", "--yolo"])),
+            "gemini --resume abc --model gemini-2.5-pro --yolo"
+        );
+    }
+
+    #[test]
+    fn resume_line_keeps_the_value_of_every_option_claude_help_lists() {
+        // Claude 2.1: `claude --effort` and `claude --name` alone are rejected ("argument missing").
+        for (option, value) in [
+            ("--effort", "high"),
+            ("--name", "feature-x"),
+            ("--debug-file", "/tmp/claude.log"), // portability: allow
+            ("--autocompact", "auto"),
+            ("--system-prompt-snapshot", "off"),
+            ("--remote-control-session-name-prefix", "box"),
+        ] {
+            let argv = words(&["claude", option, value, "fix the bug"]);
+            assert_eq!(resume_flags(AgentKind::Claude, &argv), words(&[option, value]), "{option}");
+        }
+        // A required value is the next word even when it starts with `-`, as commander reads it.
+        let argv = words(&["claude", "--append-system-prompt", "-be terse", "--verbose"]);
+        assert_eq!(
+            resume_line(AgentKind::Claude, "new", &argv),
+            "claude --resume new --append-system-prompt '-be terse' --verbose"
+        );
+        // A variadic option takes every word up to the next option.
+        let argv = words(&["claude", "--allowedTools", "Bash(git *)", "Edit", "--model", "opus"]);
+        assert_eq!(
+            resume_line(AgentKind::Claude, "new", &argv),
+            "claude --resume new --allowedTools 'Bash(git *)' Edit --model opus"
+        );
+    }
+
+    #[test]
+    fn resume_flags_inline_value_is_the_whole_option() {
+        // commander reads `--add-dir=a` as one value: the word after it is the prompt.
+        let argv = words(&["claude", "--add-dir=../lib", "fix the bug", "--debug=api", "more"]);
+        assert_eq!(resume_flags(AgentKind::Claude, &argv), words(&["--add-dir=../lib", "--debug=api"]));
+    }
+
+    #[test]
+    fn resume_line_drops_an_option_it_does_not_know_with_its_value() {
+        // Replaying an unknown option alone could leave a value option without its value.
+        let argv = words(&["claude", "--option-from-a-newer-claude", "value", "--verbose", "--also-new"]);
+        assert_eq!(resume_line(AgentKind::Claude, "new", &argv), "claude --resume new --verbose");
+        let argv = words(&["claude", "--option-from-a-newer-claude=value", "--verbose"]);
+        assert_eq!(resume_line(AgentKind::Claude, "new", &argv), "claude --resume new --verbose");
+    }
+
+    #[test]
+    fn resume_line_drops_claudes_other_session_pickers() {
+        for picker in
+            [&["--from-pr", "123"][..], &["--teleport", "abc"], &["--cloud", "fix it"], &["--from-pr"]]
+        {
+            let argv: Vec<String> =
+                ["claude"].iter().chain(picker).chain(&["--verbose"]).map(|w| w.to_string()).collect();
+            assert_eq!(
+                resume_line(AgentKind::Claude, "new", &argv),
+                "claude --resume new --verbose",
+                "{picker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_line_never_replays_the_original_session_selection() {
+        // A tab resumed once was started as `claude --resume <old>` (as persisted in state.json).
+        let argv = words(&["claude", "--resume", "sess-abc", "--model", "opus"]);
+        assert_eq!(resume_line(AgentKind::Claude, "new", &argv), "claude --resume new --model opus");
+        let argv = words(&["claude", "--continue", "--session-id=x", "--fork-session", "--verbose"]);
+        assert_eq!(resume_line(AgentKind::Claude, "new", &argv), "claude --resume new --verbose");
+        let argv = words(&["opencode", "--session", "old", "--prompt", "fix it", "--model", "a/b"]);
+        assert_eq!(resume_line(AgentKind::Opencode, "new", &argv), "opencode --session new --model a/b");
+        let argv = words(&["gemini", "--resume", "latest", "--prompt-interactive", "fix it"]);
+        assert_eq!(resume_line(AgentKind::Gemini, "new", &argv), "gemini --resume new");
+        let argv = words(&["codex", "resume", "--last"]);
+        assert_eq!(resume_line(AgentKind::Codex, "new", &argv), "codex resume new");
     }
 
     #[test]
     fn resume_line_is_the_agents_command_plus_quoted_long_flags() {
-        let argv: Vec<String> =
-            ["claude", "--dangerously-skip-permissions", "--msg=hello world", "fix the bug", "-v"]
-                .map(String::from)
-                .into();
+        let argv: Vec<String> = [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt=be terse",
+            "fix the bug",
+            "-v",
+        ]
+        .map(String::from)
+        .into();
         assert_eq!(
             resume_line(AgentKind::Claude, "7f3a", &argv),
-            "claude --resume 7f3a --dangerously-skip-permissions '--msg=hello world'"
+            "claude --resume 7f3a --dangerously-skip-permissions '--append-system-prompt=be terse'"
         );
         assert_eq!(resume_line(AgentKind::Codex, "id with space", &[]), "codex resume 'id with space'");
     }

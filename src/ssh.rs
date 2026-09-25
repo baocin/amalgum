@@ -7,7 +7,8 @@
 //!
 //! ControlPath: `<control_dir>/<16 hex of fnv1a64(host)>`. Unix socket paths are limited to 104
 //! bytes on macOS and ssh appends a 17-byte temporary suffix while creating the socket, so the
-//! name is kept short instead of using `%C`.
+//! name is kept short instead of using `%C`. The `-o ControlPath=…` value is quoted for ssh's
+//! own option parser, since the macOS control dir contains a space.
 //! Host keys are only ever accepted through the W16 dialog: [`Conn::master_args`] with
 //! `trust_new_host_key` adds `StrictHostKeyChecking=accept-new` for that one connection. Never
 //! `StrictHostKeyChecking=no`.
@@ -129,6 +130,16 @@ impl Conn {
         self.control_dir.join(format!("{hash:016x}"))
     }
 
+    /// `ControlPath="<control_path>"`. ssh re-splits every `-o` value on whitespace like a config
+    /// line and expands `%` tokens in this one, and the default macOS control dir has a space
+    /// in it (`~/Library/Application Support/…`): the path is double-quoted, with `\` and `"`
+    /// backslash-escaped and `%` doubled, so ssh reads it back verbatim.
+    fn control_path_option(&self) -> String {
+        let path = self.control_path().display().to_string();
+        let escaped = path.replace('\\', r"\\").replace('"', r#"\""#).replace('%', "%%");
+        format!("ControlPath=\"{escaped}\"")
+    }
+
     /// `-o ControlMaster=auto -o ControlPath=… -o ControlPersist=… [-o ServerAliveInterval=…
     /// -o ServerAliveCountMax=…] [-o StrictHostKeyChecking=accept-new] -N -f <host>`.
     pub fn master_args(&self, opts: &MasterOptions, trust_new_host_key: bool) -> Vec<String> {
@@ -136,7 +147,7 @@ impl Conn {
             "-o".to_string(),
             "ControlMaster=auto".to_string(),
             "-o".to_string(),
-            format!("ControlPath={}", self.control_path().display()),
+            self.control_path_option(),
             "-o".to_string(),
             format!("ControlPersist={}", opts.persist),
         ];
@@ -159,7 +170,7 @@ impl Conn {
     /// `-o ControlPath=<path>`: every command after `master_args` must name the master's
     /// socket, or ssh looks for the user's default ControlPath and misses ours.
     fn via_master(&self, rest: impl IntoIterator<Item = String>) -> Vec<String> {
-        let mut args = vec!["-o".to_string(), format!("ControlPath={}", self.control_path().display())];
+        let mut args = vec!["-o".to_string(), self.control_path_option()];
         args.extend(rest);
         args
     }
@@ -486,16 +497,54 @@ mod tests {
     }
 
     /// docs/SPEC.md §1 portability + CLAUDE.md: macOS caps `sockaddr_un.sun_path` at 104 bytes
-    /// and ssh appends a further 17-byte temp suffix while creating the socket. `control_path`
-    /// always adds exactly one separator plus 16 hex chars (17 bytes) to `control_dir`,
-    /// regardless of host, so this must hold even for a long real-world macOS path.
+    /// including the terminating NUL, and ssh first binds `<ControlPath>.<16 random chars>` (17
+    /// more bytes) before renaming it into place. `control_path` always adds exactly one
+    /// separator plus 16 hex chars (17 bytes) to `control_dir`, regardless of host. With the
+    /// default macOS control dir that leaves room for a username of up to 18 bytes (the one
+    /// below); a longer one needs a shorter runtime dir (`paths::Dirs`).
     #[test]
     fn control_path_fits_macos_socket_limit() {
-        let control_dir = "/Users/abcdefghijklmnopqrst/Library/Application Support/amalgum/run/ssh"; // portability: allow
+        let control_dir = "/Users/abcdefghijklmnopqr/Library/Application Support/amalgum/run/ssh"; // portability: allow
         let c = conn("gpu-box.example.internal.corp", control_dir);
         let path_len = c.control_path().as_os_str().len();
         assert_eq!(path_len, control_dir.len() + 17, "control_path always adds exactly 17 bytes");
-        assert!(path_len <= 104, "control path is {path_len} bytes, over the macOS sockaddr_un limit");
+        let bound = path_len + 17 + 1; // ssh's temporary suffix, then the NUL
+        assert!(bound <= 104, "ssh binds a {bound}-byte socket path, over the macOS sockaddr_un limit");
+    }
+
+    /// ssh re-splits every `-o` value like a config line and expands `%` tokens in ControlPath,
+    /// so the default macOS control dir (`~/Library/Application Support/…`) must be quoted.
+    #[test]
+    fn control_path_option_is_one_literal_token_for_ssh() {
+        let c = conn("gpu-box", "/Users/u/Library/Application Support/100%/a\"b\\c/ssh"); // portability: allow
+        let hash = c.control_path().file_name().expect("file name").to_string_lossy().into_owned();
+        let want = format!(r#"ControlPath="/Users/u/Library/Application Support/100%%/a\"b\\c/ssh/{hash}""#); // portability: allow
+        assert_eq!(c.master_args(&MasterOptions::default(), false)[3], want);
+        assert_eq!(c.check_args()[1], want);
+    }
+
+    /// `ssh -G` parses the options and prints the resulting config without connecting. Skipped
+    /// where no `ssh` is installed.
+    #[test]
+    fn control_path_option_survives_ssh_option_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_dir = dir.path().join("Application Support").join("100%").join("ssh");
+        let c = Conn { host: "gpu-box".into(), control_dir };
+        for args in [c.master_args(&MasterOptions::default(), false), c.exec_args(&["true"])] {
+            let out = match Command::new("ssh").args(["-F", "none", "-G"]).args(&args).output() {
+                Ok(out) => out,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("skipped: no ssh on PATH");
+                    return;
+                }
+                Err(e) => panic!("spawn ssh: {e}"),
+            };
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "ssh -G rejected {args:?}: {stderr}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let parsed = stdout.lines().find_map(|l| l.strip_prefix("controlpath ")).expect("controlpath");
+            assert_eq!(Path::new(parsed), c.control_path(), "{args:?}");
+        }
     }
 
     #[test]
@@ -509,7 +558,7 @@ mod tests {
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                &format!("ControlPath={}", c.control_path().display()),
+                &format!("ControlPath=\"{}\"", c.control_path().display()),
                 "-o",
                 "ControlPersist=10m",
                 "-o",
@@ -558,7 +607,7 @@ mod tests {
             args,
             vec![
                 "-o".to_string(),
-                format!("ControlPath={}", c.control_path().display()),
+                format!("ControlPath=\"{}\"", c.control_path().display()),
                 "-o".to_string(),
                 "ControlMaster=no".to_string(),
                 "gpu-box".to_string(),
@@ -568,9 +617,9 @@ mod tests {
         );
     }
 
-    /// The `-o ControlPath=…` pair every post-master command starts with.
+    /// The `-o ControlPath="…"` pair every post-master command starts with.
     fn via(c: &Conn) -> Vec<String> {
-        vec!["-o".into(), format!("ControlPath={}", c.control_path().display())]
+        vec!["-o".into(), format!("ControlPath=\"{}\"", c.control_path().display())]
     }
 
     fn with_via(c: &Conn, rest: &[&str]) -> Vec<String> {
