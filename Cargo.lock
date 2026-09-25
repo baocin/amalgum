@@ -187,6 +187,7 @@ dependencies = [
  "egui",
  "libc",
  "notify",
+ "polling",
  "serde",
  "serde_json",
  "sysinfo",

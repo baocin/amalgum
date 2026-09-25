@@ -12,7 +12,7 @@ publish = false
 #   cargo build --profile cli --no-default-features         → the headless CLI (static on musl)
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui", "dep:alacritty_terminal", "dep:sysinfo", "dep:arboard", "dep:notify"]
+gui = ["dep:eframe", "dep:egui", "dep:alacritty_terminal", "dep:polling", "dep:sysinfo", "dep:arboard", "dep:notify"]
 
 [dependencies]
 # Core + CLI: pure Rust only, so the musl CLI links fully static.
@@ -30,6 +30,8 @@ arboard = { version = "3", optional = true, default-features = false }
 eframe = { version = "0.36", optional = true, default-features = false, features = ["accesskit", "default_fonts", "wayland", "x11", "wgpu", "glow"] }
 egui = { version = "0.36", optional = true }
 notify = { version = "8", optional = true }
+# Same version alacritty_terminal uses; needed to wrap its PTY (ui/terminal/pty.rs).
+polling = { version = "3.8", optional = true }
 sysinfo = { version = "0.39", optional = true, default-features = false, features = ["system"] }
 
 [dev-dependencies]
