@@ -46,6 +46,8 @@ expect allow 'git log --oneline main..HEAD'
 expect allow 'git config core.hooksPath scripts/git-hooks'
 expect allow 'tmux -L amalgum-test kill-server'
 expect allow 'cat src/main.rs'
+expect allow "$(printf 'cat > docs/x.md <<%sEOF%s\nRun amalgum hooks setup with git push origin main\nEOF\necho done' "'" "'")"
+expect block "$(printf 'cat > x <<EOF\nnotes\nEOF\ngit push origin main')"
 
 # Unparseable payloads fail closed (raw scan still blocks).
 printf 'not json git push origin main' | "$hook" 2>/dev/null; [ $? = 2 ] && pass=$((pass + 1)) || { failed=$((failed + 1)); echo "✗ raw payload not blocked"; }

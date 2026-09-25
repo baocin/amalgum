@@ -14,6 +14,14 @@ if command -v jq >/dev/null 2>&1; then
 fi
 # Fail closed: if the payload could not be parsed, scan the raw payload instead.
 [ -n "$cmd" ] || cmd="$payload"
+# Heredoc bodies are data (file contents, docs), not commands: drop them before matching.
+# Gap: a body piped into a shell (`bash <<EOF … EOF`) is therefore not inspected.
+cmd="$(printf '%s\n' "$cmd" | awk '
+  skip { if ($0 ~ "^[ \t]*" delim "[ \t]*$") skip = 0; next }
+  { print }
+  match($0, /<<-?[ \t]*["\047]?[A-Za-z_][A-Za-z0-9_]*["\047]?/) {
+    delim = substr($0, RSTART, RLENGTH); gsub(/<<-?[ \t]*|["\047]/, "", delim); skip = 1
+  }')"
 
 block() { printf '%s\n' "$1" >&2; exit 2; }
 has() { printf '%s' "$cmd" | grep -Eq -- "$1"; }

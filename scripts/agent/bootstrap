@@ -10,7 +10,7 @@ command -v git >/dev/null || die "git not found — install git (Amalgum shells 
 command -v rustup >/dev/null || die "rustup not found — install it from https://rustup.rs, then re-run"
 
 step "toolchain (pinned in rust-toolchain.toml)"
-rustup show active-toolchain >/dev/null || die "could not install the pinned toolchain"
+rustup toolchain install >/dev/null 2>&1 || rustup show active-toolchain >/dev/null || die "could not install the pinned toolchain"
 echo "  $(rustc --version)"
 
 if [ "$(uname -s)" = Linux ]; then

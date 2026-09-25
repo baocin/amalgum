@@ -1,0 +1,139 @@
+# CI = the local gate (scripts/agent/verify) on both OSes, plus every release target built,
+# linkage-checked, smoke-tested, and packaged. Workflow logic lives in scripts/, so a failure
+# here reproduces locally with the same command.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  gate:
+    name: Gate · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Gate
+        run: VERIFY_FULL=1 scripts/agent/verify
+
+  secrets-history:
+    name: Secrets in branch history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Scan every commit on this branch (a secret deleted later is still in history)
+        run: |
+          base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+          scripts/check-secrets "${base:+$base..}HEAD"
+
+  build:
+    name: Build · ${{ matrix.kind }} · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, kind: app, target: x86_64-unknown-linux-gnu, smoke: true }
+          - { os: ubuntu-24.04, kind: cli, target: x86_64-unknown-linux-musl, smoke: true }
+          - { os: ubuntu-24.04, kind: cli, target: aarch64-unknown-linux-musl, smoke: false }
+          - { os: macos-15, kind: app, target: aarch64-apple-darwin, smoke: true }
+          - { os: macos-15, kind: app, target: x86_64-apple-darwin, smoke: false }
+          - { os: macos-15, kind: cli, target: aarch64-apple-darwin, smoke: true }
+          - { os: macos-15, kind: cli, target: x86_64-apple-darwin, smoke: false }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: rustup toolchain install && rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.kind }}-${{ matrix.target }}
+      - name: Build
+        id: build
+        run: echo "bin=$(scripts/build ${{ matrix.kind }} ${{ matrix.target }})" >> "$GITHUB_OUTPUT"
+      - name: Linkage (SPEC §1)
+        run: scripts/check-linkage "${{ steps.build.outputs.bin }}" ${{ matrix.kind }}
+      - name: Smoke
+        if: matrix.smoke
+        run: |
+          "${{ steps.build.outputs.bin }}" --version
+          "${{ steps.build.outputs.bin }}" --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.kind }}-${{ matrix.target }}
+          path: ${{ steps.build.outputs.bin }}
+          if-no-files-found: error
+          retention-days: 14
+
+  package-macos:
+    name: Package · macOS universal .dmg
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: app-*-apple-darwin
+          path: dist/in
+      - name: Bundle (ad-hoc signed)
+        id: pkg
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-ci.${GITHUB_RUN_NUMBER}"
+          chmod +x dist/in/*/amalgum
+          echo "dmg=$(scripts/package-macos "$version" dist/in/app-aarch64-apple-darwin/amalgum dist/in/app-x86_64-apple-darwin/amalgum)" >> "$GITHUB_OUTPUT"
+      - name: Launch check
+        run: dist/Amalgum.app/Contents/MacOS/amalgum --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: ${{ steps.pkg.outputs.dmg }}
+          retention-days: 14
+
+  package-linux:
+    name: Package · Linux tarball
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-x86_64-unknown-linux-gnu
+          path: dist/in
+      - name: Package
+        id: pkg
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-ci.${GITHUB_RUN_NUMBER}"
+          chmod +x dist/in/amalgum
+          echo "tarball=$(scripts/package-linux "$version" dist/in/amalgum x86_64 | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: ${{ steps.pkg.outputs.tarball }}
+          retention-days: 14

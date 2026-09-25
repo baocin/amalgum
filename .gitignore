@@ -5,3 +5,4 @@
 # agent harness local state (per machine)
 /.claude/settings.local.json
 /.claude/.gate-stamp
+/.claude/worktrees/
