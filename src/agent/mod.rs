@@ -15,7 +15,9 @@ pub mod status;
 use serde::{Deserialize, Serialize};
 
 /// Agents with hook integrations. Serialized lowercase (`"opencode"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Claude,

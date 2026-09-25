@@ -591,7 +591,9 @@ mod tests {
         let args = c.tmux_args("t", "/a b", &[("K", "v v"), ("X;rm", "1")]); // portability: allow
         assert_eq!(
             args.last().map(String::as_str),
-            Some("tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s t -c '/a b' -e 'K=v v' -e 'X;rm=1'") // portability: allow
+            Some(
+                "tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s t -c '/a b' -e 'K=v v' -e 'X;rm=1'"
+            ) // portability: allow
         );
     }
 
@@ -641,14 +643,23 @@ mod tests {
         let local = PathBuf::from("/tmp/app.sock"); // portability: allow
         let args = c.forward_socket_args("~/.amalgum/run/app.sock", &local); // portability: allow
         let spec = "~/.amalgum/run/app.sock:/tmp/app.sock"; // portability: allow
-        assert_eq!(args, with_via(&c, &["-O", "forward", "-R", spec, "-o", "StreamLocalBindUnlink=yes", "gpu-box"]));
+        assert_eq!(
+            args,
+            with_via(&c, &["-O", "forward", "-R", spec, "-o", "StreamLocalBindUnlink=yes", "gpu-box"])
+        );
     }
 
     #[test]
     fn forward_and_cancel_port_args() {
         let c = conn("gpu-box", "run/ssh");
-        assert_eq!(c.forward_port_args(3000, 8080), with_via(&c, &["-O", "forward", "-L", "3000:localhost:8080", "gpu-box"]));
-        assert_eq!(c.cancel_port_args(3000, 8080), with_via(&c, &["-O", "cancel", "-L", "3000:localhost:8080", "gpu-box"]));
+        assert_eq!(
+            c.forward_port_args(3000, 8080),
+            with_via(&c, &["-O", "forward", "-L", "3000:localhost:8080", "gpu-box"])
+        );
+        assert_eq!(
+            c.cancel_port_args(3000, 8080),
+            with_via(&c, &["-O", "cancel", "-L", "3000:localhost:8080", "gpu-box"])
+        );
     }
 
     // --- Backoff ------------------------------------------------------------------------------

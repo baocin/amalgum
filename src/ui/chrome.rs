@@ -93,6 +93,11 @@ pub enum PanelAction {
 
 /// The notification panel sliding in from the right (`Mod+Shift+I`, W14). Clicking a row
 /// focuses its workspace/tab; **Clear all** empties the store; unread rows are bold.
-pub fn notification_panel(ctx: &egui::Context, store: &mut Store, colors: &Colors, now: u64) -> Option<PanelAction> {
+pub fn notification_panel(
+    ctx: &egui::Context,
+    store: &mut Store,
+    colors: &Colors,
+    now: u64,
+) -> Option<PanelAction> {
     todo!()
 }

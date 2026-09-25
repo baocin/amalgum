@@ -34,7 +34,8 @@ pub fn launch(path: Option<String>) -> i32 {
     let target = open_target(path.as_deref(), &cwd);
 
     if let Some(loc) = &target {
-        let req = Request::new(Command::Open { location: location_arg(loc), remote: None, name: None, run: None });
+        let req =
+            Request::new(Command::Open { location: location_arg(loc), remote: None, name: None, run: None });
         if let Ok(resp) = socket::send(&dirs.socket(), &req, Duration::from_millis(500)) {
             if resp.ok {
                 return 0;
@@ -54,7 +55,10 @@ fn open_target(path: Option<&str>, cwd: &Path) -> Option<Location> {
             Location::Local { path } => Location::Local { path: cwd.join(path) },
             remote => remote,
         }),
-        None => cwd.ancestors().any(|d| d.join(".git").exists()).then(|| Location::Local { path: cwd.to_path_buf() }),
+        None => cwd
+            .ancestors()
+            .any(|d| d.join(".git").exists())
+            .then(|| Location::Local { path: cwd.to_path_buf() }),
     }
 }
 

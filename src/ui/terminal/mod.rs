@@ -15,9 +15,9 @@ mod input;
 mod pty;
 mod render;
 
+use super::theme::Colors;
 use crate::agent::osc::OscEvent;
 use crate::model::keymap::Keymap;
-use super::theme::Colors;
 use std::io;
 use std::path::PathBuf;
 
@@ -63,7 +63,14 @@ impl TerminalPane {
     /// Paint the grid into the available rect, resize the PTY when the rect's cell dimensions
     /// change, and — when `focused` — translate keyboard/paste/IME events into PTY input.
     /// Chords containing `Mod` are left for the app (`keymap`), everything else goes to the PTY.
-    pub fn show(&mut self, ui: &mut egui::Ui, focused: bool, keymap: &Keymap, colors: &Colors, font_size: f32) -> Response {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        focused: bool,
+        keymap: &Keymap,
+        colors: &Colors,
+        font_size: f32,
+    ) -> Response {
         todo!()
     }
 

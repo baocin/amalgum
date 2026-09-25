@@ -36,7 +36,17 @@ pub fn install_cli_shim(exe: &Path) -> io::Result<PathBuf> {
 
 pub fn listening_ports(pids: &[u32]) -> Vec<(u32, u16)> {
     let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let out = capture(Command::new("lsof").args(["-a", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pn", "-p", &list]));
+    let out = capture(Command::new("lsof").args([
+        "-a",
+        "-iTCP",
+        "-sTCP:LISTEN",
+        "-P",
+        "-n",
+        "-F",
+        "pn",
+        "-p",
+        &list,
+    ]));
     ports::parse_lsof(&out, pids)
 }
 

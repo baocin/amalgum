@@ -4,7 +4,11 @@
 use std::sync::mpsc::Sender;
 
 /// Run `work` on a new thread, send its result to `tx`, and wake the UI.
-pub fn spawn<T: Send + 'static>(ctx: &egui::Context, tx: &Sender<T>, work: impl FnOnce() -> T + Send + 'static) {
+pub fn spawn<T: Send + 'static>(
+    ctx: &egui::Context,
+    tx: &Sender<T>,
+    work: impl FnOnce() -> T + Send + 'static,
+) {
     let (ctx, tx) = (ctx.clone(), tx.clone());
     std::thread::spawn(move || {
         // A closed channel means the receiver (a pane or the app) is gone; drop the result.

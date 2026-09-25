@@ -91,12 +91,26 @@ impl App {
             // Keep the unreadable file for the user; never overwrite it.
             let backup = dirs.state().with_extension(format!("json.unreadable-{}", crate::util::unix_now()));
             let _ = std::fs::rename(dirs.state(), &backup);
-            toasts.push(Toast::error("Saved workspaces could not be restored", format!("{e}\nkept as {}", backup.display())), 0.0);
+            toasts.push(
+                Toast::error(
+                    "Saved workspaces could not be restored",
+                    format!("{e}\nkept as {}", backup.display()),
+                ),
+                0.0,
+            );
             AppState::default()
         });
         let notifications = Store::load(&dirs.notifications()).unwrap_or_default();
         let control = Control::start(&dirs, ctx)
-            .map_err(|e| toasts.push(Toast::error("Control socket unavailable; `amalgum` commands won't reach this window", e.to_string()), 0.0))
+            .map_err(|e| {
+                toasts.push(
+                    Toast::error(
+                        "Control socket unavailable; `amalgum` commands won't reach this window",
+                        e.to_string(),
+                    ),
+                    0.0,
+                )
+            })
             .ok();
         let (tx, rx) = channel();
         let mut app = Self {
@@ -254,7 +268,9 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Opened(Ok(opened)) => self.on_opened(ctx, opened),
-                Msg::Opened(Err(e)) => self.toast(Toast::error(e.lines().next().unwrap_or("Could not open"), e.clone())),
+                Msg::Opened(Err(e)) => {
+                    self.toast(Toast::error(e.lines().next().unwrap_or("Could not open"), e.clone()))
+                }
             }
         }
     }
@@ -315,7 +331,8 @@ impl eframe::App for App {
             self.dispatch(&ctx, action);
         }
         let info = self.status_info();
-        let status = egui::Panel::bottom("status").show(ui, |ui| chrome::status_bar(ui, &info, &self.colors)).inner;
+        let status =
+            egui::Panel::bottom("status").show(ui, |ui| chrome::status_bar(ui, &info, &self.colors)).inner;
         if let Some(action) = status {
             self.on_status_action(action);
         }
@@ -330,7 +347,12 @@ impl eframe::App for App {
                 self.on_sidebar(&ctx, action);
             }
         }
-        let git_open = self.state.active.as_deref().and_then(|id| self.state.workspace(id)).is_some_and(|w| w.git_pane_open);
+        let git_open = self
+            .state
+            .active
+            .as_deref()
+            .and_then(|id| self.state.workspace(id))
+            .is_some_and(|w| w.git_pane_open);
         if git_open {
             let (colors, settings) = (self.colors, self.settings.clone());
             let events = egui::Panel::right("git")
@@ -338,7 +360,10 @@ impl eframe::App for App {
                 .default_size(420.0)
                 .show(ui, |ui| {
                     let clicked = ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed());
-                    let events = self.active_live().and_then(|l| l.git.as_mut()).map(|g| g.show(ui, &colors, &settings, now));
+                    let events = self
+                        .active_live()
+                        .and_then(|l| l.git.as_mut())
+                        .map(|g| g.show(ui, &colors, &settings, now));
                     (clicked, events.unwrap_or_default())
                 })
                 .inner;
@@ -350,7 +375,9 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.state.workspaces().is_empty() {
                 let banner = false;
-                if let Some(action) = welcome::show(ui, &self.state.recents, banner, &self.keymap, &self.colors, now) {
+                if let Some(action) =
+                    welcome::show(ui, &self.state.recents, banner, &self.keymap, &self.colors, now)
+                {
                     self.on_welcome(&ctx, action);
                 }
             } else {
@@ -404,18 +431,22 @@ impl App {
     fn show_open_sheet(&mut self, ctx: &egui::Context, mut path: String) -> Option<String> {
         let mut result = Some(());
         let mut submit = false;
-        egui::Window::new("Open folder").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label("Folder or host:path");
-            let field = ui.add(egui::TextEdit::singleline(&mut path).desired_width(360.0));
-            field.request_focus();
-            submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    result = None;
-                }
-                submit |= ui.button("Open").clicked();
+        egui::Window::new("Open folder")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Folder or host:path");
+                let field = ui.add(egui::TextEdit::singleline(&mut path).desired_width(360.0));
+                field.request_focus();
+                submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        result = None;
+                    }
+                    submit |= ui.button("Open").clicked();
+                });
             });
-        });
         if submit && !path.trim().is_empty() {
             let loc = workspace::parse_user_location(path.trim());
             self.open(ctx, loc, None, None);
@@ -425,7 +456,8 @@ impl App {
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        let dropped: Vec<_> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for path in dropped.into_iter().filter(|p| p.is_dir()) {
             self.open(ctx, Location::Local { path }, None, None);
         }

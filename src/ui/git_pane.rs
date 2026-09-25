@@ -75,7 +75,13 @@ impl GitPane {
         todo!()
     }
     /// Draw the pane; returns requests for the app.
-    pub fn show(&mut self, ui: &mut egui::Ui, colors: &Colors, settings: &Settings, now: u64) -> Vec<GitEvent> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        colors: &Colors,
+        settings: &Settings,
+        now: u64,
+    ) -> Vec<GitEvent> {
         todo!()
     }
 }
