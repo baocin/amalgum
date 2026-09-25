@@ -78,29 +78,32 @@ pub fn show(
 
             ui.add_space(28.0);
 
+            // A fixed-width column, centred like the cards above.
+            let column = 640.0_f32.min(ui.available_width());
+            let pad = ((ui.available_width() - column) / 2.0).max(0.0);
             ui.horizontal(|ui| {
-                ui.set_width(640.0);
-                ui.label(egui::RichText::new("Recent locations").size(15.0).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !recents.is_empty() && ui.link("Clear").clicked() {
-                        action = Some(WelcomeAction::ClearRecents);
-                    }
-                });
-            });
-            ui.add_space(4.0);
-
-            if recents.is_empty() {
-                ui.colored_label(colors.get(Token::FgSecondary), "No recent locations yet.");
-            } else {
+                ui.add_space(pad);
                 ui.vertical(|ui| {
-                    ui.set_width(640.0);
+                    ui.set_width(column);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Recent locations").size(15.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !recents.is_empty() && ui.link("Clear").clicked() {
+                                action = Some(WelcomeAction::ClearRecents);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    if recents.is_empty() {
+                        ui.colored_label(colors.get(Token::FgSecondary), "No recent locations yet.");
+                    }
                     for (i, recent) in recents.iter().enumerate() {
                         if let Some(a) = recent_row(ui, i, recent, colors, now, &mut mem) {
                             action = Some(a);
                         }
                     }
                 });
-            }
+            });
 
             ui.add_space(20.0);
             ui.colored_label(

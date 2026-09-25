@@ -29,6 +29,8 @@ Spec: `docs/SPEC.md` (cited as §5.28). Built vs. planned: `docs/STATUS.md`. Har
   socket. That is why `ssh::Conn::control_path` uses a 16-hex-char name, not `%C`. Don't "simplify" it.
 - Tests that run git must use `testutil::TempRepo` / `hermetic_git`. Otherwise the developer's global config
   (signing, hooks, `init.defaultBranch`) leaks in and tests pass locally, fail in CI.
+- Running the app headless: `xvfb-run` plus `libxkbcommon-x11` (winit dlopens it; a missing one panics inside
+  `xkbcommon-dl`). wgpu has no adapter under Xvfb, so "falling back to OpenGL" on stderr is expected.
 - Cargo's `build.rs` embeds remote CLIs only when `AMALGUM_EMBED_CLI_DIR` is set (release). Locally
   `ssh::embedded_cli` returns `None`; that is expected, not a bug.
 

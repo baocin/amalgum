@@ -368,7 +368,8 @@ impl eframe::App for App {
                 .default_size(420.0)
                 .show(ui, |ui| self.git_pane(ui, now));
         }
-        egui::CentralPanel::no_frame().show(ui, |ui| {
+        let base = egui::Frame::new().fill(self.colors.get(crate::model::theme::Token::BgBase));
+        egui::CentralPanel::no_frame().frame(base).show(ui, |ui| {
             if maximized {
                 self.git_pane(ui, now);
             } else if self.state.workspaces().is_empty() {
