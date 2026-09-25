@@ -1190,7 +1190,7 @@ mod tests {
     #[test]
     fn word_diff_pure_addition() {
         let (old, new) = word_diff("hello", "hello world");
-        assert_eq!(old, vec![]);
+        assert!(old.is_empty());
         assert_eq!(&"hello world"[new[0].clone()], " world");
     }
 
