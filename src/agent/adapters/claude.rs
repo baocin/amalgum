@@ -66,7 +66,7 @@ pub fn state(text: &str, command: &str) -> HookState {
 }
 
 pub fn resume(session_id: &str) -> String {
-    format!("claude --resume {}", super::quote_word(session_id))
+    format!("claude --resume {}", crate::ssh::quote(session_id))
 }
 
 #[cfg(test)]

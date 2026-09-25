@@ -65,7 +65,7 @@ pub fn state(text: &str, command: &str) -> HookState {
 }
 
 pub fn resume(session_id: &str) -> String {
-    format!("codex resume {}", super::quote_word(session_id))
+    format!("codex resume {}", crate::ssh::quote(session_id))
 }
 
 /// Build the marker-delimited block: `notify = [...]` as a TOML array of strings, one per argv
@@ -110,7 +110,7 @@ fn has_conflicting_notify(text: &str) -> bool {
 }
 
 /// Split a command string produced by [`super::hook_command`] into argv, undoing the POSIX
-/// single-quoting [`super::quote_word`] applies. Not a general shell parser — only handles our
+/// single-quoting [`crate::ssh::quote`] applies. Not a general shell parser — only handles our
 /// own output: a run of bare words, and/or one word wrapped in `'...'` with embedded `'`
 /// escaped as `'\''`.
 fn argv(command: &str) -> Vec<String> {

@@ -101,15 +101,9 @@ pub fn resume_line(agent: AgentKind, session_id: &str, original_argv: &[String])
     let mut line = crate::agent::adapters::resume_command(agent, session_id);
     for flag in resume_flags(original_argv) {
         line.push(' ');
-        line.push_str(&shell_quote_if_needed(&flag));
+        line.push_str(&crate::ssh::quote(&flag));
     }
     line
-}
-
-/// Shell-quote `s` when it contains anything outside `[A-Za-z0-9_=./:-]`.
-fn shell_quote_if_needed(s: &str) -> String {
-    let plain = s.chars().all(|c| c.is_ascii_alphanumeric() || "_=./:-".contains(c));
-    if plain { s.to_string() } else { format!("'{}'", s.replace('\'', r"'\''")) }
 }
 
 #[cfg(test)]
@@ -336,17 +330,16 @@ mod tests {
         assert_eq!(resume_flags(&argv), vec!["--resume".to_string()]);
     }
 
-    // -- shell_quote_if_needed ------------------------------------------------------------
-
     #[test]
-    fn shell_quote_leaves_safe_characters_unquoted() {
-        assert_eq!(shell_quote_if_needed("--model=opus"), "--model=opus");
-        assert_eq!(shell_quote_if_needed("--path=/a/b-c_d.e:f"), "--path=/a/b-c_d.e:f");
-    }
-
-    #[test]
-    fn shell_quote_wraps_and_escapes_unsafe_characters() {
-        assert_eq!(shell_quote_if_needed("--msg=hello world"), "'--msg=hello world'");
-        assert_eq!(shell_quote_if_needed("--msg=it's"), r"'--msg=it'\''s'");
+    fn resume_line_is_the_agents_command_plus_quoted_long_flags() {
+        let argv: Vec<String> =
+            ["claude", "--dangerously-skip-permissions", "--msg=hello world", "fix the bug", "-v"]
+                .map(String::from)
+                .into();
+        assert_eq!(
+            resume_line(AgentKind::Claude, "7f3a", &argv),
+            "claude --resume 7f3a --dangerously-skip-permissions '--msg=hello world'"
+        );
+        assert_eq!(resume_line(AgentKind::Codex, "id with space", &[]), "codex resume 'id with space'");
     }
 }

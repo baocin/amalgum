@@ -60,7 +60,7 @@ pub fn state(text: &str, command: &str) -> HookState {
 }
 
 pub fn resume(session_id: &str) -> String {
-    format!("gemini --resume {}", super::quote_word(session_id))
+    format!("gemini --resume {}", crate::ssh::quote(session_id))
 }
 
 #[cfg(test)]

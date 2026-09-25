@@ -93,7 +93,7 @@ pub fn adapt(agent: AgentKind, raw: &serde_json::Value) -> Option<AgentEvent> {
 /// The command each hook runs: `<exe> agent-event --agent <name> --hook-version <N>`.
 /// `exe` is shell-quoted if it contains anything but `[A-Za-z0-9_./~-]`.
 pub fn hook_command(exe: &str, agent: AgentKind) -> String {
-    format!("{} agent-event --agent {} --hook-version {}", quote_word(exe), agent.name(), HOOK_VERSION)
+    format!("{} agent-event --agent {} --hook-version {}", crate::ssh::quote(exe), agent.name(), HOOK_VERSION)
 }
 
 /// Install or update our hook block for `agent` under `home`.
@@ -380,27 +380,6 @@ fn u32_field(v: &serde_json::Value, key: &str) -> Option<u32> {
     v.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
-/// POSIX single-quote a shell word unless it's already bare-safe. Safe words match
-/// `[A-Za-z0-9_./~-]+` (the `+` means the empty string always gets quoted, as `''`).
-fn quote_word(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'~' | b'-'));
-    if safe {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,21 +405,6 @@ mod tests {
         assert!(!kind(AgentKind::Claude, EventKind::SessionStart, Status::Running).notifies());
         assert!(!kind(AgentKind::Claude, EventKind::Stop, Status::Idle).notifies());
         assert!(!kind(AgentKind::Claude, EventKind::SessionEnd, Status::None).notifies());
-    }
-
-    #[test]
-    fn quote_word_leaves_safe_words_bare() {
-        let safe_words = ["claude", "/usr/local/bin/amalgum", "~/bin/amalgum", "a_b.c-9", "~"]; // portability: allow
-        for w in safe_words {
-            assert_eq!(quote_word(w), w);
-        }
-    }
-
-    #[test]
-    fn quote_word_quotes_unsafe_words() {
-        assert_eq!(quote_word("has space"), "'has space'");
-        assert_eq!(quote_word(""), "''");
-        assert_eq!(quote_word("it's"), "'it'\\''s'");
     }
 
     #[test]
