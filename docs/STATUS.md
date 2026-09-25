@@ -43,17 +43,31 @@ What exists today, mapped to docs/SPEC.md. Update this file in the same PR as th
 
 ## App (`src/ui/`)
 
+Verified by screenshot under Xvfb on Linux (`AMALGUM_SCREENSHOT`); macOS is built and linkage-checked
+in CI but has not been looked at on a real display.
+
 | Spec | Status | Note |
 |---|---|---|
-| §3 layout: menu bar, sidebar, git pane, surface, status bar | 🟡 | composed in `ui/app.rs`; components below |
-| §5.1 welcome screen | see below | |
-| §5.2 open folder / drop folder / `amalgum <path>` | 🟡 | path sheet + drag-and-drop; native folder picker ⬜ |
-| §5.3 clone, §5.28 SSH workspaces | ⬜ | next milestone; argv builders and parsers exist |
-| §5.27 terminal | see below | |
-| §5.4–5.21 git pane | see below | |
-| §5.29 agent status, notifications, OS notifications | 🟡 | hooks, OSC, and shell integration feed the status; the process heuristic (source 4) ⬜ |
-| §5.30 hibernation | ⬜ | |
-| §5.23 settings window | ⬜ | `settings.toml` is read; edit it by hand for now |
+| §3 layout: menu bar, sidebar, git pane, workspace surface, status bar | ✅ | `ui/app.rs`; below-1100 px overlay sheet ⬜ |
+| §4 theme: tokens, System/Light/Dark, `Mod+Alt+D`; bundled Inter + JetBrains Mono | ✅ | UI scale and system accent ⬜ |
+| §5.1 welcome screen, recents, missing-path handling | ✅ | first-launch hooks banner shows a hint, not the installer |
+| §5.2 open folder: `amalgum <path>`, drag-and-drop, path sheet, single-instance forwarding | ✅ | native folder picker ⬜; non-repo "Initialize?" ⬜ |
+| §5.3 clone, §5.28 SSH workspaces | ⬜ | next milestone; `ssh` argv builders, quoting, parsers exist |
+| §5.4 graph: streamed log, lanes, chips, working-tree row, selection | ✅ | context menu, focus mode, collapse, drag-and-drop ⬜ |
+| §5.5–5.6 details and diff (word-level) | 🟡 | unified only; split view, images, blame ⬜ |
+| §5.7 Changes: stage/unstage, per-hunk stage/unstage/discard, commit, amend | ✅ | line-range selection, sign-off, commit-and-push ⬜ |
+| §5.8 search, §5.10 fetch/pull/push, §5.11–5.16 tags/stashes/compare/rebase UI | ⬜ | parsers and journal exist |
+| §5.9 checkout (Refs double-click, palette) with undo | ✅ | create/rename/delete branch ⬜ |
+| §5.18 undo/redo (`Mod+Z` in the git pane) | ✅ | undo panel ⬜ |
+| §5.19 command palette (actions, workspaces, branches, recents) | ✅ | commits/stashes/worktrees groups ⬜ |
+| §5.22 workspaces: create, switch (`Mod+1..9`), close, reorder, rename, restore on launch | ✅ | new-worktree sheet (W15) ⬜ |
+| §5.24 toasts + details, notification panel | ✅ | log file ⬜ |
+| §5.27 terminal: PTY, VT, tabs, splits, focus movement, zoom, copy/paste, OSC events, ports | ✅ | search, links, scrollback persistence ⬜ |
+| §5.29 agent status from hooks, OSC 9/99/777/BEL, OSC 133; OS notifications | ✅ | process heuristic (source 4) ⬜ |
+| §5.30 hibernation | ⬜ | rules exist in `agent::hibernate` |
+| §5.23 settings window | ⬜ | Settings opens `settings.toml` in the default editor |
+| §5.31 control socket in the app (notify, set-status, agent-event, open, run, focus, list) | ✅ | resume/hibernate answer "not available" |
+| §8 accessibility beyond egui's AccessKit defaults | ⬜ | |
 
 ## Decisions that need a human
 
