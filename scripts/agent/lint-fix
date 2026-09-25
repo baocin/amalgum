@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Apply every automatic fix the gate can suggest: rustfmt, then clippy --fix for both builds.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+cargo fmt
+cargo clippy --fix --allow-dirty --allow-staged --all-targets --no-default-features -q
+cargo clippy --fix --allow-dirty --allow-staged --all-targets -q
+cargo fmt
+echo "✓ lint-fix done — re-run scripts/agent/verify"

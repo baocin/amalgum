@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Linux tarball (binary + .desktop + README) from an app binary (SPEC §9, preview until Linux
+# ships). With APPIMAGETOOL pointing at appimagetool, also builds an AppImage.
+#   scripts/package-linux <version> <binary> <arch>
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+version="${1:?version}"; bin="${2:?binary}"; arch="${3:?arch, e.g. x86_64}"
+name="amalgum-$version-linux-$arch"; stage="dist/$name"
+rm -rf "$stage"; mkdir -p "$stage"
+install -m 0755 "$bin" "$stage/amalgum"
+cp packaging/linux/amalgum.desktop README.md "$stage/"
+tar -C dist -czf "dist/$name.tar.gz" "$name"
+echo "dist/$name.tar.gz"
+
+if [ -n "${APPIMAGETOOL:-}" ]; then
+  appdir="dist/Amalgum.AppDir"; rm -rf "$appdir"; mkdir -p "$appdir/usr/bin"
+  install -m 0755 "$bin" "$appdir/usr/bin/amalgum"
+  cp packaging/linux/amalgum.desktop "$appdir/"
+  cp packaging/linux/amalgum.png "$appdir/amalgum.png"
+  ln -sf usr/bin/amalgum "$appdir/AppRun"
+  ARCH="$arch" "$APPIMAGETOOL" --no-appstream "$appdir" "dist/Amalgum-$version-$arch.AppImage" >&2
+  echo "dist/Amalgum-$version-$arch.AppImage"
+fi

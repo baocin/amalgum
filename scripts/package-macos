@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Universal Amalgum.app and .dmg from per-arch app binaries (SPEC §9).
+#   scripts/package-macos <version> <aarch64 binary> <x86_64 binary>
+# Signing: with MACOS_SIGN_IDENTITY set (a Developer ID in the keychain) the app is signed with
+# the hardened runtime; otherwise ad-hoc. Notarization runs when APPLE_ID, APPLE_TEAM_ID, and
+# APPLE_APP_PASSWORD are all set. Output: dist/Amalgum-<version>-macos-universal.dmg
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+version="${1:?version}"; arm="${2:?aarch64 binary}"; x86="${3:?x86_64 binary}"
+app="dist/Amalgum.app"; dmg="dist/Amalgum-$version-macos-universal.dmg"
+rm -rf "$app" "$dmg"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+lipo -create -output "$app/Contents/MacOS/amalgum" "$arm" "$x86"
+lipo -info "$app/Contents/MacOS/amalgum"
+sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+[ -f packaging/macos/Amalgum.icns ] && cp packaging/macos/Amalgum.icns "$app/Contents/Resources/"
+
+if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp --entitlements packaging/macos/entitlements.plist \
+    --sign "$MACOS_SIGN_IDENTITY" "$app"
+else
+  codesign --force --sign - "$app"   # ad-hoc: runs locally, Gatekeeper will warn when downloaded
+fi
+codesign --verify --strict "$app"
+
+hdiutil create -volname Amalgum -srcfolder "$app" -ov -format UDZO "$dmg" >/dev/null
+if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+  xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+    --password "$APPLE_APP_PASSWORD" --wait
+  xcrun stapler staple "$dmg"
+fi
+echo "$dmg"

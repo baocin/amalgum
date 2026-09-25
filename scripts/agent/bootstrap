@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Clean checkout → green gate, in one command. Idempotent; safe to re-run.
+# Offline by default: the network is used once, to prime the cargo cache.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+step() { printf '▸ %s\n' "$1"; }
+die()  { printf '✗ %s\n' "$1" >&2; exit 1; }
+
+command -v git >/dev/null || die "git not found — install git (Amalgum shells out to it at runtime too)"
+command -v rustup >/dev/null || die "rustup not found — install it from https://rustup.rs, then re-run"
+
+step "toolchain (pinned in rust-toolchain.toml)"
+rustup show active-toolchain >/dev/null || die "could not install the pinned toolchain"
+echo "  $(rustc --version)"
+
+if [ "$(uname -s)" = Linux ]; then
+  step "optional: musl target for the static CLI (scripts/build cli)"
+  rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 && echo "  ✓ x86_64-unknown-linux-musl" \
+    || echo "  – skipped (offline?) — only needed for release CLI builds"
+fi
+
+step "git hooks → scripts/git-hooks (pre-commit runs the gate)"
+git config core.hooksPath scripts/git-hooks
+
+step "dependencies"
+if cargo test --locked --offline --no-run -q >/dev/null 2>&1; then
+  echo "  ✓ offline build works — cache is warm"
+else
+  echo "  priming the cargo cache once (online)…"
+  cargo fetch --locked || die "cargo fetch failed — check network access to crates.io"
+fi
+
+step "gate"
+VERIFY_FULL=1 scripts/agent/verify

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Enforce SPEC §1 runtime-link rules on a built binary.
+#   scripts/check-linkage <binary> app|cli
+# Linux app: only libc/libm/libgcc_s/loader, libxkbcommon, libwayland*/libX11*/libxcb*,
+#            libvulkan, libGL*/libEGL (most are dlopen'ed and will not appear at all).
+# Linux cli: fully static (no dynamic section). macOS: system frameworks + libSystem only.
+# The CLI must also stay under 2 MiB (SPEC §5.31).
+set -euo pipefail
+bin="${1:?usage: scripts/check-linkage <binary> app|cli}"; kind="${2:?app|cli}"
+[ -f "$bin" ] || { echo "✗ no such binary: $bin" >&2; exit 1; }
+fail() { echo "✗ $*" >&2; exit 1; }
+
+case "$(uname -s)" in
+  Linux)
+    needed="$(readelf -d "$bin" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+    if [ "$kind" = cli ]; then
+      [ -z "$needed" ] || fail "CLI must be fully static but links: $needed"
+      readelf -l "$bin" | grep -q 'INTERP' && fail "CLI has a program interpreter (not static)"
+    else
+      bad="$(printf '%s\n' "$needed" | grep -vE '^(libc\.so|libm\.so|libgcc_s\.so|libdl\.so|libpthread\.so|librt\.so|ld-linux[-a-z0-9_]*\.so|libxkbcommon[-a-z0-9]*\.so|libwayland-[a-z]+\.so|libX11[-a-z0-9]*\.so|libxcb[-a-z0-9]*\.so|libvulkan\.so|libGL[A-Za-z]*\.so|libEGL\.so)' | grep . || true)"
+      [ -z "$bad" ] || fail "app links libraries outside the SPEC §1 allow-list: $bad"
+    fi
+    ;;
+  Darwin)
+    libs="$(otool -L "$bin" | tail -n +2 | awk '{print $1}')"
+    bad="$(printf '%s\n' "$libs" | grep -vE '^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libobjc\.A\.dylib|/usr/lib/libc\+\+\.1\.dylib|/usr/lib/libiconv\.2\.dylib|/usr/lib/libresolv\.9\.dylib|/System/Library/Frameworks/.*)$' | grep . || true)"
+    [ -z "$bad" ] || fail "binary links non-system libraries: $bad"
+    if [ "$kind" = cli ]; then
+      fw="$(printf '%s\n' "$libs" | grep -c '/System/Library/Frameworks/' || true)"
+      [ "$fw" = 0 ] || fail "CLI must not link frameworks (is the gui feature on?)"
+    fi
+    ;;
+  *) fail "unsupported OS" ;;
+esac
+
+if [ "$kind" = cli ]; then
+  size="$(wc -c < "$bin" | tr -d ' ')"
+  [ "$size" -lt 2097152 ] || fail "CLI is $size bytes; SPEC §5.31 requires under 2 MiB"
+  echo "✓ $bin: static CLI, $size bytes"
+else
+  echo "✓ $bin: links only allowed system libraries"
+fi

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# The gate as a git hook, so it holds in every tool (and with no agent at all).
+exec "$(git rev-parse --show-toplevel)/scripts/agent/verify"

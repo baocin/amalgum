@@ -1,0 +1,5 @@
+# Cross-link the static aarch64 Linux CLI from any host with the bundled rust-lld and Rust's
+# self-contained musl CRT, so no cross toolchain is needed (scripts/build cli aarch64-unknown-linux-musl).
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

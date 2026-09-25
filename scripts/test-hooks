@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Exercise the guardrail hook's block AND allow paths. Run by the gate when harness files change.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+hook=.claude/hooks/guard-bash.sh
+pass=0; failed=0
+expect() { # <block|allow> <command>
+  local want="$1" cmd="$2" got
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(printf '%s' "$cmd" | jq -Rs .)" | "$hook" 2>/dev/null
+  case $? in 2) got=block ;; 0) got=allow ;; *) got=error ;; esac
+  if [ "$got" = "$want" ]; then pass=$((pass + 1)); else failed=$((failed + 1)); echo "✗ expected $want, got $got: $cmd"; fi
+}
+
+expect block 'cargo publish'
+expect block 'gh release create v1.0.0'
+expect block 'git push origin main'
+expect block 'git push origin HEAD:main'
+expect block 'git push origin feature:refs/heads/master'
+expect block 'git push -u origin +main'
+expect block 'git push --force origin agent/x'
+expect block 'git push -f origin agent/x'
+expect block 'git push origin +agent/x'
+expect block 'git push origin v1.2.0'
+expect block 'git push --tags'
+expect block 'git commit --no-verify -m wip'
+expect block 'git commit -am wip -n'
+expect block 'git -c core.hooksPath=/dev/null commit -m x'
+expect block 'rm -rf /'
+expect block 'rm -rf ~'
+expect block 'rm -fr .git'
+expect block 'cargo run -- hooks setup'
+expect block './target/debug/amalgum hooks remove claude'
+expect block 'tmux -L amalgum kill-server'
+expect block 'echo {} > ~/.claude/settings.json'
+expect block 'cat ~/.ssh/id_ed25519'
+expect block 'security find-generic-password -s x'
+
+expect allow 'git push -u origin claude/bold-carson-is8dec'
+expect allow 'git push --force-with-lease origin agent/x'
+expect allow 'git push origin agent/maintenance-fix'
+expect allow 'git commit -m "note: -n flag docs"'
+expect allow 'cargo test --no-default-features'
+expect allow 'HOME=$(mktemp -d) cargo run -- hooks setup'
+expect allow 'rm -rf target/debug'
+expect allow 'git log --oneline main..HEAD'
+expect allow 'git config core.hooksPath scripts/git-hooks'
+expect allow 'tmux -L amalgum-test kill-server'
+expect allow 'cat src/main.rs'
+
+# Unparseable payloads fail closed (raw scan still blocks).
+printf 'not json git push origin main' | "$hook" 2>/dev/null; [ $? = 2 ] && pass=$((pass + 1)) || { failed=$((failed + 1)); echo "✗ raw payload not blocked"; }
+
+echo "guardrail tests: $pass passed, $failed failed"
+[ "$failed" = 0 ]

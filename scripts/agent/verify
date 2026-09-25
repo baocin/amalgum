@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# The gate. One command, one exit code; each failure line names its remedy.
+# Legs run cheapest-signal-first and are scoped to what changed vs the merge base with
+# $VERIFY_BASE (default origin/main). VERIFY_FULL=1 runs every leg; branch-level callers
+# (CI, /review-branch, handoff) must set it. Scope that cannot be determined runs everything.
+# Portable to macOS bash 3.2: no mapfile, no associative arrays.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+ok()   { printf '  ✓ %s (%ss)\n' "$1" "$(( SECONDS - T0 ))"; }
+skip() { printf '  – skipped: %s\n' "$1"; }
+fail() { printf '  ✗ %s\n' "$1" >&2; exit 1; }
+leg()  { T0=$SECONDS; }
+
+command -v cargo >/dev/null 2>&1 || fail "cargo not found — run scripts/agent/bootstrap"
+LOG="$(mktemp)"; trap 'rm -f "$LOG"' EXIT
+run() { # <failure message> <command…>: quiet on success, last 40 lines on failure
+  local msg="$1"; shift
+  "$@" >"$LOG" 2>&1 || { tail -40 "$LOG" >&2; fail "$msg"; }
+}
+
+# ---- scope --------------------------------------------------------------------------------
+FULL="${VERIFY_FULL:-0}"
+BASE="$(git merge-base HEAD "${VERIFY_BASE:-origin/main}" 2>/dev/null || true)"
+CHANGED="$( { [ -n "$BASE" ] && git diff --name-only "$BASE"...HEAD
+              git diff --name-only; git diff --cached --name-only
+              git ls-files --others --exclude-standard; } 2>/dev/null | sort -u)"
+if [ -z "$BASE" ] || [ -z "$CHANGED" ]; then FULL=1; fi
+
+RUST_RE='^(src/|tests/|build\.rs|Cargo\.(toml|lock)$|rust-toolchain\.toml$|clippy\.toml$|rustfmt\.toml$|assets/|\.cargo/)'
+HARNESS_RE='^(scripts/|\.github/|\.claude/|\.opencode/|packaging/)'
+rust=0; harness=0
+if [ "$FULL" = 1 ]; then rust=1; harness=1; echo "verify: full gate"
+else
+  printf '%s\n' "$CHANGED" | grep -Eq "$RUST_RE" && rust=1
+  printf '%s\n' "$CHANGED" | grep -Eq "$HARNESS_RE" && harness=1
+  echo "verify: scoped to $(printf '%s\n' "$CHANGED" | grep -c .) changed path(s) vs ${VERIFY_BASE:-origin/main}"
+fi
+
+# ---- always: cheap invariants ---------------------------------------------------------------
+leg; scripts/check-secrets || fail "secrets — remove the credential from the file (and from history if committed)"; ok "no secrets"
+
+# ---- rust legs ------------------------------------------------------------------------------
+if [ "$rust" = 1 ]; then
+  leg; run "headless build/tests (the CLI build: --no-default-features)" cargo test --locked --no-default-features
+  ok "headless build + tests"
+  leg; run "app build/tests (default features)" cargo test --locked
+  ok "app build + tests"
+  leg; cargo fmt --check >/dev/null 2>&1 || fail "format — run scripts/agent/lint-fix"; ok "format"
+  leg; run "clippy (headless) — fix the warnings above, or run scripts/agent/lint-fix" \
+    cargo clippy --locked --all-targets --no-default-features -- -D warnings
+  run "clippy (app) — fix the warnings above, or run scripts/agent/lint-fix" \
+    cargo clippy --locked --all-targets -- -D warnings
+  ok "clippy"
+  leg; scripts/check-portability || fail "portability — see docs/SPEC.md §1 and the add-platform-code skill"; ok "portability"
+else
+  skip "cargo legs — no Rust paths changed"
+fi
+
+# ---- harness legs ---------------------------------------------------------------------------
+if [ "$harness" = 1 ]; then
+  leg
+  for f in scripts/agent/* scripts/check-* scripts/build scripts/package-* scripts/git-hooks/* .claude/hooks/*.sh; do
+    [ -f "$f" ] || continue
+    bash -n "$f" || fail "shell syntax in $f"
+    [ -x "$f" ] || fail "$f is not executable — run: chmod +x $f"
+  done
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck -S warning scripts/agent/* scripts/check-* scripts/build scripts/package-* scripts/git-hooks/* .claude/hooks/*.sh \
+      || fail "shellcheck — fix the warnings above"
+  fi
+  scripts/test-hooks >/dev/null || fail "guardrail hook tests — run scripts/test-hooks to see which case broke"
+  ok "harness scripts + guardrail tests"
+else
+  skip "harness legs — no scripts/.github/.claude paths changed"
+fi
+
+echo "✓ verify passed"

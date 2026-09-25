@@ -1,0 +1,56 @@
+[package]
+name = "amalgum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A workspace shell for running coding agents in parallel, with git built in."
+repository = "https://github.com/baocin/amalgum"
+publish = false
+
+# One crate, one source, two builds (docs/SPEC.md §1, §9):
+#   cargo build --release                                   → the app (egui + terminal)
+#   cargo build --profile cli --no-default-features         → the headless CLI (static on musl)
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:alacritty_terminal", "dep:sysinfo", "dep:arboard", "dep:notify"]
+
+[dependencies]
+# Core + CLI: pure Rust only, so the musl CLI links fully static.
+anyhow = "1"
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+directories = "6"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "1", default-features = false, features = ["std", "parse", "display", "serde"] }
+
+# App only (feature "gui").
+alacritty_terminal = { version = "0.26", optional = true }
+arboard = { version = "3", optional = true, default-features = false }
+eframe = { version = "0.36", optional = true, default-features = false, features = ["accesskit", "default_fonts", "wayland", "x11", "wgpu", "glow"] }
+egui = { version = "0.36", optional = true }
+notify = { version = "8", optional = true }
+sysinfo = { version = "0.39", optional = true, default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# The remote CLI must stay under 2 MB (SPEC §5.31).
+[profile.cli]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"

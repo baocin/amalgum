@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Amalgum
+Comment=Workspace shell for coding agents, with git built in
+Exec=amalgum %f
+Icon=amalgum
+Terminal=false
+Categories=Development;TerminalEmulator;RevisionControl;
+StartupWMClass=amalgum

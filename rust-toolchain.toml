@@ -1,0 +1,5 @@
+# Pinned so local, agent, and CI builds use one compiler. Bump deliberately.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

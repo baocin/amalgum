@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Build one release binary and print its path. Used by CI, release, and humans alike so the
+# workflow YAML stays thin.
+#   scripts/build app [target]   the app (default features), profile release
+#   scripts/build cli [target]   the headless CLI (--no-default-features), profile cli, <2 MB
+# target defaults to the host. For Linux CLIs use *-unknown-linux-musl (fully static).
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+kind="${1:?usage: scripts/build app|cli [target]}"
+target="${2:-$(rustc -vV | sed -n 's/^host: //p')}"
+rustup target add "$target" >/dev/null 2>&1 || true
+case "$kind" in
+  app) profile=release; flags=() ;;
+  cli) profile=cli; flags=(--no-default-features) ;;
+  *) echo "unknown kind: $kind (app|cli)" >&2; exit 2 ;;
+esac
+cargo build --locked --profile "$profile" --target "$target" ${flags[@]+"${flags[@]}"} >&2
+echo "target/$target/$profile/amalgum"
