@@ -13,7 +13,12 @@ rm -rf "$app" "$dmg"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 lipo -create -output "$app/Contents/MacOS/amalgum" "$arm" "$x86"
 lipo -info "$app/Contents/MacOS/amalgum"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
-[ -f packaging/macos/Amalgum.icns ] && cp packaging/macos/Amalgum.icns "$app/Contents/Resources/"
+iconset="$(mktemp -d)/Amalgum.iconset"; mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" assets/icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  [ "$size" -le 256 ] && sips -z $((size * 2)) $((size * 2)) assets/icon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/Amalgum.icns"
 
 if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
   codesign --force --options runtime --timestamp --entitlements packaging/macos/entitlements.plist \
