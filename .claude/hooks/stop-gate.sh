@@ -13,14 +13,18 @@ root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$root" || exit 0
 command -v cargo >/dev/null 2>&1 || exit 0
 
-state="$( { git rev-parse HEAD 2>/dev/null; git diff HEAD --binary 2>/dev/null
-            # Print each untracked file's path before its bytes, so renaming or moving one
-            # (same content, e.g. between src/ and docs/) changes the state instead of hashing
-            # identically to before.
-            git ls-files -o --exclude-standard -z | while IFS= read -r -d '' f; do
-              printf '%s\n' "$f"
-              cat "$f" 2>/dev/null
-            done; } | cksum | cut -d' ' -f1)"
+# HEAD, tracked changes, and every untracked file: its path, then its bytes, so renaming or
+# moving an untracked file (same content, e.g. between src/ and docs/) changes the state.
+# (A function, not an inline $( ) block: bash 3.2 on macOS misparses comments inside $( ).)
+worktree_state() {
+  git rev-parse HEAD 2>/dev/null
+  git diff HEAD --binary 2>/dev/null
+  git ls-files -o --exclude-standard -z | while IFS= read -r -d '' f; do
+    printf '%s\n' "$f"
+    cat "$f" 2>/dev/null
+  done
+}
+state="$(worktree_state | cksum | cut -d' ' -f1)"
 stamp=".claude/.gate-stamp"
 [ -f "$stamp" ] && [ "$(sed -n 1p "$stamp")" = "green $state" ] && exit 0
 if printf '%s' "$input" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true' \

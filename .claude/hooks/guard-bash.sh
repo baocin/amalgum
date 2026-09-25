@@ -25,7 +25,8 @@ cmd="$(printf '%s\n' "$cmd" | awk '
 # Join `\`-newline line continuations into one line: has()/flag()/the segment regexes below all
 # match line by line, so `git push \` then `  origin main` on the next line must be scanned as
 # `git push   origin main`, not as two lines neither of which contains the whole statement.
-cmd="$(printf '%s\n' "$cmd" | sed -E ':a;/\\$/{N;s/\\\n/ /;ba}')"
+# (awk, not a sed label loop: BSD sed on macOS rejects `:a;…;ba` one-liners.)
+cmd="$(printf '%s\n' "$cmd" | awk '{ if (sub(/\\$/, "")) printf "%s ", $0; else print }')"
 
 block() { printf '%s\n' "$1" >&2; exit 2; }
 has() { printf '%s' "$cmd" | grep -Eq -- "$1"; }
