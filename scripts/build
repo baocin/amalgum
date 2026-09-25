@@ -15,4 +15,4 @@ case "$kind" in
   *) echo "unknown kind: $kind (app|cli)" >&2; exit 2 ;;
 esac
 cargo build --locked --profile "$profile" --target "$target" ${flags[@]+"${flags[@]}"} >&2
-echo "target/$target/$profile/amalgum"
+echo "target/$target/$profile/amalgum"  # the only stdout line: CI captures it

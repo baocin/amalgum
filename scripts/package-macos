@@ -3,9 +3,10 @@
 #   scripts/package-macos <version> <aarch64 binary> <x86_64 binary>
 # Signing: with MACOS_SIGN_IDENTITY set (a Developer ID in the keychain) the app is signed with
 # the hardened runtime; otherwise ad-hoc. Notarization runs when APPLE_ID, APPLE_TEAM_ID, and
-# APPLE_APP_PASSWORD are all set. Output: dist/Amalgum-<version>-macos-universal.dmg
+# APPLE_APP_PASSWORD are all set. Prints only the .dmg path on stdout (CI captures it); logs go to stderr.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+exec 3>&1 1>&2   # everything below logs to stderr; the result is written to fd 3
 version="${1:?version}"; arm="${2:?aarch64 binary}"; x86="${3:?x86_64 binary}"
 app="dist/Amalgum.app"; dmg="dist/Amalgum-$version-macos-universal.dmg"
 rm -rf "$app" "$dmg"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -34,4 +35,4 @@ if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PA
     --password "$APPLE_APP_PASSWORD" --wait
   xcrun stapler staple "$dmg"
 fi
-echo "$dmg"
+echo "$dmg" >&3
