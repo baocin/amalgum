@@ -40,6 +40,9 @@ pub const LOG_FORMAT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct
 /// `git log` argv for the graph: topo order, `-z`, full decorations, [`LOG_FORMAT`], plus
 /// `extra` (revision ranges, `--all`, `-n`, paths).
 ///
+/// `--all` never reaches the hidden `refs/amalgum/` backups of [`super::ops`] (§5.16 "hidden
+/// stash"): each `--all` is preceded by an `--exclude` for them.
+///
 /// `--no-show-signature` overrides a user's `log.showSignature=true`: without it, a signed
 /// commit makes git write the signature-verification program's output to stdout ahead of the
 /// record itself, which corrupts [`parse_record`]'s id. `--no-color` is the same defensive
@@ -54,7 +57,12 @@ pub fn log_args(extra: &[&str]) -> Vec<String> {
         "--no-color".to_string(),
         format!("--format={LOG_FORMAT}"),
     ];
-    args.extend(extra.iter().map(|s| s.to_string()));
+    for arg in extra {
+        if *arg == "--all" {
+            args.push(format!("--exclude={}*", super::ops::HIDDEN_REFS));
+        }
+        args.push(arg.to_string());
+    }
     args
 }
 
@@ -217,8 +225,8 @@ mod tests {
     #[test]
     fn log_args_appends_extra_after_format() {
         let args = log_args(&["--all", "-n", "500"]);
-        assert_eq!(args_to_str(&args)[7..], ["--all", "-n", "500"]);
-        assert_eq!(args.len(), 10);
+        assert_eq!(args_to_str(&args)[7..], ["--exclude=refs/amalgum/*", "--all", "-n", "500"]);
+        assert_eq!(args.len(), 11);
     }
 
     #[test]
@@ -457,6 +465,18 @@ mod tests {
         let first = commits.iter().find(|c| c.id == c1).expect("first commit");
         assert_eq!(first.refs, vec![Decoration::Branch("feature".to_string())]);
         assert!(first.parents.is_empty(), "root commit has no parents");
+    }
+
+    #[test]
+    fn all_skips_the_hidden_undo_backups() {
+        let mut repo = TempRepo::new();
+        let c1 = repo.commit_file("a.txt", "a", "first");
+        repo.write("a.txt", "dirty");
+        let saved = repo.git(&["stash", "create", "amalgum-undo-1"]);
+        repo.git(&["update-ref", "refs/amalgum/amalgum-undo-1", &saved]);
+        let out = repo.git_raw(&args_to_str(&log_args(&["--all"])));
+        let ids: Vec<String> = parse_log(&out).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![c1]);
     }
 
     #[test]

@@ -18,7 +18,11 @@ impl App {
     /// Intercept bound chords before any widget sees them. In a terminal, or while a text field
     /// has focus, only chords containing `Mod` are intercepted (§5.27 "Input mapping").
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.palette.is_some() || self.open_sheet.is_some() {
+        // A §5.20 confirmation (the only modal) owns the keyboard: `Esc`/`Mod+Enter` are its.
+        if self.palette.is_some()
+            || self.open_sheet.is_some()
+            || ctx.memory(|m| m.top_modal_layer().is_some())
+        {
             return;
         }
         let context = match self.focus {

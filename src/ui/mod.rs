@@ -8,6 +8,8 @@
 mod app;
 mod chrome;
 mod control;
+/// `pub`: the shared confirm / popover / progress kit that git-operation features build on.
+pub mod dialogs;
 mod fonts;
 mod git_pane;
 mod jobs;

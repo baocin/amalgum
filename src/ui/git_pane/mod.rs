@@ -66,6 +66,8 @@ pub enum GitEvent {
     SendToTerminal(String),
     /// The pane's summary changed (branch, counts, operation) — re-render sidebar/status bar.
     SummaryChanged,
+    /// The user ticked §5.20 **Don't ask again** and confirmed: persist it in `settings.toml`.
+    DontAskAgain(crate::model::confirm::ConfirmKind),
 }
 
 /// The graph's current selection.
@@ -212,12 +214,14 @@ impl GitPane {
         self.run_undo_redo(&ctx, false);
     }
 
-    /// Draw the pane; returns requests for the app.
+    /// Draw the pane; returns requests for the app. `preset` is the app keymap's, for dialog
+    /// chords and their labels.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         colors: &Colors,
         settings: &Settings,
+        preset: crate::model::keymap::Preset,
         now: u64,
     ) -> Vec<GitEvent> {
         self.ctx = ui.ctx().clone();
@@ -245,7 +249,7 @@ impl GitPane {
 
         match self.view {
             GitView::Graph => self.show_graph(ui, colors, settings, now, &mut events, &ctx),
-            GitView::Changes => self.show_changes(ui, colors, settings, now, &mut events, &ctx),
+            GitView::Changes => self.show_changes(ui, colors, settings, preset, &mut events, &ctx),
             GitView::Refs => self.show_refs(ui, colors, now, &mut events),
         }
 

@@ -53,6 +53,7 @@ enum Msg {
     Opened(Result<workspace::Opened, String>),
     /// Listening ports per workspace (`app/ports.rs`).
     Ports(HashMap<String, Vec<u16>>),
+    SettingsSaved(Result<(), String>),
 }
 
 pub struct App {
@@ -287,6 +288,10 @@ impl App {
             match msg {
                 Msg::Opened(Ok(opened)) => self.on_opened(ctx, opened),
                 Msg::Ports(found) => self.on_ports(found),
+                Msg::SettingsSaved(Ok(())) => {}
+                Msg::SettingsSaved(Err(e)) => {
+                    self.toast(Toast::error("Could not save \"Don't ask again\" to settings.toml", e))
+                }
                 Msg::Opened(Err(e)) => {
                     self.toast(Toast::error(e.lines().next().unwrap_or("Could not open"), e.clone()))
                 }
@@ -307,6 +312,21 @@ impl App {
         }
     }
 
+    /// §5.20 "Don't ask again": update the in-memory settings now; on a worker thread (§2
+    /// "Never block"), add just that key to the file as it is on disk — never the startup
+    /// snapshot. A failed write or an unparsable file becomes a toast.
+    fn dont_ask_again(&mut self, ctx: &egui::Context, kind: crate::model::confirm::ConfirmKind) {
+        /// Read-modify-write jobs run one at a time, so two quick saves never drop one.
+        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        if self.settings.set_dont_ask(kind) {
+            let path = self.dirs.settings();
+            super::jobs::spawn(ctx, &self.tx, move || {
+                let _guard = WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                Msg::SettingsSaved(Settings::persist_dont_ask(&path, kind))
+            });
+        }
+    }
+
     fn set_git_view(&mut self, view: crate::model::state::GitView) {
         if let Some(id) = self.state.active.clone() {
             if let Some(ws) = self.state.workspace_mut(&id) {
@@ -321,12 +341,13 @@ impl App {
         }
     }
 
-    fn on_git_events(&mut self, events: Vec<GitEvent>) {
+    fn on_git_events(&mut self, ctx: &egui::Context, events: Vec<GitEvent>) {
         for ev in events {
             match ev {
                 GitEvent::Toast(t) => self.toast(t),
                 GitEvent::SendToTerminal(text) => self.write_to_focused(text.into_bytes()),
                 GitEvent::SummaryChanged => {}
+                GitEvent::DontAskAgain(kind) => self.dont_ask_again(ctx, kind),
             }
         }
     }
@@ -416,10 +437,12 @@ impl App {
         if ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
             self.focus = Focus::Git;
         }
-        let (colors, settings) = (self.colors, self.settings.clone());
-        let events =
-            self.active_live().and_then(|l| l.git.as_mut()).map(|g| g.show(ui, &colors, &settings, now));
-        self.on_git_events(events.unwrap_or_default());
+        let (colors, settings, preset) = (self.colors, self.settings.clone(), self.keymap.preset);
+        let events = self
+            .active_live()
+            .and_then(|l| l.git.as_mut())
+            .map(|g| g.show(ui, &colors, &settings, preset, now));
+        self.on_git_events(ui.ctx(), events.unwrap_or_default());
     }
 
     fn overlays(&mut self, ctx: &egui::Context, now: u64) {

@@ -9,6 +9,7 @@
 //! journal 200, ControlPersist 10m, keepalive 20 s × 2, reconnect backoff cap 60 s, remote
 //! refresh 10 s, install hooks on remote hosts on, tmux on for new hosts.
 
+use super::confirm::ConfirmKind;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -63,6 +64,9 @@ pub struct General {
     pub skip_fetch_on_low_battery: bool,
     pub avatars: bool,
     pub absolute_timestamps: bool,
+    /// §5.20 **Don't ask again for this action**: `ConfirmKind::key` names. Unknown names and
+    /// kinds the spec never lets you silence are ignored (see [`Settings::should_confirm`]).
+    pub dont_ask_again: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,19 +161,24 @@ impl Settings {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let text = toml::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let dir = match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => {
-                std::fs::create_dir_all(dir)?;
-                dir
-            }
-            _ => Path::new("."),
+        write_atomic(path, &text)
+    }
+
+    /// §5.20 **Don't ask again**, persisted: re-reads `path` and adds `kind` to
+    /// `general.dont_ask_again`, leaving every other key as the file has it — so edits made
+    /// while the app runs survive, in-memory-only changes (font zoom) are not written, and
+    /// defaults stay implicit. A file that does not parse is never touched (`Err`, as in
+    /// [`Settings::load`]). Comments are not preserved (the `toml` crate drops them).
+    pub fn persist_dont_ask(path: &Path, kind: ConfirmKind) -> Result<(), String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.to_string()),
         };
-        let nanos =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let tmp_path = dir.join(format!(".settings-{}-{nanos}.tmp", std::process::id()));
-        std::fs::write(&tmp_path, text)?;
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        match with_dont_ask(&text, kind)? {
+            Some(text) => write_atomic(path, &text).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
     }
 
     /// Clamps or snaps out-of-range values to the nearest valid setting; applied by `load` so a
@@ -181,6 +190,22 @@ impl Settings {
             nearest_allowed(self.general.fetch_interval_min, &[0, 1, 2, 5, 10, 30]);
         self.terminal.scrollback = self.terminal.scrollback.min(100_000);
         self
+    }
+
+    /// Whether `kind` still shows its §5.20 confirmation. Only kinds that allow "don't ask
+    /// again" can be silenced, even by a hand-edited file.
+    pub fn should_confirm(&self, kind: ConfirmKind) -> bool {
+        !(kind.allows_dont_ask() && self.general.dont_ask_again.iter().any(|k| k == kind.key()))
+    }
+
+    /// Record "don't ask again" for `kind`. Returns whether anything changed (i.e. whether the
+    /// file needs saving); `false` for kinds the spec never lets you silence.
+    pub fn set_dont_ask(&mut self, kind: ConfirmKind) -> bool {
+        if !self.should_confirm(kind) || !kind.allows_dont_ask() {
+            return false;
+        }
+        self.general.dont_ask_again.push(kind.key().to_string());
+        true
     }
 
     /// Does a branch match `protected_branches` (exact or trailing `/*` glob)?
@@ -197,6 +222,49 @@ impl Settings {
             None => branch == pattern,
         })
     }
+}
+
+/// `settings.toml` text with `kind` added to `general.dont_ask_again`; `None` when it is
+/// already there or the spec never lets `kind` be silenced. Errors when `text` is not a valid
+/// settings file, so a broken file is never replaced.
+fn with_dont_ask(text: &str, kind: ConfirmKind) -> Result<Option<String>, String> {
+    if !kind.allows_dont_ask() {
+        return Ok(None);
+    }
+    toml::from_str::<Settings>(text).map_err(|e| e.to_string())?;
+    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let general = table
+        .entry("general")
+        .or_insert_with(|| toml::Table::new().into())
+        .as_table_mut()
+        .ok_or("[general] is not a table")?;
+    let list = general
+        .entry("dont_ask_again")
+        .or_insert_with(|| toml::value::Array::new().into())
+        .as_array_mut()
+        .ok_or("general.dont_ask_again is not a list")?;
+    if list.iter().any(|v| v.as_str() == Some(kind.key())) {
+        return Ok(None);
+    }
+    list.push(kind.key().into());
+    toml::to_string_pretty(&table).map(Some).map_err(|e| e.to_string())
+}
+
+/// Writes `text` to `path` atomically (temp file in the same directory, then rename), creating
+/// parent directories, so a crash or concurrent read never sees a partial file.
+fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            std::fs::create_dir_all(dir)?;
+            dir
+        }
+        _ => Path::new("."),
+    };
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let tmp_path = dir.join(format!(".settings-{}-{nanos}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, text)?;
+    std::fs::rename(&tmp_path, path)
 }
 
 /// Rounds `value` to the nearest multiple of `step` (ties round up).
@@ -250,6 +318,7 @@ impl Default for General {
             skip_fetch_on_low_battery: true,
             avatars: true,
             absolute_timestamps: false,
+            dont_ask_again: Vec::new(),
         }
     }
 }
@@ -550,6 +619,50 @@ mod tests {
         assert!(!s.is_protected("release"));
         assert!(!s.is_protected("release-1.2")); // not under the `/` prefix
         assert!(!s.is_protected("prerelease/1.2")); // prefix must match from the start
+    }
+
+    // -- persist_dont_ask (§5.20) -----------------------------------------------------------------
+
+    #[test]
+    fn persist_dont_ask_keeps_the_files_other_keys_and_writes_no_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        fs::write(&path, "[terminal]\nfont_size = 17.0\n").expect("write");
+
+        Settings::persist_dont_ask(&path, ConfirmKind::DiscardHunk).expect("persist");
+        Settings::persist_dont_ask(&path, ConfirmKind::DropStash).expect("persist");
+        Settings::persist_dont_ask(&path, ConfirmKind::DiscardHunk).expect("idempotent");
+
+        let loaded = Settings::load(&path).expect("load");
+        assert_eq!(loaded.terminal.font_size, 17.0, "an edit made while the app ran survives");
+        assert_eq!(loaded.general.dont_ask_again, ["discard-hunk", "drop-stash"]);
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("scrollback"), "defaults stay implicit:\n{text}");
+    }
+
+    #[test]
+    fn persist_dont_ask_creates_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        Settings::persist_dont_ask(&path, ConfirmKind::ResetSoft).expect("persist");
+        assert!(!Settings::load(&path).expect("load").should_confirm(ConfirmKind::ResetSoft));
+    }
+
+    #[test]
+    fn persist_dont_ask_never_touches_a_broken_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        fs::write(&path, "[terminal\nfont_size = ").expect("write");
+        assert!(Settings::persist_dont_ask(&path, ConfirmKind::DiscardHunk).is_err());
+        assert_eq!(fs::read_to_string(&path).expect("read"), "[terminal\nfont_size = ");
+    }
+
+    #[test]
+    fn persist_dont_ask_ignores_kinds_that_always_confirm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        Settings::persist_dont_ask(&path, ConfirmKind::DiscardChanges).expect("no-op");
+        assert!(!path.exists());
     }
 
     // -- RepoOverrides ----------------------------------------------------------------------------

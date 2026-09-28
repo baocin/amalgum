@@ -4,13 +4,16 @@
 use super::worker;
 use super::{GitEvent, GitPane};
 use crate::git::cmd::GitError;
-use crate::git::diff::{self, FileDiff, Selection as HunkSelection};
+use crate::git::diff::{self, FileDiff, Hunk, LineKind, Selection as HunkSelection};
 use crate::git::log::{message_args, split_message};
 use crate::git::message::{self, SubjectLen};
 use crate::git::status::{Entry, EntryKind, Status};
+use crate::model::confirm::{Confirm, ConfirmKind, Decision};
+use crate::model::keymap::Preset;
 use crate::model::settings::Settings;
 use crate::model::theme::Token;
 use crate::ui::chrome::Toast;
+use crate::ui::dialogs;
 use crate::ui::theme::Colors;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,10 +23,13 @@ pub(super) enum Side {
     Conflict,
 }
 
+/// A **Discard hunk** waiting on its §5.20 confirmation. Keeps the diff the user saw, so a
+/// refresh while the dialog is open (an agent editing the file) never retargets the discard.
 #[derive(Debug, Clone)]
 pub(super) struct PendingDiscard {
-    pub path: String,
+    pub file: FileDiff,
     pub hunk: usize,
+    pub confirm: Confirm,
 }
 
 #[derive(Default)]
@@ -59,12 +65,22 @@ pub(super) fn split_status(status: &Status) -> (Vec<&Entry>, Vec<&Entry>, Vec<&E
     (conflicts, unstaged, staged)
 }
 
-/// Title and body for the "Discard hunk" confirmation (§5.20).
-pub(super) fn discard_confirm_text(path: &str) -> (String, String) {
-    (
-        format!("Discard changes to `{path}`?"),
-        "This hunk's changes will be lost. This cannot be undone.".to_string(),
-    )
+/// The §5.20 confirmation for **Discard hunk** of `file`: names the file and lists the added
+/// lines — the only ones lost; removed lines come back.
+///
+/// A new file's (untracked or intent-to-add) hunk is its whole content, and `git apply -R` of
+/// it deletes the file: that is §5.20 "discard changes", which always asks and says so.
+pub(super) fn discard_hunk_confirm(path: &str, file: &FileDiff, hunk: &Hunk) -> Confirm {
+    let added = hunk.lines.iter().filter(|l| l.kind == LineKind::Add).map(|l| format!("+{}", l.display()));
+    if file.old_path.is_none() {
+        return Confirm::new(ConfirmKind::DiscardChanges, format!("Delete new file `{path}`?"))
+            .verb("Delete")
+            .detail("Discarding this hunk deletes the file. It is not staged or committed anywhere; its contents will be lost:")
+            .lost(added);
+    }
+    Confirm::new(ConfirmKind::DiscardHunk, format!("Discard hunk in `{path}`?"))
+        .detail("These added lines are not staged or committed anywhere and will be lost:")
+        .lost(added)
 }
 
 enum ChangesAction {
@@ -78,7 +94,9 @@ enum ChangesAction {
     StageHunk(usize),
     UnstageHunk(usize),
     RequestDiscardHunk(String, usize),
-    ConfirmDiscard,
+    ConfirmDiscard {
+        dont_ask: bool,
+    },
     CancelDiscard,
     Commit,
 }
@@ -88,8 +106,8 @@ impl GitPane {
         &mut self,
         ui: &mut egui::Ui,
         colors: &Colors,
-        _settings: &Settings,
-        _now: u64,
+        settings: &Settings,
+        preset: Preset,
         events: &mut Vec<GitEvent>,
         ctx: &egui::Context,
     ) {
@@ -216,7 +234,6 @@ impl GitPane {
         ui.separator();
         let diff = self.changes.diff.clone();
         let diff_loading = self.changes.diff_loading;
-        let pending = self.changes.pending_discard.clone();
         if diff_loading {
             ui.weak("Loading diff…");
         } else if let Some((side, path)) = &selected {
@@ -233,30 +250,18 @@ impl GitPane {
             }
         }
 
-        if let Some(p) = &pending {
-            let (title, body) = discard_confirm_text(&p.path);
-            let modal = egui::Modal::new(egui::Id::new("gitpane_discard_hunk")).show(ui.ctx(), |ui| {
-                ui.label(egui::RichText::new(title).strong());
-                ui.label(body);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        action = Some(ChangesAction::CancelDiscard);
-                    }
-                    if ui
-                        .button(egui::RichText::new("Discard").color(colors.get(Token::FgOnAccent)))
-                        .clicked()
-                    {
-                        action = Some(ChangesAction::ConfirmDiscard);
-                    }
-                });
-            });
-            if modal.backdrop_response.clicked() {
-                action = Some(ChangesAction::CancelDiscard);
+        if let Some(p) = &mut self.changes.pending_discard {
+            match dialogs::confirm_dialog(ui.ctx(), colors, preset, &mut p.confirm) {
+                Some(Decision::Confirm) => {
+                    action = Some(ChangesAction::ConfirmDiscard { dont_ask: p.confirm.remember() })
+                }
+                Some(Decision::Cancel) => action = Some(ChangesAction::CancelDiscard),
+                None => {}
             }
         }
 
         if let Some(action) = action {
-            self.apply_changes_action(ctx, action, events);
+            self.apply_changes_action(ctx, action, settings, events);
         }
     }
 
@@ -264,6 +269,7 @@ impl GitPane {
         &mut self,
         ctx: &egui::Context,
         action: ChangesAction,
+        settings: &Settings,
         events: &mut Vec<GitEvent>,
     ) {
         match action {
@@ -280,14 +286,24 @@ impl GitPane {
                 self.dispatch_stage_paths(ctx, paths, false);
             }
             ChangesAction::SelectFile(side, path) => self.dispatch_changes_diff(ctx, side, path),
-            ChangesAction::StageHunk(idx) => self.dispatch_hunk(ctx, idx, HunkOp::Stage),
-            ChangesAction::UnstageHunk(idx) => self.dispatch_hunk(ctx, idx, HunkOp::Unstage),
+            ChangesAction::StageHunk(idx) => self.dispatch_hunk(ctx, None, idx, HunkOp::Stage),
+            ChangesAction::UnstageHunk(idx) => self.dispatch_hunk(ctx, None, idx, HunkOp::Unstage),
             ChangesAction::RequestDiscardHunk(path, idx) => {
-                self.changes.pending_discard = Some(PendingDiscard { path, hunk: idx });
+                let Some(file) = self.changes.diff.first().cloned() else { return };
+                let Some(hunk) = file.hunks.get(idx) else { return };
+                let confirm = discard_hunk_confirm(&path, &file, hunk);
+                if settings.should_confirm(confirm.kind) {
+                    self.changes.pending_discard = Some(PendingDiscard { file, hunk: idx, confirm });
+                } else {
+                    self.dispatch_hunk(ctx, Some(file), idx, HunkOp::Discard);
+                }
             }
-            ChangesAction::ConfirmDiscard => {
-                if let Some(p) = self.changes.pending_discard.clone() {
-                    self.dispatch_hunk(ctx, p.hunk, HunkOp::Discard);
+            ChangesAction::ConfirmDiscard { dont_ask } => {
+                if let Some(p) = self.changes.pending_discard.take() {
+                    if dont_ask {
+                        events.push(GitEvent::DontAskAgain(p.confirm.kind));
+                    }
+                    self.dispatch_hunk(ctx, Some(p.file), p.hunk, HunkOp::Discard);
                 }
             }
             ChangesAction::CancelDiscard => self.changes.pending_discard = None,
@@ -347,8 +363,9 @@ impl GitPane {
         });
     }
 
-    fn dispatch_hunk(&mut self, ctx: &egui::Context, hunk_idx: usize, op: HunkOp) {
-        let Some(file) = self.changes.diff.first().cloned() else { return };
+    /// Apply one hunk of `file` (default: the diff on screen) to the index or the worktree.
+    fn dispatch_hunk(&mut self, ctx: &egui::Context, file: Option<FileDiff>, hunk_idx: usize, op: HunkOp) {
+        let Some(file) = file.or_else(|| self.changes.diff.first().cloned()) else { return };
         let reverse = op != HunkOp::Stage;
         let Some(patch) = diff::patch_for(&file, hunk_idx, &HunkSelection::WholeHunk, reverse) else {
             return;
@@ -412,7 +429,6 @@ impl GitPane {
     ) {
         match result {
             Ok(()) => {
-                self.changes.pending_discard = None;
                 let reselect = self.changes.selected.clone();
                 self.refresh_now(ctx);
                 if let Some((side, path)) = reselect {
@@ -631,13 +647,45 @@ mod tests {
         assert!(c.is_empty() && u.is_empty() && s.is_empty());
     }
 
-    // ---- discard_confirm_text ---------------------------------------------------------------
+    // ---- discard_hunk_confirm (§5.20) --------------------------------------------------------
 
     #[test]
-    fn discard_confirm_text_names_the_file() {
-        let (title, body) = discard_confirm_text("src/main.rs");
-        assert_eq!(title, "Discard changes to `src/main.rs`?");
-        assert!(body.contains("cannot be undone"));
+    fn discard_hunk_confirm_names_the_file_and_lists_changed_lines() {
+        use crate::testutil::TempRepo;
+        let mut repo = TempRepo::new();
+        repo.commit_file("a.txt", "one\ntwo\nthree\n", "init");
+        repo.write("a.txt", "one\nTWO\nthree\n");
+        let mut args = vec!["diff"];
+        args.extend_from_slice(diff::DIFF_ARGS);
+        let files = diff::parse(&repo.git_raw(&args));
+
+        let c = discard_hunk_confirm("a.txt", &files[0], &files[0].hunks[0]);
+        assert_eq!(c.kind, ConfirmKind::DiscardHunk);
+        assert_eq!(c.title, "Discard hunk in `a.txt`?");
+        assert_eq!(c.verb, "Discard");
+        assert_eq!(c.lost, ["+TWO"], "removed lines are restored and context is untouched");
+    }
+
+    #[test]
+    fn discarding_an_untracked_files_hunk_is_a_delete_that_always_asks() {
+        use crate::testutil::TempRepo;
+        let mut repo = TempRepo::new();
+        repo.commit_file("a.txt", "a\n", "init");
+        repo.write("notes.txt", "hello\nworld\n");
+        // The diff the Changes view shows for an untracked file (`dispatch_changes_diff`).
+        let git = crate::git::Git::new(crate::git::Location::Local { path: repo.path().to_path_buf() });
+        let files = diff::parse(&worker::diff_no_index(&git, "notes.txt").expect("diff"));
+
+        let c = discard_hunk_confirm("notes.txt", &files[0], &files[0].hunks[0]);
+        assert_eq!(c.kind, ConfirmKind::DiscardChanges);
+        assert!(!c.kind.allows_dont_ask(), "§5.20: no \"don't ask again\" for discard changes");
+        assert_eq!(c.title, "Delete new file `notes.txt`?");
+        assert_eq!(c.verb, "Delete");
+        assert_eq!(c.lost, ["+hello", "+world"]);
+
+        let mut silenced = Settings::default();
+        silenced.set_dont_ask(ConfirmKind::DiscardHunk);
+        assert!(silenced.should_confirm(c.kind), "silencing hunk discards never silences a delete");
     }
 
     // ---- entry_label --------------------------------------------------------------------------

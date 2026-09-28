@@ -46,6 +46,17 @@ pub struct Entry {
     pub undone: bool,
 }
 
+impl Entry {
+    /// What a guard snapshot for this entry must read: every ref either side recorded (sorted,
+    /// deduplicated), and whether the stash list matters.
+    pub fn guard_scope(&self) -> (Vec<String>, bool) {
+        let mut refs: Vec<String> = self.before.refs.keys().chain(self.after.refs.keys()).cloned().collect();
+        refs.sort();
+        refs.dedup();
+        (refs, !self.before.stashes.is_empty() || !self.after.stashes.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     NothingToDo,

@@ -8,9 +8,12 @@
 //! part of the command itself (`env K=V…` above).
 
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::ssh::{self, Conn};
 
@@ -39,6 +42,15 @@ pub const REPO_ENV_VARS: &[&str] = &[
     "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR",
 ];
+
+/// Subcommands that accept `--progress` (forcing progress output onto a non-TTY stderr).
+const PROGRESS_SUBCOMMANDS: &[&str] = &["clone", "fetch", "pull", "push"];
+
+/// How often [`Git::run_streaming`] checks its cancel flag while git is silent.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// The last stderr line of the [`GitError`] a cancelled [`Git::run_streaming`] returns.
+pub const CANCELLED: &str = "Cancelled";
 
 /// Where a workspace's repository lives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -135,29 +147,24 @@ fn known_summary(stderr: &str) -> Option<String> {
     {
         return Some("Offline".to_string());
     }
-    if let Some(n) = overwritten_file_count(stderr) {
-        return Some(format!("Checkout would overwrite {n} files"));
+    if let Some(files) = overwritten_files(stderr) {
+        return Some(format!("Checkout would overwrite {} files", files.len()));
     }
     None
 }
 
-/// Counts the indented file names git lists after "...would be overwritten by
-/// checkout/merge/rebase/...:".
-fn overwritten_file_count(stderr: &str) -> Option<usize> {
+/// The indented file names git lists after "...would be overwritten by
+/// checkout/merge/rebase/...:" (local changes and untracked files alike).
+pub(crate) fn overwritten_files(stderr: &str) -> Option<Vec<String>> {
     let lines: Vec<&str> = stderr.lines().collect();
     let start = lines.iter().position(|l| l.contains("would be overwritten by"))?;
-    let mut n = 0;
-    for line in &lines[start + 1..] {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line.starts_with(char::is_whitespace) {
-            n += 1;
-        } else {
-            break;
-        }
-    }
-    (n > 0).then_some(n)
+    let files: Vec<String> = lines[start + 1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .take_while(|l| l.starts_with(char::is_whitespace))
+        .map(|l| l.trim().to_string())
+        .collect();
+    (!files.is_empty()).then_some(files)
 }
 
 impl fmt::Display for GitError {
@@ -243,6 +250,95 @@ impl Git {
         self.run_inner(args, Some(input))
     }
 
+    /// Run a long network command (§5.3, §5.10): `--progress` is added to `clone`, `fetch`,
+    /// `pull`, and `push` if missing, and `on_stderr` gets each stderr segment as it arrives —
+    /// split on `\n` *and* `\r`, since git redraws progress in place with `\r` — on the calling
+    /// thread. Setting `cancel` kills git and every process it started (remotely: the ssh client,
+    /// which closes the remote git's pipes) and returns a [`GitError`] whose stderr ends with
+    /// [`CANCELLED`] — unless git had already exited, whose own result is then returned. A flag
+    /// already set spawns nothing. The error's stderr keeps whole lines, not progress redraws.
+    pub fn run_streaming(
+        &self,
+        args: &[&str],
+        cancel: &AtomicBool,
+        on_stderr: &mut dyn FnMut(&str),
+    ) -> Result<Vec<u8>, GitError> {
+        let args = with_progress(args);
+        let command_line = quoted_command_line(&self.argv(&args));
+        let error = |code, stderr: String| GitError { command: command_line.clone(), code, stderr };
+        let cancelled = |log: String| error(None, format!("{log}{CANCELLED}\n"));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled(String::new()));
+        }
+
+        let mut cmd = self.command(&args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Its own session (so its own process group): cancel also kills the helpers git spawned
+        // (index-pack, upload-pack, ssh), which would otherwise keep writing into a folder being
+        // deleted. A new session, not just a group, detaches it from the app's controlling
+        // terminal: an ssh wanting a passphrase or a host-key answer then fails fast (or uses
+        // SSH_ASKPASS) instead of stopping on SIGTTIN/SIGTTOU as a background job would.
+        // SAFETY: the closure runs between fork and exec and only calls setsid(2), which is
+        // async-signal-safe and touches no memory.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            });
+        }
+        let mut child = cmd.spawn().map_err(|e| error(None, e.to_string()))?;
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            split_segments(stderr, |segment, is_line| tx.send((segment, is_line)).is_ok())
+        });
+
+        let mut log = String::new();
+        // Set once git has exited on its own: a cancel arriving after that reports what git did
+        // (a push that landed must still be journaled), so only stderr is left to drain.
+        let mut exited = false;
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok((segment, is_line)) => {
+                    on_stderr(&segment);
+                    if is_line {
+                        log.push_str(&segment);
+                        log.push('\n');
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if exited || !cancel.load(Ordering::Relaxed) {
+                continue;
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                continue;
+            }
+            // No waiting for stderr's EOF: a killed group's pipes may close late.
+            if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: kill(2) takes no pointers; -pgid names the group spawned above.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            // Git may have exited successfully between `try_wait` and the kill.
+            if !child.wait().is_ok_and(|status| status.success()) {
+                return Err(cancelled(log));
+            }
+            exited = true;
+        }
+
+        let status = child.wait().map_err(|e| error(None, e.to_string()))?;
+        let stdout = stdout_reader.join().unwrap_or_default();
+        if status.success() { Ok(stdout) } else { Err(error(status.code(), log)) }
+    }
+
     fn run_inner(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, GitError> {
         let argv = self.argv(args);
         let command_line = quoted_command_line(&argv);
@@ -282,6 +378,54 @@ impl Git {
             })
         }
     }
+}
+
+/// `args` with `--progress` inserted after a [`PROGRESS_SUBCOMMANDS`] subcommand lacking it.
+fn with_progress<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut v = args.to_vec();
+    if v.first().is_some_and(|sub| PROGRESS_SUBCOMMANDS.contains(sub)) && !v.contains(&"--progress") {
+        v.insert(1, "--progress");
+    }
+    v
+}
+
+/// Reads `reader` to EOF, handing each non-empty segment to `emit` with `true` for a line (ended
+/// by `\n`, `\r\n`, or EOF) and `false` for a progress redraw (ended by a lone `\r`). Stops early
+/// when `emit` returns `false`.
+fn split_segments(reader: impl Read, mut emit: impl FnMut(String, bool) -> bool) {
+    let mut reader = reader;
+    let mut segment = Vec::new();
+    let mut after_cr = false;
+    let mut flush = |segment: &mut Vec<u8>, is_line| {
+        let keep_going = segment.is_empty() || emit(String::from_utf8_lossy(segment).into_owned(), is_line);
+        segment.clear();
+        keep_going
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &byte in &chunk[..n] {
+            // A `\r` ends a progress redraw only once we know no `\n` follows it.
+            if std::mem::take(&mut after_cr) {
+                if !flush(&mut segment, byte == b'\n') {
+                    return;
+                }
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => after_cr = true,
+                b'\n' if !flush(&mut segment, true) => return,
+                b'\n' => {}
+                _ => segment.push(byte),
+            }
+        }
+    }
+    flush(&mut segment, !after_cr);
 }
 
 /// The argv joined into one shell-quoted line, for [`GitError::command`] and logs.
@@ -647,5 +791,161 @@ mod tests {
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
             assert!(removed.iter().any(|r| r == var), "{var} not cleared: {removed:?}");
         }
+    }
+
+    // --- Git::run_streaming -----------------------------------------------------------------
+
+    #[test]
+    fn with_progress_adds_the_flag_to_network_commands_once() {
+        assert_eq!(with_progress(&["fetch", "origin"]), vec!["fetch", "--progress", "origin"]);
+        assert_eq!(with_progress(&["push", "--progress", "o"]), vec!["push", "--progress", "o"]);
+        assert_eq!(with_progress(&["status"]), vec!["status"]);
+        assert_eq!(with_progress(&[]), Vec::<&str>::new());
+    }
+
+    fn segments(input: &[u8]) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        split_segments(input, |s, line| {
+            out.push((s, line));
+            true
+        });
+        out
+    }
+
+    #[test]
+    fn split_segments_separates_redraws_from_lines() {
+        let got = segments(b"Receiving:  1%\rReceiving: 50%\rReceiving: 100%, done.\r\nnext\n\nlast");
+        let want = [("Receiving:  1%", false), ("Receiving: 50%", false), ("Receiving: 100%, done.", true)];
+        let mut want: Vec<(String, bool)> = want.iter().map(|(s, l)| (s.to_string(), *l)).collect();
+        want.extend([("next".to_string(), true), ("last".to_string(), true)]);
+        assert_eq!(got, want);
+        assert_eq!(segments(b"tail\r"), vec![("tail".to_string(), false)]);
+        assert_eq!(segments(b""), vec![]);
+    }
+
+    /// A repo with one commit and a bare clone of it; returns (repo, bare path).
+    fn repo_with_bare_remote() -> (TempRepo, tempfile::TempDir) {
+        let mut repo = TempRepo::new();
+        for i in 0..20 {
+            repo.commit_file(&format!("f{i}.txt"), &"x\n".repeat(i + 1), &format!("c{i}"));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = repo.path().display().to_string();
+        repo.git(&["clone", "-q", "--bare", &src, &dir.path().join("r.git").display().to_string()]);
+        (repo, dir)
+    }
+
+    #[test]
+    fn run_streaming_reports_progress_and_succeeds() {
+        let (_repo, dir) = repo_with_bare_remote();
+        let url = format!("file://{}", dir.path().join("r.git").display());
+        let git = Git::new(Location::Local { path: dir.path().to_path_buf() });
+        let mut seen = Vec::new();
+        let cancel = AtomicBool::new(false);
+        git.run_streaming(&["clone", &url, "w"], &cancel, &mut |s| seen.push(s.to_string()))
+            .expect("clone succeeds");
+        assert!(dir.path().join("w").join("f0.txt").exists());
+        assert!(seen.iter().any(|s| s.starts_with("Cloning into")), "{seen:?}");
+        assert!(seen.iter().any(|s| s.starts_with("Receiving objects:")), "--progress was passed: {seen:?}");
+    }
+
+    #[test]
+    fn run_streaming_failure_keeps_stderr_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = Git::new(Location::Local { path: dir.path().to_path_buf() });
+        let missing = dir.path().join("missing.git").display().to_string();
+        let err = git
+            .run_streaming(&["clone", &missing, "w"], &AtomicBool::new(false), &mut |_| {})
+            .expect_err("no such repository");
+        assert_eq!(err.code, Some(128));
+        assert!(err.stderr.contains("does not exist"), "{}", err.stderr);
+        assert!(err.command.contains("--progress"), "{}", err.command);
+    }
+
+    #[test]
+    fn run_streaming_with_cancel_already_set_spawns_nothing() {
+        let (_repo, dir) = repo_with_bare_remote();
+        let git = Git::new(Location::Local { path: dir.path().to_path_buf() });
+        let err = git
+            .run_streaming(&["clone", "r.git", "w"], &AtomicBool::new(true), &mut |_| panic!("no output"))
+            .expect_err("cancelled");
+        assert_eq!(err.code, None);
+        assert!(err.stderr.ends_with(&format!("{CANCELLED}\n")), "{}", err.stderr);
+        assert!(!dir.path().join("w").exists());
+    }
+
+    /// A cancel that arrives after git already finished reports git's result, not a cancel: the
+    /// operation happened (a push landed) and the caller must journal it.
+    #[test]
+    fn run_streaming_cancel_after_git_exited_reports_success() {
+        let host_dir = tempfile::tempdir().expect("tempdir");
+        let host = host_dir.path().join("quick-host.sh");
+        std::fs::write(&host, "echo 'Writing objects: 100% (1/1), done.' >&2\necho pushed\n")
+            .expect("write host");
+        let git = Git {
+            location: Location::Remote { host: host.display().to_string(), path: "r".into() },
+            git_bin: "git".into(),
+            ssh_bin: "sh".into(),
+            control_dir: None,
+        };
+        let cancel = AtomicBool::new(false);
+        let out = git
+            .run_streaming(&["push", "origin"], &cancel, &mut |_| {
+                cancel.store(true, Ordering::Relaxed);
+                // Let the host exit before the runner looks at the flag.
+                std::thread::sleep(Duration::from_millis(300));
+            })
+            .expect("git finished before the cancel");
+        assert_eq!(out, b"pushed\n");
+    }
+
+    /// Cancelling kills the process instead of waiting for it: here a "remote" that would take
+    /// 30 s, through the fake-ssh `sh` host.
+    #[test]
+    fn run_streaming_cancel_kills_a_running_command() {
+        let host_dir = tempfile::tempdir().expect("tempdir");
+        let host = host_dir.path().join("slow-host.sh");
+        std::fs::write(&host, "echo 'Receiving objects:   1% (1/100)' >&2\nexec sleep 30\n")
+            .expect("write host");
+        let git = Git {
+            location: Location::Remote { host: host.display().to_string(), path: "r".into() },
+            git_bin: "git".into(),
+            ssh_bin: "sh".into(),
+            control_dir: None,
+        };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        let err = git
+            .run_streaming(&["fetch", "origin"], &cancel, &mut |s| {
+                seen.push(s.to_string());
+                cancel.store(true, Ordering::Relaxed);
+            })
+            .expect_err("cancelled");
+        assert!(started.elapsed() < Duration::from_secs(10), "waited for the child: {:?}", started.elapsed());
+        assert_eq!(seen, vec!["Receiving objects:   1% (1/100)"]);
+        assert!(err.stderr.ends_with(&format!("{CANCELLED}\n")), "{}", err.stderr);
+    }
+
+    #[test]
+    fn run_streaming_works_for_a_remote_location() {
+        let (_repo, dir) = repo_with_bare_remote();
+        let host_dir = tempfile::tempdir().expect("tempdir");
+        let git = Git {
+            location: Location::Remote {
+                host: fake_host(host_dir.path()),
+                path: dir.path().display().to_string(),
+            },
+            git_bin: "git".into(),
+            ssh_bin: "sh".into(),
+            control_dir: None,
+        };
+        let mut seen = Vec::new();
+        git.run_streaming(&["clone", "r.git", "w"], &AtomicBool::new(false), &mut |s| {
+            seen.push(s.to_string())
+        })
+        .expect("remote clone");
+        assert!(dir.path().join("w").join("f0.txt").exists());
+        assert!(seen.iter().any(|s| s.starts_with("Cloning into")), "{seen:?}");
     }
 }

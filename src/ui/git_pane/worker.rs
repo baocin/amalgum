@@ -5,9 +5,11 @@
 
 use crate::git::cmd::{Git, GitError};
 use crate::git::diff::{FileChange, FileDiff};
-use crate::git::journal::{self, Entry as JournalEntry, Plan, Refused, Snapshot};
+use crate::git::journal::{self, Entry as JournalEntry, Refused, Snapshot};
 use crate::git::log::Commit;
-use crate::git::refs::{Ref, Remote, STASH_ARGS, Stash, Worktree};
+/// Snapshot, HEAD, and plan helpers shared with `git::ops` (moved there; re-exported for the pane).
+pub(super) use crate::git::ops::{head_and_branch, read_snapshot, run_plan, short_hash};
+use crate::git::refs::{Ref, Remote, Stash, Worktree};
 use crate::git::status::{RepoOp, Status};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,47 +74,6 @@ pub(super) enum Reply {
 
     Undo(JournalRunOutcome),
     Redo(JournalRunOutcome),
-}
-
-/// `git rev-parse HEAD` and the branch name from `git symbolic-ref -q HEAD`, tolerating an
-/// unborn HEAD (`None`) or a detached one (`branch: None`). The name is the full ref minus
-/// `refs/heads/`, as `git checkout` takes it and as checkout entries record it: `--short` would
-/// print `heads/v1` for a branch `v1` when a tag `v1` also exists.
-pub(super) fn head_and_branch(git: &Git) -> (Option<String>, Option<String>) {
-    let head = git.run(&["rev-parse", "HEAD"]).ok().map(|o| String::from_utf8_lossy(&o).trim().to_string());
-    let branch = git
-        .run(&["symbolic-ref", "-q", "HEAD"])
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o).trim().to_string())
-        .map(|r| r.strip_prefix("refs/heads/").map(str::to_string).unwrap_or(r))
-        .filter(|b| !b.is_empty());
-    (head, branch)
-}
-
-/// The repo's state for the journal guard (§5.18): HEAD and its branch, the hash of each ref in
-/// `refs` (a ref that doesn't resolve is left out), and the stash list if `stashes`.
-pub(super) fn read_snapshot(git: &Git, refs: &[String], stashes: bool) -> Snapshot {
-    let (head, branch) = head_and_branch(git);
-    let refs = refs
-        .iter()
-        .filter_map(|name| {
-            let out = git.run(&["rev-parse", name]).ok()?;
-            Some((name.clone(), String::from_utf8_lossy(&out).trim().to_string()))
-        })
-        .collect();
-    let stashes = if stashes {
-        git.run(STASH_ARGS)
-            .map(|o| crate::git::refs::parse_stashes(&o).into_iter().map(|s| s.oid).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    Snapshot { head, branch, refs, stashes }
-}
-
-/// A short (7-char) hash for descriptions and labels; shorter inputs pass through unchanged.
-pub(super) fn short_hash(id: &str) -> &str {
-    &id[..id.len().min(7)]
 }
 
 /// `git diff --no-index` shows an untracked file "as all-added" (§4 "Changes view"), but unlike
@@ -217,16 +178,6 @@ pub(super) fn checkout_entry(
     }
 }
 
-/// Runs every command of `plan` in order via `git.run`, stopping at (and returning) the first
-/// failure.
-pub(super) fn run_plan(git: &Git, plan: &Plan) -> Result<(), GitError> {
-    for cmd in plan {
-        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        git.run(&args)?;
-    }
-    Ok(())
-}
-
 /// The human line for a refused undo/redo (§5.18): `action` is `"undo"` or `"redo"`.
 pub(super) fn refusal_message(action: &str, refused: &Refused) -> String {
     match refused {
@@ -243,6 +194,7 @@ fn display_ref_name(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::journal::Plan;
 
     // ---- next_log_n ---------------------------------------------------------------------
 
