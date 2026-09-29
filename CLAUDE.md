@@ -45,7 +45,8 @@ Spec: `docs/SPEC.md` (cited as §5.28). Built vs. planned: `docs/STATUS.md`. Har
   (`--no-default-features`, profile `cli`, static musl on Linux, < 2 MB) that is uploaded to ssh hosts.
   `main.rs`: a subcommand runs `ctl::cli::run`; no subcommand calls `ui::launch`.
 - Everything outside `src/ui/` is headless and ships in the CLI. Parsers are pure (`&[u8]`/`&str` → structs).
-  Only `git::cmd`, `ctl::socket`/`ctl::queue`, `agent::adapters` (config files), and `platform` do I/O.
+  Only `git::cmd`, `ctl::socket`/`ctl::queue`, `agent::adapters` (config files), `ssh::runner`/`ssh::steps`/
+  `ssh::manager` (ssh and scp, on worker threads), and `platform` do I/O.
 - Git is the system `git`, local or `ssh <host> -- git -C <path>`, always machine formats
   (`-z`, `--porcelain=v2`, `--format`). No libgit2. `gix` may come later behind a feature.
 - Remote workspaces: one ssh ControlMaster per host, tmux `-L amalgum` for session survival, the app's

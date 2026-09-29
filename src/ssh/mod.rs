@@ -1,6 +1,15 @@
-//! ssh and tmux argv builders (§5.28). The app never talks SSH itself: it runs the system
-//! `ssh` over one ControlMaster per host, so `~/.ssh/config`, agents, ProxyJump, and hardware
-//! keys work for free. This module only builds argument vectors and parses ssh's output.
+//! SSH workspaces (§5.28). The app never talks SSH itself: it runs the system `ssh` over one
+//! ControlMaster per host, so `~/.ssh/config`, agents, ProxyJump, and hardware keys work for
+//! free. This file builds argument vectors and parses ssh's output (pure); the submodules add
+//! the engine around it:
+//! - [`runner`]   the one place ssh/scp are spawned, behind a trait so everything is testable
+//! - [`steps`]    each connect step (§5.28 "Connect" 1–5) as a function, plus forwards and kill
+//! - [`state`]    the pure W16 connection state machine: progress line, banner, backoff
+//! - [`manager`]  one refcounted ControlMaster per host, steps on worker threads, typed events
+//! - [`terminal`] the ssh argv a remote terminal tab spawns (tmux or plain shell)
+//!
+//! Every `Conn` argv starts with `-F <file>` when [`Conn::config_file`] is set (Settings → SSH,
+//! and the test sshd), so nothing needs the real `~/.ssh/config`.
 //!
 //! Remote commands reach the remote shell as a single string, so every argument is quoted with
 //! [`quote`]. A leading `~/` (or a bare `~`) is left unquoted so the remote shell expands it.
@@ -17,10 +26,17 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod manager;
+pub mod runner;
+mod sha256;
+pub mod state;
+pub mod steps;
+pub mod terminal;
+
 /// Private tmux server name (`tmux -L amalgum`).
 pub const TMUX_SERVER: &str = "amalgum";
 /// Uploaded to `~/.amalgum/tmux.conf`: tmux stays invisible (§5.28).
-pub const TMUX_CONF: &str = include_str!("../assets/tmux.conf");
+pub const TMUX_CONF: &str = include_str!("../../assets/tmux.conf");
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded_cli.rs"));
@@ -131,13 +147,39 @@ pub fn user_sets_keepalive(ssh_g: &str) -> bool {
 pub const MAX_CONTROL_PATH_BYTES: usize = 104 - 1 - 17;
 
 /// One host's connection parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conn {
     pub host: String,
     pub control_dir: PathBuf,
+    /// `ssh -F <file>` instead of `~/.ssh/config` (Settings → SSH; tests' private sshd).
+    pub config_file: Option<PathBuf>,
 }
 
 impl Conn {
+    pub fn new(host: impl Into<String>, control_dir: impl Into<PathBuf>) -> Self {
+        Self { host: host.into(), control_dir: control_dir.into(), config_file: None }
+    }
+
+    pub fn with_config_file(mut self, config_file: Option<PathBuf>) -> Self {
+        self.config_file = config_file;
+        self
+    }
+
+    /// `-F <file>` when a config file is set, else nothing. Leads every argv built here.
+    fn config_args(&self) -> Vec<String> {
+        match &self.config_file {
+            Some(file) => vec!["-F".to_string(), file.display().to_string()],
+            None => Vec::new(),
+        }
+    }
+
+    /// `[-F <file>] -G <host>`: the effective config for the host (keepalive detection).
+    pub fn query_config_args(&self) -> Vec<String> {
+        let mut args = self.config_args();
+        args.extend(["-G".to_string(), self.host.clone()]);
+        args
+    }
+
     /// `<control_dir>/<16 lowercase hex chars of fnv1a64(host)>`. Always exactly
     /// `control_dir`'s length plus 17 bytes (one separator, 16 hex digits), regardless of host.
     pub fn control_path(&self) -> PathBuf {
@@ -156,7 +198,10 @@ impl Conn {
     }
 
     /// `-o ControlMaster=auto -o ControlPath=… -o ControlPersist=… [-o ServerAliveInterval=…
-    /// -o ServerAliveCountMax=…] [-o StrictHostKeyChecking=accept-new] -N -f <host>`.
+    /// -o ServerAliveCountMax=…] -o StrictHostKeyChecking=yes|accept-new -N -f <host>`.
+    ///
+    /// Untrusted, the key must already be known (`yes`): without a terminal ssh would otherwise
+    /// ask `SSH_ASKPASS` to confirm an unknown key, accepting it outside the W16 dialog.
     ///
     /// `InvalidInput` when the control path is over [`MAX_CONTROL_PATH_BYTES`]: ssh could not
     /// create the master's socket there (with the default macOS control dir, a user name over
@@ -173,24 +218,26 @@ impl Conn {
                 ),
             ));
         }
-        let mut args = vec![
+        let mut args = self.config_args();
+        args.extend([
             "-o".to_string(),
             "ControlMaster=auto".to_string(),
             "-o".to_string(),
             self.control_path_option(),
             "-o".to_string(),
             format!("ControlPersist={}", opts.persist),
-        ];
+        ]);
         if let Some((interval, count)) = opts.keepalive {
             args.push("-o".into());
             args.push(format!("ServerAliveInterval={interval}"));
             args.push("-o".into());
             args.push(format!("ServerAliveCountMax={count}"));
         }
-        if trust_new_host_key {
-            args.push("-o".into());
-            args.push("StrictHostKeyChecking=accept-new".into());
-        }
+        args.push("-o".into());
+        args.push(
+            if trust_new_host_key { "StrictHostKeyChecking=accept-new" } else { "StrictHostKeyChecking=yes" }
+                .into(),
+        );
         args.push("-N".into());
         args.push("-f".into());
         args.push(self.host.clone());
@@ -200,8 +247,23 @@ impl Conn {
     /// `-o ControlPath=<path>`: every command after `master_args` must name the master's
     /// socket, or ssh looks for the user's default ControlPath and misses ours.
     fn via_master(&self, rest: impl IntoIterator<Item = String>) -> Vec<String> {
-        let mut args = vec!["-o".to_string(), self.control_path_option()];
+        let mut args = self.config_args();
+        args.extend(["-o".to_string(), self.control_path_option()]);
         args.extend(rest);
+        args
+    }
+
+    /// `[-F <file>] -v -o BatchMode=yes -o StrictHostKeyChecking=yes -o ControlMaster=no -o
+    /// ControlPath=none <host> -- true`: a throwaway connection that stops at the unknown host key
+    /// and logs its fingerprint (`debug1: Server host key: …`, see [`parse_server_host_key`]).
+    /// Never through the master (there is none yet), never accepting anything.
+    pub fn host_key_probe_args(&self) -> Vec<String> {
+        let mut args = self.config_args();
+        for word in ["-v", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no"]
+        {
+            args.push(word.to_string());
+        }
+        args.extend(["-o".into(), "ControlPath=none".into(), self.host.clone(), "--".into(), "true".into()]);
         args
     }
 
@@ -242,6 +304,35 @@ impl Conn {
         ])
     }
 
+    /// `-o ControlPath=… -O cancel -R <remote_sock> <host>`: undo
+    /// [`forward_socket_args`](Self::forward_socket_args) (Disconnect closes forwards, §5.28).
+    pub fn cancel_socket_args(&self, remote_sock: &str) -> Vec<String> {
+        self.via_master([
+            "-O".into(),
+            "cancel".into(),
+            "-R".into(),
+            remote_sock.to_string(),
+            self.host.clone(),
+        ])
+    }
+
+    /// `scp [-F <file>] -o ControlPath=… -o ControlMaster=no -q -- <local> <host>:<remote>` (the
+    /// caller prepends the scp binary). `remote` must be absolute and shell-safe, because scp's
+    /// legacy protocol hands it to the remote shell while its SFTP mode does not; `None` otherwise.
+    pub fn scp_upload_args(&self, local: &Path, remote: &str) -> Option<Vec<String>> {
+        if !remote.starts_with('/') || quote_literal(remote) != remote {
+            return None;
+        }
+        Some(self.via_master([
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-q".into(),
+            "--".into(),
+            local.display().to_string(),
+            format!("{}:{remote}", self.host),
+        ]))
+    }
+
     /// Open a remote port locally: `-o ControlPath=… -O forward -L <local>:localhost:<remote> <host>`.
     pub fn forward_port_args(&self, local_port: u16, remote_port: u16) -> Vec<String> {
         self.via_master([
@@ -268,7 +359,8 @@ impl Conn {
     /// Environment pairs are quoted whole, so values are literal (no `~` or `$` expansion):
     /// pass absolute remote paths.
     ///
-    /// Terminal with session survival: `-o ControlPath=… -t <host> -- tmux -L amalgum -f ~/.amalgum/tmux.conf
+    /// Terminal with session survival (tmux ≥ 3.2 for `-e`, see [`tmux_supports_env`]):
+    /// `-o ControlPath=… -o ControlMaster=no -o StrictHostKeyChecking=yes -t <host> -- tmux -L amalgum -f ~/.amalgum/tmux.conf
     /// new-session -A -s <session> -c <cwd> -e K=V …`.
     pub fn tmux_args(&self, session: &str, cwd: &str, env: &[(&str, &str)]) -> Vec<String> {
         let conf = format!("~/{}/tmux.conf", crate::paths::REMOTE_ROOT);
@@ -282,17 +374,34 @@ impl Conn {
         for (k, v) in env {
             cmd.push_str(&format!(" -e {}", quote(&format!("{k}={v}"))));
         }
-        self.via_master(["-t".into(), self.host.clone(), "--".into(), cmd])
+        self.terminal_via_master(cmd)
     }
 
-    /// Terminal without tmux: `-o ControlPath=… -t <host> -- 'cd <cwd> && exec env K=V … "$SHELL" -l'`.
+    /// `-o ControlPath=… -o ControlMaster=no -o StrictHostKeyChecking=yes -t <host> -- <cmd>`.
+    /// Should the master be gone, the tab's ssh connects on its own, but neither becomes a
+    /// master without ControlPersist nor asks about a host key inside the PTY (only W16 does).
+    fn terminal_via_master(&self, cmd: String) -> Vec<String> {
+        self.via_master([
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-t".into(),
+            self.host.clone(),
+            "--".into(),
+            cmd,
+        ])
+    }
+
+    /// Terminal without tmux: `-o ControlPath=… -o ControlMaster=no -o StrictHostKeyChecking=yes
+    /// -t <host> -- 'cd <cwd> && exec env K=V … "$SHELL" -l'`.
     pub fn shell_args(&self, cwd: &str, env: &[(&str, &str)]) -> Vec<String> {
         let mut cmd = format!("cd {} && exec env", quote(cwd));
         for (k, v) in env {
             cmd.push_str(&format!(" {}", quote(&format!("{k}={v}"))));
         }
         cmd.push_str(" \"$SHELL\" -l");
-        self.via_master(["-t".into(), self.host.clone(), "--".into(), cmd])
+        self.terminal_via_master(cmd)
     }
 }
 
@@ -345,6 +454,81 @@ pub fn parse_host_key_prompt(stderr: &str) -> Option<HostKeyPrompt> {
     let fingerprint = fp_line[fp_start..].split_whitespace().next()?.trim_end_matches('.').to_string();
 
     Some(HostKeyPrompt { host, key_type, fingerprint })
+}
+
+/// The pid in `ssh -O check` output (`Master running (pid=4242)`).
+pub fn parse_master_pid(check_output: &str) -> Option<u32> {
+    let rest = &check_output[check_output.find("(pid=")? + 5..];
+    rest[..rest.find(')')?].parse().ok()
+}
+
+/// `<hostname>:<port>` from `ssh -G <host>` output: how ssh's `-v` log names the target
+/// (`Authenticating to <hostname>:<port> as '<user>'`), see [`parse_server_host_key`].
+pub fn ssh_g_target(ssh_g: &str) -> Option<String> {
+    let value = |key: &str| {
+        ssh_g.lines().find_map(|line| {
+            let (k, v) = line.split_once(' ')?;
+            k.eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        })
+    };
+    Some(format!("{}:{}", value("hostname")?, value("port")?))
+}
+
+/// The host key the target itself offered, from `ssh -v` output (`debug1: Server host key:
+/// ssh-ed25519 SHA256:…`). Used when ssh ran without a terminal and so printed only "Host key
+/// verification failed." instead of the authenticity prompt that [`parse_host_key_prompt`] reads.
+///
+/// `target` is `<hostname>:<port>` ([`ssh_g_target`]). Only a key logged after the target's own
+/// `Authenticating to <target> as` line counts: with ProxyJump, ssh passes `-v` on to the jump
+/// connection, whose key is logged first. `None` when the target's key never showed (the jump
+/// host's key is the unknown one, say): that must not be offered as the target's.
+pub fn parse_server_host_key(host: &str, target: &str, verbose_stderr: &str) -> Option<HostKeyPrompt> {
+    let marker = format!("Authenticating to {target} as ");
+    let lines: Vec<&str> = verbose_stderr.lines().collect();
+    let start = lines.iter().rposition(|l| l.contains(&marker))?;
+    let line = lines[start..].iter().find_map(|l| l.split_once("Server host key: ").map(|(_, r)| r))?;
+    let mut words = line.split_whitespace();
+    let algorithm = words.next()?;
+    let fingerprint = words.next().filter(|f| f.starts_with("SHA256:"))?.to_string();
+    let key_type = match algorithm {
+        a if a.contains("ed25519") => "ED25519",
+        a if a.contains("ed448") => "ED448",
+        a if a.starts_with("ecdsa") => "ECDSA",
+        a if a.contains("rsa") => "RSA",
+        a if a.contains("dss") => "DSA",
+        other => other,
+    };
+    Some(HostKeyPrompt { host: host.to_string(), key_type: key_type.to_string(), fingerprint })
+}
+
+/// ssh refused a host key it already knows under a different value (possible MITM). Never
+/// offered as a Trust dialog: the user must fix `known_hosts` themselves.
+pub fn host_key_changed(stderr: &str) -> bool {
+    stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+        || (stderr.contains("Host key for ") && stderr.contains("has changed"))
+}
+
+/// ssh could not verify the host key and nothing says it changed: the key is unknown.
+pub fn host_key_unknown(stderr: &str) -> bool {
+    !host_key_changed(stderr)
+        && (stderr.contains("Host key verification failed") || stderr.contains("The authenticity of host"))
+}
+
+/// Does `tmux -V` output name a tmux with `new-session -e` (3.2 or later)? Versions it cannot
+/// read (`tmux master`, a distribution's odd suffix) are assumed new enough.
+pub fn tmux_supports_env(tmux_v: &str) -> bool {
+    let Some(version) = tmux_v.split_whitespace().nth(1) else { return true };
+    let version = version.strip_prefix("next-").unwrap_or(version);
+    let mut parts = version.split('.');
+    let number = |part: Option<&str>| -> Option<u32> {
+        let digits: String = part?.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    match (number(parts.next()), number(parts.next())) {
+        (Some(major), Some(minor)) => (major, minor) >= (3, 2),
+        (Some(major), None) => major > 3,
+        _ => true,
+    }
 }
 
 /// Rust target of the CLI binary to upload for `uname -sm` output (§5.31 "Remote build").
@@ -569,7 +753,7 @@ mod tests {
     // --- Conn -------------------------------------------------------------------------------
 
     fn conn(host: &str, dir: &str) -> Conn {
-        Conn { host: host.to_string(), control_dir: PathBuf::from(dir) }
+        Conn::new(host, dir)
     }
 
     #[test]
@@ -622,7 +806,7 @@ mod tests {
     #[test]
     fn control_path_option_survives_ssh_option_parsing() {
         let control_dir = PathBuf::from("Application Support/100%/ssh");
-        let c = Conn { host: "gpu-box".into(), control_dir };
+        let c = Conn::new("gpu-box", control_dir);
         for args in [c.master_args(&MasterOptions::default(), false).unwrap(), c.exec_args(&["true"])] {
             let out = match Command::new("ssh").args(["-F", "none", "-G"]).args(&args).output() {
                 Ok(out) => out,
@@ -658,6 +842,8 @@ mod tests {
                 "ServerAliveInterval=20",
                 "-o",
                 "ServerAliveCountMax=2",
+                "-o",
+                "StrictHostKeyChecking=yes",
                 "-N",
                 "-f",
                 "gpu-box",
@@ -682,7 +868,10 @@ mod tests {
         assert!(trusted.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
 
         let untrusted = c.master_args(&opts, false).unwrap();
-        assert!(!untrusted.iter().any(|a| a.starts_with("StrictHostKeyChecking")));
+        assert!(
+            untrusted.iter().any(|a| a == "StrictHostKeyChecking=yes"),
+            "without a tty ssh would ask SSH_ASKPASS to accept an unknown key: {untrusted:?}"
+        );
 
         for args in [&trusted, &untrusted] {
             assert!(
@@ -719,12 +908,14 @@ mod tests {
         via(c).into_iter().chain(rest.iter().map(|s| s.to_string())).collect()
     }
 
+    const TERMINAL_OPTS: &[&str] = &["-o", "ControlMaster=no", "-o", "StrictHostKeyChecking=yes"];
+
     #[test]
     fn tmux_args_shape() {
         let c = conn("gpu-box", "run/ssh");
         let args = c.tmux_args("tab-1", "/srv/app", &[("AMALGUM_SOCK", "~/.amalgum/run/app.sock")]); // portability: allow
         let cmd = "tmux -L amalgum -f ~/.amalgum/tmux.conf new-session -A -s tab-1 -c /srv/app -e 'AMALGUM_SOCK=~/.amalgum/run/app.sock'"; // portability: allow
-        assert_eq!(args, with_via(&c, &["-t", "gpu-box", "--", cmd]));
+        assert_eq!(args, with_via(&c, &[TERMINAL_OPTS, &["-t", "gpu-box", "--", cmd]].concat()));
     }
 
     #[test]
@@ -744,7 +935,7 @@ mod tests {
         let c = conn("gpu-box", "run/ssh");
         let args = c.shell_args("/srv/app", &[("AMALGUM_TAB", "t1")]); // portability: allow
         let cmd = "cd /srv/app && exec env AMALGUM_TAB=t1 \"$SHELL\" -l"; // portability: allow
-        assert_eq!(args, with_via(&c, &["-t", "gpu-box", "--", cmd]));
+        assert_eq!(args, with_via(&c, &[TERMINAL_OPTS, &["-t", "gpu-box", "--", cmd]].concat()));
     }
 
     #[test]
@@ -802,6 +993,147 @@ mod tests {
             c.cancel_port_args(3000, 8080),
             with_via(&c, &["-O", "cancel", "-L", "3000:localhost:8080", "gpu-box"])
         );
+    }
+
+    #[test]
+    fn config_file_leads_every_argv() {
+        let c = conn("gpu-box", "run/ssh").with_config_file(Some(PathBuf::from("cfg dir/ssh_config")));
+        let local = PathBuf::from("app.sock");
+        let f = ["-F", "cfg dir/ssh_config"];
+        for args in [
+            c.master_args(&MasterOptions::default(), false).unwrap(),
+            c.query_config_args(),
+            c.check_args(),
+            c.exit_args(),
+            c.exec_args(&["true"]),
+            c.forward_socket_args("r.sock", &local),
+            c.cancel_socket_args("r.sock"),
+            c.forward_port_args(1, 2),
+            c.cancel_port_args(1, 2),
+            c.tmux_args("t", "d", &[]),
+            c.shell_args("d", &[]),
+            c.scp_upload_args(&local, "/h/x").unwrap(), // portability: allow
+        ] {
+            assert_eq!(args[..2], f, "{args:?}");
+        }
+        assert_eq!(conn("gpu-box", "run/ssh").query_config_args(), ["-G", "gpu-box"]);
+    }
+
+    #[test]
+    fn cancel_socket_args_shape() {
+        let c = conn("gpu-box", "run/ssh");
+        assert_eq!(
+            c.cancel_socket_args("/h/.amalgum/run/a.sock"),
+            with_via(&c, &["-O", "cancel", "-R", "/h/.amalgum/run/a.sock", "gpu-box"])
+        ); // portability: allow
+    }
+
+    #[test]
+    fn scp_upload_args_shape_and_refusals() {
+        let c = conn("gpu-box", "run/ssh");
+        let local = PathBuf::from("up/amalgum");
+        assert_eq!(
+            c.scp_upload_args(&local, "/h/.amalgum/bin/1/amalgum.part").unwrap(), // portability: allow
+            with_via(
+                &c,
+                &[
+                    "-o",
+                    "ControlMaster=no",
+                    "-q",
+                    "--",
+                    "up/amalgum",
+                    "gpu-box:/h/.amalgum/bin/1/amalgum.part"
+                ]
+            )  // portability: allow
+        );
+        for bad in ["relative/x", "~/x", "/h/a b", "/h/$(id)", "/h/x;y"] {
+            assert_eq!(c.scp_upload_args(&local, bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_master_pid_cases() {
+        assert_eq!(parse_master_pid("Master running (pid=4242)\r\n"), Some(4242));
+        assert_eq!(parse_master_pid("Control socket connect(x): No such file or directory"), None);
+        assert_eq!(parse_master_pid("(pid=abc)"), None);
+    }
+
+    const AUTH: &str = "debug1: Authenticating to 10.0.0.5:22 as 'u'\n";
+
+    #[test]
+    fn parse_server_host_key_from_verbose_output() {
+        let stderr = format!(
+            "{AUTH}debug1: kex: host key algorithm: ssh-ed25519\n\
+            debug1: Server host key: ssh-ed25519 SHA256:24yrxNupGDvbdfSvVx7I31Mz8TpzwZhhKKSrqIBty5s\n\
+            Host key verification failed.\n"
+        );
+        assert_eq!(
+            parse_server_host_key("gpu-box", "10.0.0.5:22", &stderr),
+            Some(HostKeyPrompt {
+                host: "gpu-box".into(),
+                key_type: "ED25519".into(),
+                fingerprint: "SHA256:24yrxNupGDvbdfSvVx7I31Mz8TpzwZhhKKSrqIBty5s".into(),
+            })
+        );
+        let key = |line: &str| parse_server_host_key("h", "10.0.0.5:22", &format!("{AUTH}{line}"));
+        assert_eq!(
+            key("debug1: Server host key: ecdsa-sha2-nistp256 SHA256:abc\n").unwrap().key_type,
+            "ECDSA"
+        );
+        assert_eq!(key("debug1: Server host key: rsa-sha2-512 SHA256:abc\n").unwrap().key_type, "RSA");
+        assert_eq!(key("Host key verification failed.\n"), None);
+        assert_eq!(key("debug1: Server host key: ssh-ed25519 MD5:aa\n"), None);
+        let no_marker = "debug1: Server host key: ssh-ed25519 SHA256:abc\n";
+        assert_eq!(parse_server_host_key("h", "10.0.0.5:22", no_marker), None, "whose key is unknown");
+    }
+
+    /// ssh passes `-v` to the ProxyJump connection, whose key is logged before the target's.
+    #[test]
+    fn parse_server_host_key_skips_the_jump_hosts_key() {
+        let stderr = "debug1: Executing proxy command: exec ssh -v -W '[10.0.0.5]:22' jump\n\
+            debug1: Authenticating to jump.example:22 as 'u'\n\
+            debug1: Server host key: ssh-ed25519 SHA256:JUMP\n\
+            debug1: Authenticated to jump.example ([1.2.3.4]:22) using \"publickey\".\n\
+            debug1: Authenticating to 10.0.0.5:22 as 'u'\n\
+            debug1: Server host key: ecdsa-sha2-nistp256 SHA256:TARGET\n\
+            Host key verification failed.\n";
+        let prompt = parse_server_host_key("gpu-box", "10.0.0.5:22", stderr).unwrap();
+        assert_eq!((prompt.key_type.as_str(), prompt.fingerprint.as_str()), ("ECDSA", "SHA256:TARGET"));
+
+        let jump_unknown = "debug1: Authenticating to jump.example:22 as 'u'\n\
+            debug1: Server host key: ssh-ed25519 SHA256:JUMP\n\
+            Host key verification failed.\n\
+            kex_exchange_identification: Connection closed by remote host\n";
+        assert_eq!(parse_server_host_key("gpu-box", "10.0.0.5:22", jump_unknown), None);
+    }
+
+    #[test]
+    fn ssh_g_target_cases() {
+        assert_eq!(ssh_g_target("user u\nhostname 10.0.0.5\nport 2222\n").as_deref(), Some("10.0.0.5:2222"));
+        assert_eq!(ssh_g_target("hostname h\n"), None);
+    }
+
+    #[test]
+    fn tmux_supports_env_cases() {
+        for new in
+            ["tmux 3.2", "tmux 3.2a", "tmux 3.4", "tmux 4.0", "tmux next-3.5", "tmux master", "tmux 10"]
+        {
+            assert!(tmux_supports_env(new), "{new}");
+        }
+        for old in ["tmux 3.1c", "tmux 3.0a", "tmux 2.7", "tmux 1.8"] {
+            assert!(!tmux_supports_env(old), "{old}");
+        }
+    }
+
+    #[test]
+    fn host_key_unknown_versus_changed() {
+        let unknown_no_tty = "Host key verification failed.\n";
+        let unknown_strict = "No ED25519 host key is known for gpu-box and you have requested strict checking.\nHost key verification failed.\n";
+        let changed = "@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@\nHost key verification failed.\n";
+        assert!(host_key_unknown(unknown_no_tty) && host_key_unknown(unknown_strict));
+        assert!(!host_key_changed(unknown_strict));
+        assert!(host_key_changed(changed) && !host_key_unknown(changed));
+        assert!(!host_key_unknown("Permission denied (publickey).\n"));
     }
 
     // --- Backoff ------------------------------------------------------------------------------

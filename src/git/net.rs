@@ -1507,6 +1507,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "sh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         let loc = clone(&git, "remote.git", "c", None, &no_cancel(), &mut |_| {}).expect("remote clone");
         assert_eq!(loc, Location::Remote { host, path: format!("{parent}/c") });

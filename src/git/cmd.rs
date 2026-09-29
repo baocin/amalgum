@@ -185,11 +185,19 @@ pub struct Git {
     pub ssh_bin: String,
     /// ControlMaster socket directory (`Dirs::ssh_control_dir`); remote only.
     pub control_dir: Option<PathBuf>,
+    /// `ssh -F <file>` (Settings → SSH); remote only. `None` reads `~/.ssh/config`.
+    pub ssh_config: Option<PathBuf>,
 }
 
 impl Git {
     pub fn new(location: Location) -> Self {
-        Self { location, git_bin: "git".to_string(), ssh_bin: "ssh".to_string(), control_dir: None }
+        Self {
+            location,
+            git_bin: "git".to_string(),
+            ssh_bin: "ssh".to_string(),
+            control_dir: None,
+            ssh_config: None,
+        }
     }
 
     /// The full argv that would run, for logs and the error details pane.
@@ -211,12 +219,16 @@ impl Git {
                 let mut v = vec![self.ssh_bin.clone()];
                 match &self.control_dir {
                     Some(control_dir) => {
-                        let conn = Conn { host: host.clone(), control_dir: control_dir.clone() };
+                        let conn = Conn::new(host.clone(), control_dir.clone())
+                            .with_config_file(self.ssh_config.clone());
                         v.extend(conn.exec_args(&remote_refs));
                     }
                     // No control directory configured: drop the ControlPath/ControlMaster
                     // options that `Conn::exec_args` would add and just address the host.
                     None => {
+                        if let Some(file) = &self.ssh_config {
+                            v.extend(["-F".to_string(), file.display().to_string()]);
+                        }
                         v.push(host.clone());
                         v.push("--".to_string());
                         v.push(ssh::remote_command(&remote_refs));
@@ -527,6 +539,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "ssh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         assert_eq!(
             git.argv(&["status"]),
@@ -546,6 +559,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "ssh".into(),
             control_dir: Some(PathBuf::from("/run/ssh")), // portability: allow
+            ssh_config: None,
         };
         let argv = git.argv(&["log", "-1"]);
         assert_eq!(argv[0], "ssh");
@@ -557,6 +571,17 @@ mod tests {
         assert_eq!(argv[6], "--");
         assert_eq!(argv[7], "env GIT_TERMINAL_PROMPT=0 LC_ALL=C GIT_OPTIONAL_LOCKS=0 git -C /srv/app log -1"); // portability: allow
         assert_eq!(argv.len(), 8);
+    }
+
+    #[test]
+    fn argv_remote_passes_the_ssh_config_file_first() {
+        let mut git = Git::new(Location::Remote { host: "gpu-box".into(), path: "~/g".into() });
+        git.ssh_config = Some(PathBuf::from("cfg/ssh_config"));
+        assert_eq!(git.argv(&["status"])[..4], ["ssh", "-F", "cfg/ssh_config", "gpu-box"]);
+        git.control_dir = Some(PathBuf::from("run/ssh"));
+        let argv = git.argv(&["status"]);
+        assert_eq!(argv[..4], ["ssh", "-F", "cfg/ssh_config", "-o"]);
+        assert!(argv[4].starts_with("ControlPath="), "{argv:?}");
     }
 
     /// A remote host for [`Git::argv`]'s `<ssh_bin> <host> -- <command>` with `ssh_bin = "sh"`
@@ -596,6 +621,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "sh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         let out = git.run(&["status", "--porcelain=v2"]).expect("remote status");
         assert!(out.is_empty(), "clean tree: {:?}", String::from_utf8_lossy(&out));
@@ -887,6 +913,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "sh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         let cancel = AtomicBool::new(false);
         let out = git
@@ -912,6 +939,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "sh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let started = std::time::Instant::now();
@@ -939,6 +967,7 @@ mod tests {
             git_bin: "git".into(),
             ssh_bin: "sh".into(),
             control_dir: None,
+            ssh_config: None,
         };
         let mut seen = Vec::new();
         git.run_streaming(&["clone", "r.git", "w"], &AtomicBool::new(false), &mut |s| {

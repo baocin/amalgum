@@ -8,7 +8,7 @@
 //! - [`git`]      system-git runner (local + ssh), porcelain parsers, graph lanes, journal (§5.4–5.21)
 //! - [`agent`]    agent status model, hook adapters/installers, OSC scanner, hibernation (§5.27–5.30)
 //! - [`model`]    UI-agnostic app model: settings, state, split layout, keymap, theme, fuzzy (§3–4, §7)
-//! - [`ssh`]      ssh/tmux argv builders, remote quoting, reconnect backoff (§5.28)
+//! - [`ssh`]      remote workspaces: ssh/tmux argv, quoting, connect steps, W16 state, host manager (§5.28)
 //! - [`ports`]    parse `lsof`/`ss` listening-port output (§5.27)
 //! - [`platform`] the only module that may call OS-specific APIs (§1)
 //! - `ui`         the eframe app (feature `gui`)

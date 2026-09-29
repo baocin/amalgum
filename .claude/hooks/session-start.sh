@@ -17,6 +17,13 @@ if command -v apt-get >/dev/null 2>&1 && ! { command -v xvfb-run >/dev/null && l
   apt-get install -y -q xvfb libxkbcommon-x11-0 >/dev/null 2>&1 || true
 fi
 
+# Best effort: the ssh engine's end-to-end tests (tests/ssh.rs) start a private sshd; they skip
+# without one. Run as root, sshd also needs its privilege-separation directory.
+if command -v apt-get >/dev/null 2>&1 && ! { command -v ssh >/dev/null && [ -x /usr/sbin/sshd ]; }; then
+  apt-get install -y -q openssh-client openssh-server >/dev/null 2>&1 || true
+fi
+if [ "$(id -u)" = 0 ] && [ -x /usr/sbin/sshd ]; then mkdir -p /run/sshd || true; fi
+
 # Warm both feature sets for tests and clippy. A red tree must not fail session start.
 for flags in "--no-default-features" ""; do
   # shellcheck disable=SC2086
