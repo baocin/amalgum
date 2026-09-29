@@ -30,8 +30,9 @@ const INFO_SCRIPT: &str = r#"printf '%s\n' "$HOME"; uname -sm"#;
 /// `<digest>  <file>` from whichever tool the host has.
 const SHA256_SCRIPT: &str =
     r#"if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$1"; else shasum -a 256 -- "$1"; fi"#;
-/// Make the uploaded binary executable and move it into place atomically.
-const INSTALL_SCRIPT: &str = r#"chmod 755 -- "$1" && mv -f -- "$1" "$2""#;
+/// Make the uploaded binary executable and move it into place atomically. No `--` after
+/// chmod's mode: BSD chmod (macOS hosts) takes it as a file name. `$1` is always absolute.
+const INSTALL_SCRIPT: &str = r#"chmod 755 "$1" && mv -f -- "$1" "$2""#;
 /// Write stdin to `~/.amalgum/tmux.conf` atomically.
 const TMUX_CONF_SCRIPT: &str = r#"d="$HOME/.amalgum" && mkdir -p "$d" && cat > "$d/tmux.conf.tmp" && mv -f "$d/tmux.conf.tmp" "$d/tmux.conf""#;
 /// The socket directory (0700), minus a stale socket a dead connection left at `$1`: sshd
