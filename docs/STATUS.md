@@ -55,13 +55,18 @@ in CI but has not been looked at on a real display.
 | §4 theme: tokens, System/Light/Dark, `Mod+Alt+D`; bundled Inter + JetBrains Mono | ✅ | UI scale and system accent ⬜ |
 | §5.1 welcome screen, recents, missing-path handling | ✅ | first-launch hooks banner shows a hint, not the installer |
 | §5.2 open folder: `amalgum <path>`, drag-and-drop, path sheet, single-instance forwarding | ✅ | native folder picker ⬜; non-repo "Initialize?" ⬜ |
-| §5.3 clone, §5.28 SSH workspaces | ⬜ | next milestone; `ssh` argv builders, quoting, parsers exist |
-| §5.4 graph: streamed log, lanes, chips, working-tree row, selection | ✅ | context menu, focus mode, collapse, drag-and-drop ⬜ |
+| §5.3 clone | ✅ | sheet, clipboard autofill, shallow, clone on a remote host, progress + cancel; native folder picker ⬜; opening a remote clone waits on §5.28 |
+| §5.28 SSH workspaces | ⬜ | next milestone; `ssh` argv builders, quoting, parsers exist |
+| §5.4 graph: streamed log, lanes, chips, working-tree row, selection, commit context menu | ✅ | focus mode, collapse, drag-and-drop ⬜ |
 | §5.5–5.6 details and diff (word-level) | 🟡 | unified only; split view, images, blame ⬜ |
 | §5.7 Changes: stage/unstage, per-hunk stage/unstage/discard, commit, amend | ✅ | line-range selection, sign-off, commit-and-push ⬜ |
-| §5.8 search, §5.10 fetch/pull/push, §5.11–5.16 tags/stashes/compare/rebase UI | ⬜ | parsers and journal exist |
-| §5.9 checkout (Refs double-click, palette) with undo | ✅ | create/rename/delete branch ⬜ |
-| §5.18 undo/redo (`Mod+Z` in the git pane) | ✅ | undo panel ⬜ |
+| §5.8 search | ✅ | in-memory matching; the on-disk index for 100k-commit repos ⬜ |
+| §5.10 fetch / pull / push, background fetch, protected branches | ✅ | battery check ⬜ (no platform reading) |
+| §5.11 tags, §5.12 stashes, §5.16 cherry-pick / revert / reset | ✅ | |
+| §5.13 compare, §5.14 multi-select, §5.15 history/blame, §5.16 interactive rebase UI | ⬜ | rebase plans and editor helpers exist |
+| §5.9 branches: create, checkout (incl. remote/tracking), rename, delete, upstream, merge, rebase | ✅ | drag-and-drop, "Switch to that workspace" ⬜ |
+| §5.18 undo/redo (`Mod+Z` in the git pane) for every ref-changing operation | ✅ | undo panel ⬜ |
+| §5.20 destructive confirmations | ✅ | |
 | §5.19 command palette (actions, workspaces, branches, recents) | ✅ | commits/stashes/worktrees groups ⬜ |
 | §5.22 workspaces: create, switch (`Mod+1..9`), close, reorder, rename, restore on launch | ✅ | new-worktree sheet (W15) ⬜ |
 | §5.24 toasts + details, notification panel | ✅ | log file ⬜ |
