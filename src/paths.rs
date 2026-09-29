@@ -50,6 +50,12 @@ impl Dirs {
     pub fn socket(&self) -> PathBuf {
         self.runtime.join("app.sock")
     }
+    /// Where ssh reverse-forwards remote hosts' `AMALGUM_SOCK` (§5.28). A separate socket from
+    /// [`Dirs::socket`] so the app can tell remote requests apart and accept only
+    /// notifications from them (invariant 10).
+    pub fn remote_socket(&self) -> PathBuf {
+        self.runtime.join("remote.sock")
+    }
     pub fn ssh_control_dir(&self) -> PathBuf {
         self.runtime.join("ssh")
     }

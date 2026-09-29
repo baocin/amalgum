@@ -57,7 +57,7 @@ impl Settings {
             master: MasterOptions::default(),
             keepalive: true,
             app_id: app_id.into(),
-            local_socket: dirs.socket(),
+            local_socket: dirs.remote_socket(),
             cli_version: env!("CARGO_PKG_VERSION").into(),
             probe_interval: 5.0,
             backoff_cap: 60,
