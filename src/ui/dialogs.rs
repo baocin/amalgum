@@ -115,6 +115,83 @@ pub fn confirm_dialog(
     decision
 }
 
+// ---- W16 unknown host key ------------------------------------------------------------------------
+
+/// What the user did in the W16 host-key dialog this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyChoice {
+    CopyFingerprint,
+    Cancel,
+    Trust,
+}
+
+/// The W16 dialog for an unknown host key: the only way a key is ever accepted (§5.28). A
+/// §5.20 confirmation too: `Esc` cancels, `Enter` does nothing, `Mod+Enter` trusts.
+pub fn host_key_dialog(
+    ctx: &egui::Context,
+    colors: &Colors,
+    preset: Preset,
+    prompt: &crate::ssh::HostKeyPrompt,
+    ssh_said: &str,
+) -> Option<HostKeyChoice> {
+    let mut choice = take_press(ctx, preset).and_then(confirm::decide).map(|d| match d {
+        Decision::Confirm => HostKeyChoice::Trust,
+        Decision::Cancel => HostKeyChoice::Cancel,
+    });
+    let mod_enter = Chord::parse("Mod+Enter").map(|c| preset.label(&c)).unwrap_or_default();
+    let frame = egui::Frame::default()
+        .fill(colors.get(Token::BgRaised))
+        .stroke(egui::Stroke::new(1.0, colors.get(Token::Border)))
+        .corner_radius(8)
+        .inner_margin(16);
+    let modal =
+        egui::Modal::new(egui::Id::new(("amalgum_host_key", &prompt.host))).frame(frame).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.label(
+                egui::RichText::new(format!("Unknown host key for {}", prompt.host)).strong().size(15.0),
+            );
+            ui.add_space(8.0);
+            let key = format!("{} {}", prompt.key_type, prompt.fingerprint);
+            ui.label(egui::RichText::new(key).font(egui::FontId::monospace(13.0)));
+            ui.label("Verify this fingerprint with the host owner.");
+            if !ssh_said.trim().is_empty() {
+                ui.add_space(6.0);
+                ui.colored_label(colors.get(Token::FgSecondary), "ssh said:");
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    let text = egui::RichText::new(ssh_said.trim_end())
+                        .font(egui::FontId::monospace(11.0))
+                        .color(colors.get(Token::FgSecondary));
+                    ui.add(egui::Label::new(text).wrap());
+                });
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+                let on_accent = colors.get(Token::FgOnAccent);
+                let trust = egui::Button::new(egui::RichText::new("Trust").color(on_accent).strong())
+                    .shortcut_text(egui::RichText::new(&mod_enter).color(on_accent))
+                    .fill(colors.get(Token::Danger));
+                let trust = ui.add(trust);
+                if trust.has_focus() {
+                    trust.surrender_focus();
+                }
+                if trust.clicked() {
+                    choice = Some(HostKeyChoice::Trust);
+                }
+                if ui.add(egui::Button::new("Cancel").shortcut_text("Esc")).clicked() {
+                    choice = Some(HostKeyChoice::Cancel);
+                }
+                if ui.button("Copy fingerprint").clicked() {
+                    choice = Some(HostKeyChoice::CopyFingerprint);
+                }
+            });
+        });
+    if modal.backdrop_response.clicked() {
+        choice = choice.or(Some(HostKeyChoice::Cancel));
+    }
+    choice
+}
+
 // ---- W19 popover forms ---------------------------------------------------------------------------
 
 /// What a popover did this frame.

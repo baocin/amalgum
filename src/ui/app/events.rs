@@ -28,7 +28,9 @@ impl App {
         }
     }
 
-    fn on_request(&mut self, ctx: &egui::Context, req: Request, now: u64) {
+    /// One control request: live from the socket, or drained from a host's queue (§5.28),
+    /// where `req.ts` is when the event really happened.
+    pub(super) fn on_request(&mut self, ctx: &egui::Context, req: Request, now: u64) {
         let at = req.ts.min(now);
         match req.cmd {
             Command::Notify { title, body, workspace, tab } => {

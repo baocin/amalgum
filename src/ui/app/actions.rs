@@ -1,6 +1,8 @@
 //! Actions from every entry point — shortcuts, menu bar, palette, sidebar, welcome screen —
 //! funnel through here (§2 "every action is reachable three ways").
 
+use super::open_sheet::OpenSheet;
+use super::remote::RowAction;
 use super::{App, Focus};
 use crate::git::Location;
 use crate::model::fuzzy::Group;
@@ -55,7 +57,15 @@ impl App {
     pub(super) fn dispatch(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::CommandPalette => self.palette = Some(Palette::default()),
-            Action::OpenFolder | Action::NewWorkspace => self.open_sheet = Some(default_open_path()),
+            Action::OpenFolder | Action::NewWorkspace => {
+                self.open_sheet(ctx, OpenSheet::folder(default_open_path()))
+            }
+            Action::ConnectToHost => self.open_sheet(ctx, OpenSheet::host(self.settings.ssh.tmux_default)),
+            Action::Reconnect => {
+                if let Some(id) = self.state.active.clone() {
+                    self.on_remote_row(&id, RowAction::Reconnect);
+                }
+            }
             Action::CloneRepository => self.clone.open(ctx, &self.settings),
             Action::CloseWorkspace => {
                 if let Some(id) = self.state.active.clone() {
@@ -418,6 +428,7 @@ impl App {
             self.state.active = Some(id.to_string());
             self.focus = Focus::Terminal;
             self.dirty = true;
+            self.refresh_active_remote_git();
         }
     }
 
@@ -428,7 +439,7 @@ impl App {
         };
         match action {
             SidebarAction::Select(id) => self.activate(ctx, &id),
-            SidebarAction::NewWorkspace => self.open_sheet = Some(default_open_path()),
+            SidebarAction::NewWorkspace => self.open_sheet(ctx, OpenSheet::folder(default_open_path())),
             SidebarAction::Close(id) => self.close_workspace(&id),
             SidebarAction::Rename(id, name) => {
                 if let Some(w) = self.state.workspace_mut(&id) {
@@ -438,9 +449,11 @@ impl App {
             }
             SidebarAction::MoveUp(id) => self.dirty |= self.state.move_workspace(&id, -1),
             SidebarAction::MoveDown(id) => self.dirty |= self.state.move_workspace(&id, 1),
-            SidebarAction::OpenPort(port) => {
-                let _ = crate::platform::open_in_default_app(&format!("http://localhost:{port}"));
-            }
+            SidebarAction::OpenPort(id, port) => self.open_port(&id, port),
+            SidebarAction::Disconnect(id) => self.on_remote_row(&id, RowAction::Disconnect),
+            SidebarAction::Reconnect(id) => self.on_remote_row(&id, RowAction::Reconnect),
+            SidebarAction::KillSessions(id) => self.on_remote_row(&id, RowAction::KillSessions),
+            SidebarAction::Ports(id) => self.on_remote_row(&id, RowAction::Ports),
             SidebarAction::RevealInFileManager(id) => {
                 if let Some(p) = path_of(self, &id) {
                     let _ = crate::platform::reveal_in_file_manager(&p);
@@ -471,7 +484,7 @@ impl App {
                     .flat_map(|r| r.remotes.iter().flat_map(|g| g.workspaces.iter().map(|w| w.id.clone())))
                     .collect();
                 for id in doomed {
-                    self.live.remove(&id);
+                    self.drop_live(&id);
                 }
                 self.state.forget_repo(&repo);
                 self.dirty = true;
@@ -481,7 +494,7 @@ impl App {
 
     pub(super) fn on_welcome(&mut self, ctx: &egui::Context, action: WelcomeAction) {
         match action {
-            WelcomeAction::OpenFolder => self.open_sheet = Some(default_open_path()),
+            WelcomeAction::OpenFolder => self.open_sheet(ctx, OpenSheet::folder(default_open_path())),
             WelcomeAction::OpenRecent(loc) => self.open(ctx, loc, None, None),
             WelcomeAction::RemoveRecent(loc) => {
                 self.state.recents.retain(|r| r.location != loc);
@@ -493,7 +506,7 @@ impl App {
             }
             WelcomeAction::CloneRepository => self.clone.open(ctx, &self.settings),
             WelcomeAction::ConnectToHost => {
-                self.toast(Toast::info("SSH workspaces are the next milestone; open a local folder for now"));
+                self.open_sheet(ctx, OpenSheet::host(self.settings.ssh.tmux_default))
             }
             WelcomeAction::SetUpHooks => {
                 self.toast(Toast::info(

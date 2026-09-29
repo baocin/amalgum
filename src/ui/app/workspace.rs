@@ -1,15 +1,15 @@
 //! Opening locations (§5.2, §5.22) and the terminal/git runtime of each workspace (§5.27).
 
 use super::{App, Focus, Live, Msg};
-use crate::git::refs::{REMOTE_ARGS, parse_remotes};
+use crate::git::refs::{REMOTE_ARGS, Remote, parse_remotes};
 use crate::git::{Git, Location, remote};
 use crate::model::layout::{Axis, Closed, PaneId, Tree};
 use crate::model::state::{GitView, Pane, Tab, Workspace};
+use crate::ssh::terminal::TabSpawn;
 use crate::ui::chrome::Toast;
 use crate::ui::git_pane::GitPane;
 use crate::ui::jobs;
 use crate::ui::terminal::{Spawn, TerminalPane};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A location resolved to its repository (worker thread result).
@@ -47,16 +47,33 @@ pub(super) fn parse_user_location(text: &str) -> Location {
     }
 }
 
+/// Which repo group a repository belongs to (§5.2, §5.28 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Identity {
+    pub repo_id: String,
+    pub repo_name: String,
+    /// The primary remote (`origin`, else the first): name and fetch URL.
+    pub remote: Option<(String, String)>,
+}
+
+/// Identify a repo from its remotes: the primary remote's normalised URL, so local and remote
+/// clones of one repo nest together; without remotes, its location (`root`) and `dir_name`.
+pub(super) fn identity(remotes: &[Remote], root: &str, dir_name: Option<String>) -> Identity {
+    let primary = remotes.iter().find(|r| r.name == "origin").or(remotes.first());
+    let repo_name = primary
+        .and_then(|r| remote::normalize(&r.fetch_url))
+        .and_then(|n| n.rsplit('/').next().map(str::to_string))
+        .or(dir_name)
+        .unwrap_or_else(|| root.to_string());
+    Identity {
+        repo_id: remote::repo_id(primary.map(|r| r.fetch_url.as_str()), root),
+        repo_name,
+        remote: primary.map(|r| (r.name.clone(), r.fetch_url.clone())),
+    }
+}
+
 /// Worker: find the repo root, its primary remote, and the current branch (§5.2 steps 1–3).
-fn resolve(loc: Location, name: Option<String>, run: Option<String>) -> Result<Opened, String> {
-    let path = match loc {
-        Location::Local { path } => path,
-        Location::Remote { host, path } => {
-            return Err(format!(
-                "Remote workspaces are not available in this build yet ({host}:{path}).\nSSH workspaces (SPEC §5.28) are the next milestone."
-            ));
-        }
-    };
+fn resolve(path: PathBuf, name: Option<String>, run: Option<String>) -> Result<Opened, String> {
     let top = Git::new(Location::Local { path: path.clone() })
         .run(&["rev-parse", "--show-toplevel"])
         .map_err(|e| format!("{}: {}\n{}", e.summary(), path.display(), e.stderr))?;
@@ -64,20 +81,13 @@ fn resolve(loc: Location, name: Option<String>, run: Option<String>) -> Result<O
     let git = Git::new(Location::Local { path: root.clone() });
     let remotes =
         git.run(REMOTE_ARGS).map(|o| parse_remotes(&String::from_utf8_lossy(&o))).unwrap_or_default();
-    let primary = remotes.iter().find(|r| r.name == "origin").or(remotes.first());
-    let remote = primary.map(|r| (r.name.clone(), r.fetch_url.clone()));
     let branch = git
         .run(&["symbolic-ref", "--short", "-q", "HEAD"])
         .ok()
         .map(|o| String::from_utf8_lossy(&o).trim().to_string())
         .filter(|b| !b.is_empty());
-    let root_str = root.display().to_string();
-    let repo_name = primary
-        .and_then(|r| remote::normalize(&r.fetch_url))
-        .and_then(|n| n.rsplit('/').next().map(str::to_string))
-        .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| root_str.clone());
-    let repo_id = remote::repo_id(primary.map(|r| r.fetch_url.as_str()), &root_str);
+    let dir_name = root.file_name().map(|n| n.to_string_lossy().into_owned());
+    let Identity { repo_id, repo_name, remote } = identity(&remotes, &root.display().to_string(), dir_name);
     Ok(Opened { root, repo_id, repo_name, remote, branch, name, run })
 }
 
@@ -91,27 +101,29 @@ impl App {
         run: Option<String>,
     ) {
         if let Some(existing) = self.state.workspaces().iter().find(|w| same_location(&w.location, &loc)) {
-            self.state.active = Some(existing.id.clone());
-            self.dirty = true;
-            return;
+            let id = existing.id.clone();
+            return self.activate(ctx, &id);
         }
-        jobs::spawn(ctx, &self.tx, move || Msg::Opened(resolve(loc, name, run)));
+        match loc {
+            Location::Local { path } => {
+                jobs::spawn(ctx, &self.tx, move || Msg::Opened(resolve(path, name, run)))
+            }
+            remote => {
+                let keep = self.settings.ssh.tmux_default;
+                self.open_remote(ctx, remote, name, run, keep);
+            }
+        }
     }
 
-    pub(super) fn on_opened(&mut self, ctx: &egui::Context, o: Opened) {
-        let location = Location::Local { path: o.root.clone() };
-        if let Some(existing) = self.state.workspaces().iter().find(|w| w.location == location) {
-            self.state.active = Some(existing.id.clone());
-            self.dirty = true;
-            return;
-        }
+    /// A new workspace's persisted state: one tab with one terminal.
+    pub(super) fn new_workspace_state(&mut self, location: Location, name: String) -> Workspace {
         let id = self.state.new_id("w");
         let tab_id = self.state.new_id("t");
         let pane_id = self.next_pane_id();
-        let ws = Workspace {
-            name: o.name.clone().or(o.branch.clone()).unwrap_or_else(|| o.repo_name.clone()),
-            id: id.clone(),
-            location: location.clone(),
+        Workspace {
+            name,
+            id,
+            location,
             tabs: vec![Tab {
                 id: tab_id,
                 name: None,
@@ -122,7 +134,20 @@ impl App {
             active_tab: 0,
             git_view: GitView::Graph,
             git_pane_open: true,
-        };
+            keep_sessions: true,
+        }
+    }
+
+    pub(super) fn on_opened(&mut self, ctx: &egui::Context, o: Opened) {
+        let location = Location::Local { path: o.root.clone() };
+        if let Some(existing) = self.state.workspaces().iter().find(|w| w.location == location) {
+            self.state.active = Some(existing.id.clone());
+            self.dirty = true;
+            return;
+        }
+        let name = o.name.clone().or(o.branch.clone()).unwrap_or_else(|| o.repo_name.clone());
+        let ws = self.new_workspace_state(location.clone(), name);
+        let id = ws.id.clone();
         let (remote_name, url) = o.remote.clone().unzip();
         self.state.add_workspace(
             &o.repo_id,
@@ -158,6 +183,16 @@ impl App {
             return;
         }
         let Some(ws) = self.state.workspace(id).cloned() else { return };
+        if let Location::Remote { host, path } = &ws.location {
+            let live = self.remote_live(id, host, path);
+            self.live.insert(id.to_string(), live);
+            // A host another workspace already connected: start the terminals now.
+            if let Some(epoch) = self.remote.ssh.machine(host).filter(|m| m.is_connected()).map(|m| m.epoch())
+            {
+                self.spawn_remote_terminals(ctx, id, epoch);
+            }
+            return;
+        }
         let repo_id = self
             .state
             .repos
@@ -172,7 +207,7 @@ impl App {
             }
             _ => None,
         };
-        let mut live = Live { panes: HashMap::new(), trackers: HashMap::new(), git, last_message: None };
+        let mut live = Live { git, ..Live::default() };
         for tab in &ws.tabs {
             for pane in &tab.panes {
                 match self.spawn_terminal(ctx, &ws, &tab.id, pane) {
@@ -186,15 +221,33 @@ impl App {
         self.live.insert(id.to_string(), live);
     }
 
-    fn spawn_terminal(
+    pub(super) fn spawn_terminal(
         &self,
         ctx: &egui::Context,
         ws: &Workspace,
         tab: &str,
         pane: &Pane,
     ) -> Result<TerminalPane, String> {
-        let Location::Local { path: root } = &ws.location else {
-            return Err("remote terminals are not available in this build yet".into());
+        let root = match &ws.location {
+            Location::Local { path } => path,
+            // §5.28 "Terminal spawn": ssh through the host's master, into tmux when asked for.
+            Location::Remote { host, path } => {
+                let (key, cwd) = (pane_key(tab, pane.id), pane.cwd.clone().unwrap_or_else(|| path.clone()));
+                let spawn = TabSpawn { workspace_id: &ws.id, tab_id: &key, cwd: &cwd };
+                let argv = self
+                    .remote
+                    .ssh
+                    .terminal_argv_with(host, &spawn, ws.keep_sessions)
+                    .ok_or_else(|| format!("{host} is not connected"))?;
+                let (program, args) = argv.split_first().ok_or("empty ssh command")?;
+                let spec = Spawn {
+                    cwd: crate::paths::home().unwrap_or_else(std::env::temp_dir),
+                    env: Vec::new(),
+                    program: Some((program.clone(), args.to_vec())),
+                    scrollback: self.settings.terminal.scrollback as usize,
+                };
+                return TerminalPane::spawn(spec, ctx).map_err(|e| e.to_string());
+            }
         };
         let cwd = pane.cwd.as_ref().map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| root.clone());
         let env = vec![
@@ -246,6 +299,9 @@ impl App {
     }
 
     fn add_terminal(&mut self, ctx: &egui::Context, ws: &Workspace, tab_id: &str, pane: &Pane) {
+        if self.remote_down(&ws.id) {
+            return; // it starts with the others once the host is back (`remote.rs`)
+        }
         match self.spawn_terminal(ctx, ws, tab_id, pane) {
             Ok(term) => {
                 if let Some(live) = self.live.get_mut(&ws.id) {
@@ -280,12 +336,30 @@ impl App {
             live.panes.remove(&target);
             live.trackers.remove(&key);
         }
+        // A remote pane's tmux session would live on, detached, on the host.
+        if let Some(host) = self.live.get(&id).and_then(|l| l.remote.as_ref()).map(|r| r.host.clone()) {
+            let tmux = self.state.workspace(&id).is_some_and(|w| w.keep_sessions);
+            self.remote.ssh.end_session(&host, &key, tmux);
+        }
     }
 
+    /// `Mod+Shift+W` / row menu **Close**; a remote workspace in tmux asks keep or kill first.
     pub(super) fn close_workspace(&mut self, id: &str) {
-        self.live.remove(id);
+        if !self.close_remote_or_ask(id) {
+            self.finish_close(id);
+        }
+    }
+
+    pub(super) fn finish_close(&mut self, id: &str) {
+        self.drop_live(id);
         self.state.remove_workspace(id);
         self.dirty = true;
+    }
+
+    /// Stop a workspace's runtime; a remote one lets go of its host and forwards.
+    pub(super) fn drop_live(&mut self, id: &str) {
+        self.release_remote(id);
+        self.live.remove(id);
     }
 
     fn focused_cwd(&self) -> Option<String> {
@@ -312,5 +386,37 @@ fn same_location(a: &Location, b: &Location) -> bool {
             canon(pa) == canon(pb)
         }
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote(name: &str, url: &str) -> Remote {
+        Remote { name: name.into(), fetch_url: url.into(), push_url: url.into() }
+    }
+
+    #[test]
+    fn local_and_remote_clones_of_one_repo_share_an_identity() {
+        let url = "https://github.com/acme/conduit.git";
+        let local = identity(&[remote("origin", url)], "/home/a/w/conduit", Some("conduit".into())); // portability: allow
+        let over_ssh = identity(&[remote("origin", url)], "gpu-box:~/conduit-2", Some("conduit-2".into()));
+        assert_eq!(local, over_ssh);
+        assert_eq!(local.repo_name, "conduit");
+        assert_eq!(local.remote, Some(("origin".into(), url.into())));
+    }
+
+    #[test]
+    fn origin_wins_and_no_remote_falls_back_to_the_location() {
+        let id = identity(
+            &[remote("fork", "https://x.org/me/a.git"), remote("origin", "https://x.org/u/b.git")],
+            "r",
+            None,
+        );
+        assert_eq!(id.repo_name, "b");
+        let bare = identity(&[], "gpu-box:~/scratch", Some("scratch".into()));
+        assert_eq!((bare.repo_name.as_str(), bare.remote), ("scratch", None));
+        assert_eq!(bare.repo_id, remote::repo_id(None, "gpu-box:~/scratch"), "the placeholder group's id");
     }
 }

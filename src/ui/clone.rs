@@ -83,10 +83,10 @@ impl CloneSheet {
         }
         self.home = crate::paths::home();
         self.form = Some(CloneForm::new(&settings.clone_dir()));
-        let home = self.home.clone();
+        let config_path = settings.ssh.config_path(self.home.as_deref());
         super::jobs::spawn(ctx, &self.tx, move || {
             let clipboard = arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok();
-            let config = home.and_then(|h| std::fs::read_to_string(h.join(".ssh").join("config")).ok());
+            let config = config_path.and_then(|p| std::fs::read_to_string(p).ok());
             Reply::Prefill {
                 clipboard,
                 hosts: config.map(|c| crate::ssh::config_hosts(&c)).unwrap_or_default(),

@@ -191,6 +191,8 @@ pub struct Machine {
     backoff: Backoff,
     /// Warnings of the attempt in flight, moved into `Connected`.
     pending: Vec<Warning>,
+    /// The latest failed attempt's error, for the banner's **Details** while retrying.
+    last_error: Option<GitError>,
 }
 
 impl Machine {
@@ -202,11 +204,17 @@ impl Machine {
             epoch: 0,
             backoff: Backoff::new(backoff_cap),
             pending: Vec::new(),
+            last_error: None,
         }
     }
 
     pub fn phase(&self) -> &Phase {
         &self.phase
+    }
+
+    /// Why the latest attempt failed (ssh's stderr under **Details**); cleared on connect.
+    pub fn last_error(&self) -> Option<&GitError> {
+        self.last_error.as_ref()
     }
 
     /// Epoch of the current (or last) attempt.
@@ -274,6 +282,7 @@ impl Machine {
             (Event::Connected { epoch }, P::Connecting { .. } | P::Lost { .. }) if epoch == self.epoch => {
                 self.phase = P::Connected { warnings: std::mem::take(&mut self.pending) };
                 self.backoff.reset();
+                self.last_error = None;
                 None
             }
             // An attempt the user cancelled (however many cancels ago) still opened forwards:
@@ -285,6 +294,7 @@ impl Machine {
                 if epoch == self.epoch =>
             {
                 self.pending.clear();
+                self.last_error = Some(error.clone());
                 if fatal {
                     self.phase = P::Failed { step, error };
                     return None;
@@ -582,6 +592,19 @@ mod tests {
         assert_eq!(m.banner(21.7).unwrap(), "Connection lost 11 s ago · retrying in 1 s");
         assert_eq!(m.banner(22.0).unwrap(), "Connection lost 12 s ago · retrying in 1 s", "never 0 s");
         assert_eq!(m.banner(10.0 + 185.0).unwrap(), "Connection lost 3 min ago · retrying in 1 s");
+    }
+
+    #[test]
+    fn the_last_failure_is_kept_for_details_until_connected() {
+        let mut m = machine();
+        let epoch = epoch_of(m.handle(Event::Connect, 0.0));
+        let error = err(255, "ssh: connect to host gpu-box port 22: Connection refused");
+        m.handle(Event::Failed { epoch, step: Step::Master, error: error.clone(), fatal: false }, 1.0);
+        assert!(matches!(m.phase(), Phase::Retrying { .. }));
+        assert_eq!(m.last_error(), Some(&error));
+        let epoch = epoch_of(m.handle(Event::RetryNow, 2.0));
+        m.handle(Event::Connected { epoch }, 3.0);
+        assert_eq!(m.last_error(), None);
     }
 
     #[test]

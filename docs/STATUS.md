@@ -24,7 +24,7 @@ shells) found 55 distinct defects; all were fixed test-first and each fix was at
 | Spec | Module | Status |
 |---|---|---|
 | §5.31 control socket, protocol, CLI, offline queue | `ctl::*` | ✅ |
-| §5.28 ssh/tmux argv builders, quoting, backoff, host-key prompt parsing | `ssh` | ✅ (the connection manager that runs them is ⬜) |
+| §5.28 ssh/tmux argv builders, quoting, backoff, host-key prompt parsing, connection manager | `ssh` | ✅ |
 | §5.7, §5.17 status porcelain v2, in-progress operation detection | `git::status` | ✅ |
 | §5.9–5.12, §5.21 refs, stashes, worktrees, remotes | `git::refs` | ✅ |
 | §5.4 log parsing, incremental lane layout | `git::log`, `git::graph` | ✅ |
@@ -55,8 +55,8 @@ in CI but has not been looked at on a real display.
 | §4 theme: tokens, System/Light/Dark, `Mod+Alt+D`; bundled Inter + JetBrains Mono | ✅ | UI scale and system accent ⬜ |
 | §5.1 welcome screen, recents, missing-path handling | ✅ | first-launch hooks banner shows a hint, not the installer |
 | §5.2 open folder: `amalgum <path>`, drag-and-drop, path sheet, single-instance forwarding | ✅ | native folder picker ⬜; non-repo "Initialize?" ⬜ |
-| §5.3 clone | ✅ | sheet, clipboard autofill, shallow, clone on a remote host, progress + cancel; native folder picker ⬜; opening a remote clone waits on §5.28 |
-| §5.28 SSH workspaces | ⬜ | next milestone; `ssh` argv builders, quoting, parsers exist |
+| §5.3 clone | ✅ | sheet, clipboard autofill, shallow, clone on a remote host, progress + cancel; native folder picker ⬜ |
+| §5.28 SSH workspaces | 🟡 | `ui/app/remote.rs`: `amalgum open host:path`, Connect to host sheet (host list from ssh config, tmux option), restore on launch, W16 progress line / banner / host-key dialog, tmux reattach on reconnect, remote git pane (10 s poll), hooks live and drained, ⊘ row + Disconnect / Reconnect / Kill sessions, `ssh -L` forwards in a ports popover; listening remote ports are not discovered (forward by number), file drag-and-drop upload ⬜, Settings → SSH per-host table ⬜ (settings.toml `[ssh]`, read at launch) |
 | §5.4 graph: streamed log, lanes, chips, working-tree row, selection, commit context menu | ✅ | focus mode, collapse, drag-and-drop ⬜ |
 | §5.5–5.6 details and diff (word-level) | 🟡 | unified only; split view, images, blame ⬜ |
 | §5.7 Changes: stage/unstage, per-hunk stage/unstage/discard, commit, amend | ✅ | line-range selection, sign-off, commit-and-push ⬜ |

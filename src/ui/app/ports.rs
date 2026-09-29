@@ -18,6 +18,7 @@ impl App {
         let roots: Vec<(String, u32)> = self
             .live
             .iter()
+            .filter(|(_, live)| live.remote.is_none()) // remote ports come from forwards
             .flat_map(|(ws, live)| live.panes.values().map(move |t| (ws.clone(), t.pid())))
             .collect();
         jobs::spawn(ctx, &self.tx, move || Msg::Ports(listening_by_workspace(&roots)));

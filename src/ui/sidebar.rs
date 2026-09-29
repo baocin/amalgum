@@ -26,6 +26,18 @@ pub struct RowInfo {
     pub last_message: Option<(String, u64)>,
     /// "reconnecting 12s", "hibernated", …
     pub note: Option<String>,
+    /// Remote workspaces: the host's link, which picks the row menu's entries.
+    pub remote: Option<RemoteLink>,
+}
+
+/// A remote workspace's host, as the row menu sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteLink {
+    Connected,
+    /// Connecting, lost, or waiting to retry: **Reconnect** now, or **Disconnect** to stop (§5.28).
+    Reconnecting,
+    /// Disconnected, failed, or waiting on the host key: only **Reconnect**.
+    Down,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +48,14 @@ pub enum SidebarAction {
     Rename(String, String),
     MoveUp(String),
     MoveDown(String),
-    OpenPort(u16),
+    /// A port listed on workspace `.0`'s row.
+    OpenPort(String, u16),
     RevealInFileManager(String),
+    /// Remote rows (§5.22, §5.28): the host's connection and its tmux sessions, and W18.
+    Disconnect(String),
+    Reconnect(String),
+    KillSessions(String),
+    Ports(String),
     CopyPath(String),
     OpenInExternalTerminal(String),
     ToggleRepo(String),
@@ -214,12 +232,19 @@ fn remote_header(ui: &mut egui::Ui, group: &RemoteGroup, colors: &Colors) {
         ui.add_space(14.0);
         ui.label(format!("▾ {}", group.name));
         if let Some(url) = &group.url {
-            ui.colored_label(colors.get(Token::FgSecondary), url);
+            // Elided: a long URL (or a path remote) must not widen the sidebar.
+            let url = egui::RichText::new(url).color(colors.get(Token::FgSecondary));
+            ui.add(egui::Label::new(url).truncate());
         }
     });
 }
 
-fn row_menu_items(ui: &mut egui::Ui, ws: &Workspace, mem: &mut UiState) -> Option<SidebarAction> {
+fn row_menu_items(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    remote: Option<RemoteLink>,
+    mem: &mut UiState,
+) -> Option<SidebarAction> {
     let mut result = None;
     if ui.button("Rename").clicked() {
         mem.renaming = Some(ws.id.clone());
@@ -239,6 +264,23 @@ fn row_menu_items(ui: &mut egui::Ui, ws: &Workspace, mem: &mut UiState) -> Optio
     }
     if ui.button("Copy path").clicked() {
         result = Some(SidebarAction::CopyPath(ws.id.clone()));
+    }
+    if let Some(link) = remote {
+        ui.separator();
+        if link != RemoteLink::Connected && ui.button("Reconnect").clicked() {
+            result = Some(SidebarAction::Reconnect(ws.id.clone()));
+        }
+        if link != RemoteLink::Down && ui.button("Disconnect").clicked() {
+            result = Some(SidebarAction::Disconnect(ws.id.clone()));
+        }
+        if link == RemoteLink::Connected {
+            if ui.button("Forward a port…").clicked() {
+                result = Some(SidebarAction::Ports(ws.id.clone()));
+            }
+            if ui.button("Kill sessions…").clicked() {
+                result = Some(SidebarAction::KillSessions(ws.id.clone()));
+            }
+        }
     }
     ui.separator();
     if ui.button("Close").clicked() {
@@ -289,7 +331,7 @@ fn workspace_row(
                 ui.label(&ws.name);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let dots = ui.menu_button("⋯", |ui| row_menu_items(ui, ws, mem));
+                let dots = ui.menu_button("⋯", |ui| row_menu_items(ui, ws, info.remote, mem));
                 if let Some(Some(a)) = dots.inner {
                     action = Some(a);
                 }
@@ -311,7 +353,7 @@ fn workspace_row(
             ui.horizontal(|ui| {
                 for &port in &info.ports {
                     if ui.link(format!(":{port}")).clicked() {
-                        action = Some(SidebarAction::OpenPort(port));
+                        action = Some(SidebarAction::OpenPort(ws.id.clone(), port));
                     }
                 }
             });
@@ -337,7 +379,7 @@ fn workspace_row(
     let row_id = ui.id().with(("sidebar-row", ws.id.as_str()));
     let row_resp = ui.interact(frame.response.rect, row_id, egui::Sense::click());
     row_resp.context_menu(|ui| {
-        if let Some(a) = row_menu_items(ui, ws, mem) {
+        if let Some(a) = row_menu_items(ui, ws, info.remote, mem) {
             action = Some(a);
         }
     });
@@ -433,6 +475,7 @@ mod tests {
             active_tab: 0,
             git_view: crate::model::state::GitView::default(),
             git_pane_open: false,
+            keep_sessions: true,
         }
     }
 }

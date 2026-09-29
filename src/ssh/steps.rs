@@ -141,9 +141,12 @@ pub fn parse_drain(stdout: &str) -> Drained {
     drained
 }
 
-/// sshd said no to a forward (rather than the connection failing).
+/// sshd said no to a forward, or ssh would not name it (a listen path longer than `sun_path`),
+/// rather than the connection failing: the host stays usable in queue mode.
 fn forward_refused(stderr: &str) -> bool {
-    stderr.contains("forwarding failed") || stderr.contains("forwarding request failed")
+    stderr.contains("forwarding failed")
+        || stderr.contains("forwarding request failed")
+        || stderr.contains("Bad remote forwarding specification")
 }
 
 fn local_error(command: &str, stderr: String) -> GitError {
@@ -416,6 +419,25 @@ impl Link<'_> {
             Err(e)
                 if e.code != Some(255)
                     && (e.stderr.contains("no server running") || e.stderr.contains("error connecting")) =>
+            {
+                Ok(())
+            }
+            other => other.map(drop),
+        }
+    }
+}
+
+impl Link<'_> {
+    /// A closed tab: `tmux -L amalgum kill-session -t =<session>` (`=`: that exact name, not
+    /// a prefix). A session or server already gone is success.
+    pub fn end_session(&self, session: &str) -> Result<(), GitError> {
+        let target = format!("={session}");
+        match self.exec(&["tmux", "-L", super::TMUX_SERVER, "kill-session", "-t", &target], None) {
+            Err(e)
+                if e.code != Some(255)
+                    && ["can't find session", "no server running", "error connecting"]
+                        .iter()
+                        .any(|gone| e.stderr.contains(gone)) =>
             {
                 Ok(())
             }
@@ -1064,6 +1086,13 @@ pub(crate) mod tests {
             Ok(SocketStatus::Refused { ssh_said: refused.into() })
         ); // portability: allow
 
+        let bad = "Bad remote forwarding specification '/h/x:/l'\n"; // portability: allow
+        let r = FakeRunner::default().on("-O forward", out(255, "", bad));
+        assert!(matches!(
+            link(&r, &c).forward_socket("/h/x", &local), // portability: allow
+            Ok(SocketStatus::Refused { .. })
+        ));
+
         let colon = link(&r, &c).forward_socket("/h/a:b/.amalgum/run/a.sock", &local).unwrap(); // portability: allow
         assert!(
             matches!(colon, SocketStatus::Refused { ref ssh_said } if ssh_said.contains("':'")),
@@ -1085,6 +1114,21 @@ pub(crate) mod tests {
         assert!(r.ran("tmux -L amalgum kill-server"));
         let r = FakeRunner::default().on("kill-server", out(255, "", "Connection closed\n"));
         assert!(link(&r, &c).kill_sessions().is_err());
+    }
+
+    #[test]
+    fn ending_a_tabs_session_targets_that_exact_name_and_tolerates_it_being_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = conn(dir.path());
+        let r = FakeRunner::default();
+        assert_eq!(link(&r, &c).end_session("t1_1"), Ok(()));
+        assert!(r.ran("kill-session -t '=t1_1'"), "{:?}", r.commands());
+        let r = FakeRunner::default().on("kill-session", out(1, "", "can't find session: t1_1\n"));
+        assert_eq!(link(&r, &c).end_session("t1_1"), Ok(()));
+        let r = FakeRunner::default().on("kill-session", out(255, "", "Connection closed\n"));
+        assert!(link(&r, &c).end_session("t1_1").is_err());
+        let r = FakeRunner::default().on("kill-session", out(1, "", "permission denied\n"));
+        assert!(link(&r, &c).end_session("t1_1").is_err(), "anything else is reported");
     }
 
     #[test]

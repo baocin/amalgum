@@ -61,6 +61,13 @@ pub struct Workspace {
     pub active_tab: usize,
     pub git_view: GitView,
     pub git_pane_open: bool,
+    /// Remote only: W15 **Keep sessions alive with tmux on the host** (§5.28 "Terminal spawn").
+    #[serde(default = "yes")]
+    pub keep_sessions: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,6 +178,39 @@ impl AppState {
         if self.active.is_none() {
             self.active = Some(id);
         }
+    }
+
+    /// Move workspace `id` under repo `repo_id` / remote `remote` (created if new) once its
+    /// real identity is known (§5.28 step 5: a remote workspace is read over ssh after it is
+    /// created). A repo group left without workspaces by the move is dropped: it only held
+    /// this workspace until it was identified. Returns whether anything moved.
+    pub fn rehome_workspace(
+        &mut self,
+        id: &str,
+        repo_id: &str,
+        repo_name: &str,
+        remote: &str,
+        url: Option<&str>,
+    ) -> bool {
+        let Some((ri, gi, wi)) = self.repos.iter().enumerate().find_map(|(ri, r)| {
+            r.remotes
+                .iter()
+                .enumerate()
+                .find_map(|(gi, g)| g.workspaces.iter().position(|w| w.id == id).map(|wi| (ri, gi, wi)))
+        }) else {
+            return false;
+        };
+        if self.repos[ri].id == repo_id && self.repos[ri].remotes[gi].name == remote {
+            return false;
+        }
+        let ws = self.repos[ri].remotes[gi].workspaces.remove(wi);
+        if self.repos[ri].remotes.iter().all(|g| g.workspaces.is_empty()) {
+            self.repos.remove(ri);
+        }
+        let active = self.active.take();
+        self.add_workspace(repo_id, repo_name, remote, url, ws);
+        self.active = active;
+        true
     }
 
     /// Removes `id` from its remote group (the group and its repo survive empty, per §5.22
@@ -314,7 +354,38 @@ mod tests {
             active_tab: 0,
             git_view: GitView::default(),
             git_pane_open: true,
+            keep_sessions: true,
         }
+    }
+
+    #[test]
+    fn rehoming_moves_a_workspace_to_its_identified_repo_and_drops_the_placeholder() {
+        let url = "ssh://example.com/a/conduit.git";
+        let mut state = AppState::default();
+        state.add_workspace("r-local", "conduit", "origin", Some(url), ws("w0"));
+        state.add_workspace("pending", "conduit", "", None, ws("w1"));
+        state.active = Some("w1".into());
+
+        assert!(state.rehome_workspace("w1", "r-local", "conduit", "origin", Some(url)));
+        assert_eq!(state.repos.len(), 1, "the placeholder group is gone");
+        let ids: Vec<&str> = state.repos[0].remotes[0].workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w0", "w1"]);
+        assert_eq!(state.active.as_deref(), Some("w1"), "the active workspace stays active");
+
+        assert!(!state.rehome_workspace("w1", "r-local", "conduit", "origin", None), "already there");
+        assert!(!state.rehome_workspace("nope", "r", "n", "", None));
+
+        assert!(state.rehome_workspace("w1", "r-local", "conduit", "upstream", Some("u")));
+        assert_eq!(state.repos.len(), 1, "a group that still has workspaces stays");
+        assert_eq!(state.repos[0].remotes[1].name, "upstream");
+    }
+
+    #[test]
+    fn keep_sessions_defaults_on_for_older_state_files() {
+        let mut v = serde_json::to_value(ws("w0")).unwrap();
+        v.as_object_mut().unwrap().remove("keep_sessions");
+        let w: Workspace = serde_json::from_value(v).unwrap();
+        assert!(w.keep_sessions);
     }
 
     // --- load / save -----------------------------------------------------

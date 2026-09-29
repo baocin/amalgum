@@ -79,6 +79,8 @@ pub enum GitEvent {
     Sync(requests::SyncRequest),
     /// Refs → remote → **Bind active workspace to this remote** (§5.10).
     BindRemote(String),
+    /// A remote read failed with ssh's own exit code: check the host's connection (§5.28).
+    HostUnreachable,
 }
 
 /// The graph's current selection.
@@ -147,6 +149,8 @@ pub struct GitPane {
     undo_busy: bool,
 
     live: Live,
+    /// A remote repo's host is reachable; while not, polling pauses (§5.28 reconnecting).
+    online: bool,
     last_summary: RepoSummary,
     initial_loading: bool,
     /// Fetch / pull / push (§5.10), see [`sync`].
@@ -156,7 +160,13 @@ pub struct GitPane {
 impl GitPane {
     /// Start loading status, refs, and the first 500 commits in the background.
     pub fn new(location: Location, journal_path: PathBuf, ctx: &egui::Context) -> Self {
-        let git = Git::new(location.clone());
+        Self::with_git(Git::new(location), journal_path, ctx)
+    }
+
+    /// [`new`](Self::new) with a prepared runner: a remote repo's comes from the ssh manager
+    /// (its ControlMaster and `-F` config, §5.28 "Remote git").
+    pub fn with_git(git: Git, journal_path: PathBuf, ctx: &egui::Context) -> Self {
+        let location = git.location.clone();
         let journal = Journal::load(&journal_path).unwrap_or_default();
         let (tx, rx) = channel();
 
@@ -203,6 +213,7 @@ impl GitPane {
             log_refetch_dispatched_gen: 0,
             undo_busy: false,
             live,
+            online: true,
             last_summary: RepoSummary::default(),
             initial_loading: true,
             sync: sync::SyncState::default(),
@@ -216,8 +227,21 @@ impl GitPane {
         self.view = view;
     }
 
-    /// Re-read status, refs, and the head of the log (after hook events, focus, fetch).
+    /// The host went away or came back: pause polling while offline, refresh on return.
+    pub fn set_online(&mut self, online: bool) {
+        let back = online && !self.online;
+        self.online = online;
+        if back {
+            self.refresh();
+        }
+    }
+
+    /// Re-read status, refs, and the head of the log (after hook events, focus, fetch). A no-op
+    /// while the host is down: coming back online refreshes.
     pub fn refresh(&mut self) {
+        if !self.online {
+            return;
+        }
         self.generation += 1;
         let ctx = self.ctx.clone();
         self.dispatch_refresh_jobs(&ctx);
@@ -259,7 +283,7 @@ impl GitPane {
         let frame_time = ctx.input(|i| i.time);
         let mut events = self.drain_replies(&ctx);
 
-        self.poll_watch(&ctx, frame_time);
+        self.poll_watch(&ctx, frame_time, settings.git.remote_refresh_secs);
 
         self.show_sync_toolbar(ui, colors, preset, &mut events);
         ui.horizontal(|ui| {
@@ -436,9 +460,7 @@ impl GitPane {
                             self.maybe_refetch_log(ctx);
                         }
                     }
-                    Err(e) => {
-                        events.push(GitEvent::Toast(Toast::error("Could not read status", e.to_string())))
-                    }
+                    Err(e) => self.read_failed("Could not read status", &e, events),
                 }
             }
             Reply::Refs { page_gen, result } => {
@@ -456,17 +478,14 @@ impl GitPane {
                             self.maybe_refetch_log(ctx);
                         }
                     }
-                    Err(e) => {
-                        events.push(GitEvent::Toast(Toast::error("Could not read refs", e.to_string())))
-                    }
+                    Err(e) => self.read_failed("Could not read refs", &e, events),
                 }
             }
             Reply::Stashes { page_gen, result } => {
                 if worker::gen_is_current(page_gen, self.generation) {
                     match result {
                         Ok(s) => self.stashes = s,
-                        Err(e) => events
-                            .push(GitEvent::Toast(Toast::error("Could not read stashes", e.to_string()))),
+                        Err(e) => self.read_failed("Could not read stashes", &e, events),
                     }
                 }
             }
@@ -474,8 +493,7 @@ impl GitPane {
                 if worker::gen_is_current(page_gen, self.generation) {
                     match result {
                         Ok(w) => self.worktrees = w,
-                        Err(e) => events
-                            .push(GitEvent::Toast(Toast::error("Could not read worktrees", e.to_string()))),
+                        Err(e) => self.read_failed("Could not read worktrees", &e, events),
                     }
                 }
             }
@@ -483,8 +501,7 @@ impl GitPane {
                 if worker::gen_is_current(page_gen, self.generation) {
                     match result {
                         Ok(r) => self.remotes = r,
-                        Err(e) => events
-                            .push(GitEvent::Toast(Toast::error("Could not read remotes", e.to_string()))),
+                        Err(e) => self.read_failed("Could not read remotes", &e, events),
                     }
                 }
             }
@@ -502,9 +519,7 @@ impl GitPane {
                 }
                 match result {
                     Ok(commits) => self.apply_log_page(commits, requested),
-                    Err(e) => {
-                        events.push(GitEvent::Toast(Toast::error("Could not read history", e.to_string())))
-                    }
+                    Err(e) => self.read_failed("Could not read history", &e, events),
                 }
             }
             Reply::CommitBody { id, result } => self.apply_commit_body(id, result),
@@ -537,6 +552,20 @@ impl GitPane {
         self.log_loaded = 0;
         self.log_has_more = true;
         self.dispatch_log_page(ctx, n);
+    }
+}
+
+impl GitPane {
+    /// A background read failed. Over ssh, exit 255 is ssh itself (the connection, not the
+    /// repo): ask the app to check the host — the W16 banner takes over if it is gone — and
+    /// say so in a warning that fades, not an error that stays.
+    fn read_failed(&self, what: &str, e: &GitError, events: &mut Vec<GitEvent>) {
+        if matches!(self.location, Location::Remote { .. }) && e.code == Some(255) {
+            events.push(GitEvent::HostUnreachable);
+            events.push(GitEvent::Toast(Toast::warning(format!("{what}: {}", e.summary()), e.to_string())));
+            return;
+        }
+        events.push(GitEvent::Toast(Toast::error(what, e.to_string())));
     }
 }
 
@@ -753,7 +782,11 @@ fn is_excluded(path: &std::path::Path) -> bool {
 }
 
 impl GitPane {
-    fn poll_watch(&mut self, ctx: &egui::Context, frame_time: f64) {
+    /// Local: the watcher's debounced refresh. Remote (or a local repo the watcher could not
+    /// cover): poll while visible — this runs from `show` — every `remote_refresh_secs` with
+    /// `git status` and `git for-each-ref` (§5.25), every 2 s with status for the local fallback.
+    fn poll_watch(&mut self, ctx: &egui::Context, frame_time: f64, remote_refresh_secs: u32) {
+        let remote = matches!(self.location, Location::Remote { .. });
         match &mut self.live {
             Live::Watcher { dirty, debounce_until, .. } => {
                 if dirty.swap(false, Ordering::Relaxed) && debounce_until.is_none() {
@@ -769,10 +802,21 @@ impl GitPane {
                 }
             }
             Live::Poll { last_poll } => {
-                if frame_time - *last_poll >= 2.0 {
-                    *last_poll = frame_time;
-                    self.dispatch_status(ctx);
+                let every = if remote { f64::from(remote_refresh_secs.max(1)) } else { 2.0 };
+                if !self.online {
+                    return;
                 }
+                let due = *last_poll + every;
+                if frame_time < due {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(due - frame_time));
+                    return;
+                }
+                *last_poll = frame_time;
+                self.dispatch_status(ctx);
+                if remote {
+                    self.dispatch_refs(ctx);
+                }
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(every));
             }
         }
     }
@@ -917,6 +961,7 @@ mod tests {
             log_refetch_dispatched_gen: 0,
             undo_busy: false,
             live: Live::Poll { last_poll: 0.0 },
+            online: true,
             last_summary: RepoSummary::default(),
             initial_loading: true,
             sync: sync::SyncState::default(),

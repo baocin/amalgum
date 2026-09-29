@@ -102,6 +102,11 @@ pub enum HostEvent {
         host: String,
         result: Result<(), GitError>,
     },
+    /// [`Manager::end_session`] answered.
+    SessionEnded {
+        host: String,
+        result: Result<(), GitError>,
+    },
 }
 
 enum Msg {
@@ -286,9 +291,16 @@ impl Manager {
 
     /// The argv for a terminal tab on `host`, or `None` until the host is connected.
     pub fn terminal_argv(&self, host: &str, tab: &TabSpawn) -> Option<Vec<String>> {
+        self.terminal_argv_with(host, tab, self.settings.keepalive)
+    }
+
+    /// [`terminal_argv`](Self::terminal_argv) for a workspace that chose tmux itself (W15
+    /// **Keep sessions alive with tmux**): tmux only when `keepalive` and the host has a usable
+    /// one. Asking for tmux needs [`Settings::keepalive`] on, which prepares hosts for it.
+    pub fn terminal_argv_with(&self, host: &str, tab: &TabSpawn, keepalive: bool) -> Option<Vec<String>> {
         let entry = self.hosts.get(host).filter(|h| h.machine.is_connected())?;
         let session = entry.session.as_ref()?;
-        let tmux = session.use_tmux(self.settings.keepalive);
+        let tmux = session.use_tmux(keepalive && self.settings.keepalive);
         Some(terminal::terminal_argv(&self.settings.ssh_bin, &entry.conn, &session.remote_socket, tab, tmux))
     }
 
@@ -336,6 +348,22 @@ impl Manager {
         self.work(move |w| {
             let result = w.link(&conn).kill_sessions();
             w.send(Msg::Event(HostEvent::SessionsKilled { host, result }));
+        });
+    }
+
+    /// A tab closed: end its tmux session on the host, which would otherwise live on detached.
+    /// Nothing to do unless the tab ran in tmux (`keepalive` as for
+    /// [`terminal_argv_with`](Self::terminal_argv_with)) on a connected host.
+    pub fn end_session(&mut self, host: &str, tab_id: &str, keepalive: bool) {
+        let Some(entry) = self.hosts.get(host).filter(|h| h.machine.is_connected()) else { return };
+        if !entry.session.as_ref().is_some_and(|s| s.use_tmux(keepalive && self.settings.keepalive)) {
+            return;
+        }
+        let (conn, host, session) =
+            (entry.conn.clone(), host.to_string(), terminal::tmux_session_name(tab_id));
+        self.work(move |w| {
+            let result = w.link(&conn).end_session(&session);
+            w.send(Msg::Event(HostEvent::SessionEnded { host, result }));
         });
     }
 
@@ -765,10 +793,11 @@ mod tests {
         m.acquire("gpu-box", "ws1", "~/a", now).unwrap();
         pump(&mut m, &mut now, connected);
 
-        let argv =
-            m.terminal_argv("gpu-box", &TabSpawn { workspace_id: "ws1", tab_id: "t1", cwd: "~/a" }).unwrap();
+        let tab = TabSpawn { workspace_id: "ws1", tab_id: "t1", cwd: "~/a" };
+        let argv = m.terminal_argv("gpu-box", &tab).unwrap();
         let want = "cd ~/a && exec env AMALGUM_SOCK=/home/u/.amalgum/run/app1.sock"; // portability: allow
         assert!(argv.last().unwrap().starts_with(want), "no tmux on this host: {argv:?}");
+        assert_eq!(m.terminal_argv_with("gpu-box", &tab, false), Some(argv));
         let git = m.git("gpu-box", "~/a").unwrap();
         assert!(git.argv(&["status"]).iter().any(|a| a.starts_with("ControlPath=")));
 

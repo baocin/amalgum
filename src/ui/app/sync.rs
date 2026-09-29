@@ -30,6 +30,9 @@ impl App {
         let mut events = Vec::new();
         let mut attention = Vec::new();
         for id in ids {
+            if self.remote_down(&id) {
+                continue; // a remote repo waits for its host (§5.28)
+            }
             let bound = self.bound_remote(&id);
             if let Some(git) = self.live.get_mut(&id).and_then(|l| l.git.as_mut()) {
                 events.extend(git.sync_tick(ctx, &self.settings, bound.as_deref(), now));

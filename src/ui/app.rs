@@ -5,10 +5,14 @@
 //! - `app/events.rs`    control-socket requests and terminal events → agent status, notifications
 //! - `app/actions.rs`   actions from the palette, menu bar, and shortcuts
 //! - `app/surface.rs`   the center area: tab strip and split terminal panes
+//! - `app/remote.rs`    remote workspaces: the ssh manager, W16, W18 forwards (§5.28)
+//! - `app/open_sheet.rs` Open folder / Connect to host (W15's location part)
 
 mod actions;
 mod events;
+mod open_sheet;
 mod ports;
+mod remote;
 mod surface;
 mod sync;
 mod workspace;
@@ -41,12 +45,15 @@ enum Focus {
 }
 
 /// Runtime objects for one workspace. Persistent facts live in `AppState`.
+#[derive(Default)]
 struct Live {
     panes: HashMap<PaneId, TerminalPane>,
     /// Agent status per terminal, keyed by the pane's `AMALGUM_TAB` id (`<tab>.<pane>`).
     trackers: HashMap<String, Tracker>,
     git: Option<GitPane>,
     last_message: Option<(String, u64)>,
+    /// Remote workspaces: the host and the connection the terminals run on.
+    remote: Option<remote::RemoteLive>,
 }
 
 /// Results coming back from worker threads.
@@ -55,6 +62,8 @@ enum Msg {
     /// Listening ports per workspace (`app/ports.rs`).
     Ports(HashMap<String, Vec<u16>>),
     SettingsSaved(Result<(), String>),
+    /// `Host` aliases for the open sheet (§5.22 W15).
+    SshHosts(Vec<String>),
 }
 
 pub struct App {
@@ -75,7 +84,9 @@ pub struct App {
     palette: Option<Palette>,
     /// §5.3 clone sheet and its running clone.
     clone: super::clone::CloneSheet,
-    open_sheet: Option<String>,
+    open_sheet: Option<open_sheet::OpenSheet>,
+    /// SSH workspaces (§5.28).
+    remote: remote::Remote,
     show_notifications: bool,
     show_sidebar: bool,
     /// `Mod+Shift+Enter`: the focused terminal fills its tab.
@@ -127,7 +138,9 @@ impl App {
             })
             .ok();
         let (tx, rx) = channel();
+        let remote = remote::Remote::new(ctx, &dirs, &settings);
         let mut app = Self {
+            remote,
             saver: spawn_saver(dirs.state()),
             dirs,
             keymap: Keymap::new(Preset::native()),
@@ -217,17 +230,19 @@ impl App {
             .map(|ws| {
                 let s = self.summary(&ws.id);
                 let (status, low_confidence) = self.workspace_status(&ws.id);
-                let info = RowInfo {
+                let mut info = RowInfo {
                     status,
                     low_confidence,
                     branch: s.branch.or(s.detached),
                     ahead: s.ahead,
                     behind: s.behind,
                     dirty: s.changed,
-                    ports: self.ports.get(&ws.id).cloned().unwrap_or_default(),
+                    ports: self.workspace_ports(&ws.id),
                     last_message: self.live.get(&ws.id).and_then(|l| l.last_message.clone()),
                     note: None,
+                    remote: None,
                 };
+                self.remote_row(&ws.id, &mut info);
                 (ws.id.clone(), info)
             })
             .collect()
@@ -246,9 +261,9 @@ impl App {
             changed: s.changed,
             op: s.op.map(|op| (op, s.conflicts)),
             agent,
-            ports: self.ports.get(ws).cloned().unwrap_or_default(),
+            ports: self.workspace_ports(ws),
             unread: self.notifications.unread(),
-            remote_state: None,
+            remote_state: self.remote_state(ws),
             sync: self.sync_status(ws),
         }
     }
@@ -274,7 +289,7 @@ impl App {
                     })
                     .collect();
                 serde_json::json!({
-                    "id": ws.id, "name": ws.name, "ports": self.ports.get(&ws.id), "location": workspace::location_label(&ws.location, None),
+                    "id": ws.id, "name": ws.name, "ports": self.workspace_ports(&ws.id), "location": workspace::location_label(&ws.location, None),
                     "status": self.workspace_status(&ws.id).0, "tabs": tabs,
                 })
             })
@@ -294,6 +309,11 @@ impl App {
                 Msg::Opened(Ok(opened)) => self.on_opened(ctx, opened),
                 Msg::Ports(found) => self.on_ports(found),
                 Msg::SettingsSaved(Ok(())) => {}
+                Msg::SshHosts(hosts) => {
+                    if let Some(sheet) = self.open_sheet.as_mut() {
+                        sheet.hosts = hosts;
+                    }
+                }
                 Msg::SettingsSaved(Err(e)) => {
                     self.toast(Toast::error("Could not save \"Don't ask again\" to settings.toml", e))
                 }
@@ -309,8 +329,11 @@ impl App {
             StatusAction::OpenChanges => self.set_git_view(crate::model::state::GitView::Changes),
             StatusAction::ToggleNotifications => self.show_notifications = !self.show_notifications,
             StatusAction::OpenPort(port) => {
-                let _ = crate::platform::open_in_default_app(&format!("http://localhost:{port}"));
+                if let Some(ws) = self.state.active.clone() {
+                    self.open_port(&ws, port);
+                }
             }
+            StatusAction::RemotePorts => self.show_remote_ports(),
             StatusAction::ShowFetchError => self.show_fetch_error(),
             StatusAction::ContinueOp | StatusAction::AbortOp | StatusAction::CreateBranch => {
                 self.set_git_view(crate::model::state::GitView::Changes);
@@ -356,6 +379,7 @@ impl App {
                 GitEvent::DontAskAgain(kind) => self.dont_ask_again(ctx, kind),
                 GitEvent::Sync(request) => self.on_sync_request(ctx, request),
                 GitEvent::BindRemote(remote) => self.bind_active_to_remote(&remote),
+                GitEvent::HostUnreachable => self.probe_active_host(),
             }
         }
     }
@@ -365,10 +389,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.time = ctx.input(|i| i.time).max(f64::MIN_POSITIVE);
-        self.focused_window = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let was_focused =
+            std::mem::replace(&mut self.focused_window, ctx.input(|i| i.viewport().focused.unwrap_or(true)));
+        if self.focused_window && !was_focused {
+            self.refresh_active_remote_git(); // §5.25: remote repos refresh on focus
+        }
         let now = crate::util::unix_now();
         self.apply_theme(&ctx);
         self.drain_messages(&ctx);
+        self.poll_ssh(&ctx);
         self.drain_control(&ctx, now);
         self.poll_terminals(&ctx, now);
         self.handle_shortcuts(&ctx);
@@ -460,6 +489,12 @@ impl App {
             g.set_app_context(focused, bound.as_deref());
             g.show(ui, &colors, &settings, preset, now)
         });
+        if events.is_none()
+            && let Some(state) = self.remote_state(&active)
+        {
+            // A remote repo loads once its host answers (§5.28 step 5).
+            ui.weak(format!("Repository not loaded yet ({state})"));
+        }
         self.on_git_events(ui.ctx(), events.unwrap_or_default());
     }
 
@@ -485,9 +520,10 @@ impl App {
                 None => {}
             }
         }
-        if let Some(path) = self.open_sheet.take() {
-            self.open_sheet = self.show_open_sheet(ctx, path);
+        if let Some(sheet) = self.open_sheet.take() {
+            self.open_sheet = self.show_open_sheet(ctx, sheet);
         }
+        self.remote_overlays(ctx);
         self.clone_sheet(ctx);
         self.toasts.show(ctx, &self.colors, self.time);
     }
@@ -509,32 +545,15 @@ impl App {
         }
     }
 
-    /// The minimal "Open Folder" sheet: a path field (a native picker is a later step).
-    fn show_open_sheet(&mut self, ctx: &egui::Context, mut path: String) -> Option<String> {
-        let mut result = Some(());
-        let mut submit = false;
-        egui::Window::new("Open folder")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("Folder or host:path");
-                let field = ui.add(egui::TextEdit::singleline(&mut path).desired_width(360.0));
-                field.request_focus();
-                submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        result = None;
-                    }
-                    submit |= ui.button("Open").clicked();
-                });
-            });
-        if submit && !path.trim().is_empty() {
-            let loc = workspace::parse_user_location(path.trim());
-            self.open(ctx, loc, None, None);
-            return None;
+    /// §5.25: a remote repo has no watcher; it refreshes when its workspace gains focus.
+    fn refresh_active_remote_git(&mut self) {
+        let Some(id) = self.state.active.clone() else { return };
+        if !self.remote_down(&id)
+            && let Some(live) = self.live.get_mut(&id).filter(|l| l.remote.is_some())
+            && let Some(git) = live.git.as_mut()
+        {
+            git.refresh();
         }
-        result.map(|()| path)
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {

@@ -115,6 +115,9 @@ pub struct Git {
 #[serde(default)]
 pub struct Ssh {
     pub ssh_path: Option<String>,
+    /// `ssh -F <file>` for every connection; `None` reads `~/.ssh/config`. Its `Host` aliases
+    /// fill the W15 host list.
+    pub config_file: Option<String>,
     pub keepalive_interval: u32,
     pub keepalive_count: u32,
     pub control_persist: String,
@@ -396,12 +399,42 @@ impl Default for Ssh {
     fn default() -> Self {
         Ssh {
             ssh_path: None,
+            config_file: None,
             keepalive_interval: 20,
             keepalive_count: 2,
             control_persist: "10m".to_string(),
             tmux_default: true,
             reconnect_cap_secs: 60,
         }
+    }
+}
+
+impl Ssh {
+    /// The ssh config whose `Host` aliases W15 and the clone sheet offer: the configured file,
+    /// else `~/.ssh/config`.
+    pub fn config_path(&self, home: Option<&Path>) -> Option<std::path::PathBuf> {
+        match &self.config_file {
+            Some(file) => Some(file.into()),
+            None => home.map(|h| h.join(".ssh").join("config")),
+        }
+    }
+
+    /// The connection manager's settings (§5.28). Hosts are always prepared for tmux (upload
+    /// `tmux.conf`, check its version); each workspace decides whether its terminals use it
+    /// (W15 **Keep sessions alive with tmux**, default [`Ssh::tmux_default`]).
+    pub fn manager_settings(&self, dirs: &crate::paths::Dirs, app_id: &str) -> crate::ssh::manager::Settings {
+        let mut s = crate::ssh::manager::Settings::new(dirs, app_id);
+        if let Some(ssh) = &self.ssh_path {
+            s.ssh_bin = ssh.clone();
+        }
+        s.ssh_config = self.config_file.as_ref().map(Into::into);
+        s.master = crate::ssh::MasterOptions {
+            persist: self.control_persist.clone(),
+            keepalive: Some((self.keepalive_interval, self.keepalive_count)),
+        };
+        s.keepalive = true;
+        s.backoff_cap = self.reconnect_cap_secs;
+        s
     }
 }
 
@@ -607,6 +640,25 @@ mod tests {
         assert_eq!(s.clone().normalized().general.fetch_interval_min, 2);
         s.general.fetch_interval_min = 4;
         assert_eq!(s.normalized().general.fetch_interval_min, 5);
+    }
+
+    #[test]
+    fn ssh_section_maps_to_the_connection_manager() {
+        let dirs = crate::paths::Dirs::under(Path::new("root"));
+        let mut ssh = Ssh::default();
+        let m = ssh.manager_settings(&dirs, "app1");
+        assert_eq!((m.ssh_bin.as_str(), m.ssh_config.clone(), m.backoff_cap), ("ssh", None, 60));
+        assert_eq!((m.master.persist.as_str(), m.master.keepalive), ("10m", Some((20, 2))));
+        assert!(m.keepalive, "hosts are prepared for tmux; workspaces opt in");
+        assert_eq!(m.control_dir, dirs.ssh_control_dir());
+        assert_eq!(ssh.config_path(Some(Path::new("h"))), Some(Path::new("h").join(".ssh").join("config")));
+
+        ssh = toml::from_str("ssh_path = \"my-ssh\"\nconfig_file = \"cfg\"\ncontrol_persist = \"1m\"\nkeepalive_interval = 5\nreconnect_cap_secs = 9\n").unwrap();
+        let m = ssh.manager_settings(&dirs, "app1");
+        assert_eq!((m.ssh_bin.as_str(), m.backoff_cap), ("my-ssh", 9));
+        assert_eq!(m.ssh_config, Some("cfg".into()));
+        assert_eq!((m.master.persist.as_str(), m.master.keepalive), ("1m", Some((5, 2))));
+        assert_eq!(ssh.config_path(None), Some("cfg".into()));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! The workspace surface (§5.27, W4): a tab strip, then the active tab's split tree of
 //! terminals. The focused pane gets a 1 px `border.focus` outline; a pane whose agent needs
-//! input gets a 2 px `accent` ring until it is focused (§2 "Agents first").
+//! input gets a 2 px `accent` ring until it is focused (§2 "Agents first"). A remote workspace whose
+//! host is not connected shows the W16 progress line above and banner below its terminals,
+//! which grey out keeping their last screen and take no input.
 
 use super::{App, Focus, workspace::pane_key};
 use crate::agent::status::{Status, Tracker, rollup};
@@ -64,6 +66,8 @@ impl App {
         };
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
+        let (area, down) = self.remote_chrome(ui, &id, area);
+        let remote = matches!(ws.location, crate::git::Location::Remote { .. });
         let font_size = self.settings.terminal.font_size;
         let mut focus_to: Option<PaneId> = None;
         let panes =
@@ -71,7 +75,8 @@ impl App {
         for (pane_id, r) in panes {
             let rect = to_egui(r).shrink(1.0);
             let key = pane_key(&tab.id, pane_id);
-            let focused = self.focus == Focus::Terminal && tab.focused == pane_id && !self.clone.is_open();
+            let focused =
+                self.focus == Focus::Terminal && tab.focused == pane_id && !self.clone.is_open() && !down;
             let (colors, keymap) = (self.colors, &self.keymap);
             let Some(live) = self.live.get_mut(&id) else { continue };
             let needs_input = live.trackers.get(&key).is_some_and(|t| t.status() == Status::NeedsInput);
@@ -82,9 +87,13 @@ impl App {
                         focus_to = Some(pane_id);
                     }
                 }
+                None if remote => {}
                 None => {
                     child.weak("This terminal could not be started. Close it with the palette (Close pane).");
                 }
+            }
+            if down {
+                ui.painter().rect_filled(rect, 0.0, colors.faded(Token::BgBase, 0.6));
             }
             let stroke = if needs_input && !focused {
                 egui::Stroke::new(2.0, colors.get(Token::Accent))

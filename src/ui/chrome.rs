@@ -276,6 +276,8 @@ pub enum StatusAction {
     CreateBranch,
     /// "Fetch failed · 3m" clicked: show the last background fetch's stderr.
     ShowFetchError,
+    /// The remote state ("gpu-box · connected") clicked: the W18 ports popover.
+    RemotePorts,
 }
 
 /// Status dot color token (§5.29 urgency chain). Shared with the sidebar (§5.22).
@@ -356,7 +358,11 @@ pub fn status_bar(ui: &mut egui::Ui, info: &StatusInfo, colors: &Colors) -> Opti
                 action = Some(StatusAction::ToggleNotifications);
             }
             if let Some(remote) = &info.remote_state {
-                ui.colored_label(colors.get(Token::FgSecondary), remote);
+                let text = egui::RichText::new(remote).color(colors.get(Token::FgSecondary));
+                if ui.add(egui::Button::new(text).frame(false)).on_hover_text("Ports on this host").clicked()
+                {
+                    action = Some(StatusAction::RemotePorts);
+                }
             }
         });
     });
