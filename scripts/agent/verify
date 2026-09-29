@@ -14,9 +14,13 @@ leg()  { T0=$SECONDS; }
 
 command -v cargo >/dev/null 2>&1 || fail "cargo not found — run scripts/agent/bootstrap"
 LOG="$(mktemp)"; trap 'rm -f "$LOG"' EXIT
-run() { # <failure message> <command…>: quiet on success, last 40 lines on failure
-  local msg="$1"; shift
-  "$@" >"$LOG" 2>&1 || { tail -40 "$LOG" >&2; fail "$msg"; }
+run() { # <failure message> <command…>: quiet on success; on failure, every panic message
+  local msg="$1"; shift    # (so the first of several failing tests is never cut off), then the tail
+  "$@" >"$LOG" 2>&1 || {
+    grep -A6 "panicked at" "$LOG" | grep -v '^ *[0-9]*: \|^ *at ' | head -120 >&2
+    tail -25 "$LOG" >&2
+    fail "$msg"
+  }
 }
 
 # ---- scope --------------------------------------------------------------------------------
