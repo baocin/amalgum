@@ -74,6 +74,10 @@ pub(super) enum Reply {
 
     Undo(JournalRunOutcome),
     Redo(JournalRunOutcome),
+
+    Ops(super::ops_ui::OpsReply),
+    Search(super::search::SearchReply),
+    Stash(super::details::StashReply),
 }
 
 /// `git diff --no-index` shows an untracked file "as all-added" (§4 "Changes view"), but unlike

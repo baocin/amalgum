@@ -19,8 +19,15 @@
 mod changes;
 mod details;
 mod graph;
+mod menus;
+mod ops_ui;
 mod refs;
+pub mod requests;
+mod search;
+mod sync;
 mod worker;
+
+pub use sync::SyncRequest;
 
 use super::chrome::Toast;
 use super::jobs;
@@ -68,6 +75,10 @@ pub enum GitEvent {
     SummaryChanged,
     /// The user ticked §5.20 **Don't ask again** and confirmed: persist it in `settings.toml`.
     DontAskAgain(crate::model::confirm::ConfirmKind),
+    /// Fetch / pull / push asked for from a menu (§5.4 item 3, §5.10): the sync feature runs it.
+    Sync(requests::SyncRequest),
+    /// Refs → remote → **Bind active workspace to this remote** (§5.10).
+    BindRemote(String),
 }
 
 /// The graph's current selection.
@@ -121,6 +132,12 @@ pub struct GitPane {
     // -- changes view --
     changes: changes::ChangesState,
 
+    // -- branch / tag / rewrite operations and their prompts --
+    ops: ops_ui::OpsState,
+    // -- commit search (§5.8) and stash popovers (§5.12) --
+    search: search::SearchUi,
+    stash_ui: details::StashUi,
+
     // -- worker plumbing --
     tx: Sender<Reply>,
     rx: Receiver<Reply>,
@@ -132,6 +149,8 @@ pub struct GitPane {
     live: Live,
     last_summary: RepoSummary,
     initial_loading: bool,
+    /// Fetch / pull / push (§5.10), see [`sync`].
+    sync: sync::SyncState,
 }
 
 impl GitPane {
@@ -174,6 +193,9 @@ impl GitPane {
             selected: Selection::None,
             details: None,
             changes: changes::ChangesState::default(),
+            ops: ops_ui::OpsState::default(),
+            search: search::SearchUi::default(),
+            stash_ui: details::StashUi::default(),
             tx,
             rx,
             generation: 1,
@@ -183,7 +205,9 @@ impl GitPane {
             live,
             last_summary: RepoSummary::default(),
             initial_loading: true,
+            sync: sync::SyncState::default(),
         };
+        pane.search = search::SearchUi::new(&pane.location);
         pane.dispatch_bootstrap(ctx);
         pane
     }
@@ -205,11 +229,17 @@ impl GitPane {
 
     /// `Mod+Z` / `Mod+Shift+Z` in the git pane (§5.18). Refusals become toasts.
     pub fn undo(&mut self) {
+        if self.confirm_lossy_undo(true) {
+            return;
+        }
         let ctx = self.ctx.clone();
         self.run_undo_redo(&ctx, true);
     }
 
     pub fn redo(&mut self) {
+        if self.confirm_lossy_undo(false) {
+            return;
+        }
         let ctx = self.ctx.clone();
         self.run_undo_redo(&ctx, false);
     }
@@ -231,6 +261,7 @@ impl GitPane {
 
         self.poll_watch(&ctx, frame_time);
 
+        self.show_sync_toolbar(ui, colors, preset, &mut events);
         ui.horizontal(|ui| {
             for (label, v) in
                 [("Graph", GitView::Graph), ("Changes", GitView::Changes), ("Refs", GitView::Refs)]
@@ -250,8 +281,13 @@ impl GitPane {
         match self.view {
             GitView::Graph => self.show_graph(ui, colors, settings, now, &mut events, &ctx),
             GitView::Changes => self.show_changes(ui, colors, settings, preset, &mut events, &ctx),
-            GitView::Refs => self.show_refs(ui, colors, now, &mut events),
+            GitView::Refs => {
+                self.show_refs(ui, colors, now, &mut events);
+                self.show_refs_details(ui, colors, now, &mut events, &ctx);
+            }
         }
+        self.show_ops_overlays(ui, colors, settings, preset, &mut events);
+        self.show_stash_overlays(ui, colors, settings, preset, &mut events);
 
         let summary = self.compute_summary();
         if summary != self.last_summary {
@@ -456,6 +492,7 @@ impl GitPane {
                 if worker::gen_is_current(page_gen, self.generation) {
                     self.git_dir = git_dir;
                     self.op = op;
+                    self.finish_pending(ctx);
                 }
             }
             Reply::LogPage { page_gen, requested, result } => {
@@ -480,6 +517,9 @@ impl GitPane {
             Reply::Checkout { branch, result } => self.apply_checkout(ctx, branch, result, events),
             Reply::Undo(outcome) => self.apply_undo_redo(ctx, "undo", outcome, events),
             Reply::Redo(outcome) => self.apply_undo_redo(ctx, "redo", outcome, events),
+            Reply::Ops(reply) => self.apply_ops_reply(ctx, reply, events),
+            Reply::Search(reply) => self.apply_search_reply(reply, events),
+            Reply::Stash(reply) => self.apply_stash_reply(ctx, reply, events),
         }
     }
 
@@ -526,8 +566,8 @@ impl GitPane {
 
 impl GitPane {
     fn run_undo_redo(&mut self, ctx: &egui::Context, is_undo: bool) {
-        if self.undo_busy {
-            return;
+        if self.undo_busy || self.sync_busy() {
+            return; // a running fetch/pull/push moves refs too (§5.10)
         }
         let peeked = if is_undo { self.journal.peek_undo() } else { self.journal.peek_redo() };
         let Some(entry) = peeked else {
@@ -615,6 +655,10 @@ impl GitPane {
     /// §5.9 "Checkout": `git checkout <target>`, journaled with an inverse that checks out the
     /// previous branch (or the previous detached hash).
     pub(super) fn start_checkout(&mut self, ctx: &egui::Context, target: String) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        self.set_busy(true);
         let git = self.git.clone();
         let now = crate::util::unix_now();
         jobs::spawn(ctx, &self.tx, move || {
@@ -647,6 +691,7 @@ impl GitPane {
         result: Result<worker::CheckoutOutcome, GitError>,
         events: &mut Vec<GitEvent>,
     ) {
+        self.set_busy(false);
         match result {
             Ok(outcome) => {
                 self.journal.record(outcome.entry);
@@ -862,6 +907,9 @@ mod tests {
             selected: Selection::None,
             details: None,
             changes: changes::ChangesState::default(),
+            ops: ops_ui::OpsState::default(),
+            search: search::SearchUi::default(),
+            stash_ui: details::StashUi::default(),
             tx,
             rx,
             generation: 1,
@@ -871,6 +919,7 @@ mod tests {
             live: Live::Poll { last_poll: 0.0 },
             last_summary: RepoSummary::default(),
             initial_loading: true,
+            sync: sync::SyncState::default(),
         }
     }
 }

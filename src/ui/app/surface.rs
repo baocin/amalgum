@@ -71,7 +71,7 @@ impl App {
         for (pane_id, r) in panes {
             let rect = to_egui(r).shrink(1.0);
             let key = pane_key(&tab.id, pane_id);
-            let focused = self.focus == Focus::Terminal && tab.focused == pane_id;
+            let focused = self.focus == Focus::Terminal && tab.focused == pane_id && !self.clone.is_open();
             let (colors, keymap) = (self.colors, &self.keymap);
             let Some(live) = self.live.get_mut(&id) else { continue };
             let needs_input = live.trackers.get(&key).is_some_and(|t| t.status() == Status::NeedsInput);

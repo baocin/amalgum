@@ -1,6 +1,9 @@
 //! Command palette (§5.19, W8): centered overlay, fuzzy input (`model::fuzzy`), results grouped
 //! Actions, Workspaces, Branches, Tags, Stashes, Worktrees, Recent locations, Commits; group
 //! prefixes `> @ # $ ~ !`; ↑/↓/Enter/Esc; shortcuts right-aligned.
+//!
+//! Git commands with a trailing `…` (**Create branch…**, **Create tag…**, **Merge…**,
+//! **Rebase…**) open a popover or branch picker in the git pane; see [`git_items`].
 
 use super::theme::Colors;
 use crate::git::Location;
@@ -14,7 +17,15 @@ pub enum Target {
     Action(Action),
     Workspace(String),
     Branch(String),
+    /// §5.11 Checkout tag (detached).
+    Tag(String),
     Location(Location),
+    /// A fetch / pull variant (§5.10) for the active workspace's git pane.
+    Sync(crate::ui::git_pane::SyncRequest),
+    /// **Merge…** / **Rebase…**: pick the branch in the git pane (§5.9).
+    PickBranch {
+        merge: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +91,41 @@ fn build_results<'a>(query: &str, items: &'a [Item]) -> Vec<(&'a Item, Match)> {
     }
     out.truncate(MAX_RESULTS);
     out
+}
+
+/// The git pane commands (§5.9, §5.11): **Create branch…** and **Create tag…** replace the
+/// table's plain "New Branch" / "New Tag" rows (same actions, same shortcut, the spec's wording),
+/// **Merge…** / **Rebase…** open a branch picker. `shortcut` labels an action's first binding.
+pub fn git_items(shortcut: impl Fn(Action) -> String) -> Vec<Item> {
+    let item = |label: &str, detail: String, target: Target| Item {
+        group: Group::Actions,
+        label: label.to_string(),
+        detail,
+        target,
+    };
+    vec![
+        item("Create branch…", shortcut(Action::NewBranch), Target::Action(Action::NewBranch)),
+        item("Create tag…", shortcut(Action::NewTag), Target::Action(Action::NewTag)),
+        item("Merge…", String::new(), Target::PickBranch { merge: true }),
+        item("Rebase…", String::new(), Target::PickBranch { merge: false }),
+    ]
+}
+
+/// Table actions whose palette row [`git_items`] replaces.
+pub fn superseded_by_git_items(action: Action) -> bool {
+    matches!(action, Action::NewBranch | Action::NewTag)
+}
+
+/// The Tags group (§5.19): Enter checks the tag out, detached (§5.11).
+pub fn tag_items(tags: Vec<String>) -> Vec<Item> {
+    tags.into_iter()
+        .map(|t| Item {
+            group: Group::Tags,
+            label: t.clone(),
+            detail: "Enter to checkout (detached)".into(),
+            target: Target::Tag(t),
+        })
+        .collect()
 }
 
 fn group_label(group: Group) -> &'static str {
@@ -353,6 +399,29 @@ mod tests {
     fn wrap_on_empty_list_is_always_zero() {
         assert_eq!(wrap_next(0, 0), 0);
         assert_eq!(wrap_prev(0, 0), 0);
+    }
+
+    // ---- git commands ----
+
+    #[test]
+    fn git_items_are_found_by_the_spec_wording() {
+        let items = git_items(|a| if a == Action::NewBranch { "⌘B".into() } else { String::new() });
+        let results = build_results("create branch", &items);
+        assert_eq!(results[0].0.label, "Create branch…");
+        assert_eq!(results[0].0.detail, "⌘B");
+        assert_eq!(results[0].0.target, Target::Action(Action::NewBranch));
+        let merge = build_results("merge", &items);
+        assert_eq!(merge[0].0.target, Target::PickBranch { merge: true });
+        assert!(superseded_by_git_items(Action::NewTag));
+        assert!(!superseded_by_git_items(Action::Push));
+    }
+
+    #[test]
+    fn tags_prefix_free_search_finds_tag_items() {
+        let items = tag_items(vec!["v1.0".into(), "v2.0".into()]);
+        let results = build_results("v2", &items);
+        assert_eq!(results[0].0.target, Target::Tag("v2.0".into()));
+        assert_eq!(results[0].0.group, Group::Tags);
     }
 
     // ---- Default ----

@@ -7,6 +7,7 @@
 
 mod app;
 mod chrome;
+mod clone;
 mod control;
 /// `pub`: the shared confirm / popover / progress kit that git-operation features build on.
 pub mod dialogs;

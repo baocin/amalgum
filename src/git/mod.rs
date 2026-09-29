@@ -16,6 +16,7 @@
 //! - [`rebase`]   interactive rebase plans and the editor helpers (§5.16)
 //! - [`message`]  commit message editor rules (§5.7)
 //! - [`net`]      clone, fetch, pull, push with progress and cancel (§5.3, §5.10, §5.11)
+//! - [`worktree_ops`] worktree remove / prune / lock / unlock from the Refs view (§5.21)
 
 pub mod cmd;
 pub mod diff;
@@ -30,5 +31,6 @@ pub mod refs;
 pub mod remote;
 pub mod search;
 pub mod status;
+pub mod worktree_ops;
 
 pub use cmd::{Git, GitError, Location};

@@ -10,6 +10,7 @@ mod actions;
 mod events;
 mod ports;
 mod surface;
+mod sync;
 mod workspace;
 
 use super::chrome::{self, PanelAction, StatusAction, StatusInfo, Toast, Toasts};
@@ -72,6 +73,8 @@ pub struct App {
     saver: Sender<AppState>,
     toasts: Toasts,
     palette: Option<Palette>,
+    /// §5.3 clone sheet and its running clone.
+    clone: super::clone::CloneSheet,
     open_sheet: Option<String>,
     show_notifications: bool,
     show_sidebar: bool,
@@ -137,6 +140,7 @@ impl App {
             rx,
             toasts,
             palette: None,
+            clone: Default::default(),
             open_sheet: None,
             show_notifications: false,
             show_sidebar: true,
@@ -245,6 +249,7 @@ impl App {
             ports: self.ports.get(ws).cloned().unwrap_or_default(),
             unread: self.notifications.unread(),
             remote_state: None,
+            sync: self.sync_status(ws),
         }
     }
 
@@ -306,6 +311,7 @@ impl App {
             StatusAction::OpenPort(port) => {
                 let _ = crate::platform::open_in_default_app(&format!("http://localhost:{port}"));
             }
+            StatusAction::ShowFetchError => self.show_fetch_error(),
             StatusAction::ContinueOp | StatusAction::AbortOp | StatusAction::CreateBranch => {
                 self.set_git_view(crate::model::state::GitView::Changes);
             }
@@ -348,6 +354,8 @@ impl App {
                 GitEvent::SendToTerminal(text) => self.write_to_focused(text.into_bytes()),
                 GitEvent::SummaryChanged => {}
                 GitEvent::DontAskAgain(kind) => self.dont_ask_again(ctx, kind),
+                GitEvent::Sync(request) => self.on_sync_request(ctx, request),
+                GitEvent::BindRemote(remote) => self.bind_active_to_remote(&remote),
             }
         }
     }
@@ -366,6 +374,7 @@ impl eframe::App for App {
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
         self.scan_ports(&ctx);
+        self.tick_sync(&ctx, now);
 
         let menu = egui::Panel::top("menu").show(ui, |ui| chrome::menu_bar(ui, &self.keymap)).inner;
         if let Some(action) = menu {
@@ -434,14 +443,23 @@ impl eframe::App for App {
 impl App {
     /// The active workspace's git pane; a click inside moves keyboard focus to it.
     fn git_pane(&mut self, ui: &mut egui::Ui, now: u64) {
-        if ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+        // `max_rect`, not `ui_contains_pointer`: nothing is laid out yet, so `min_rect` is empty.
+        if ui.rect_contains_pointer(ui.max_rect()) && ui.input(|i| i.pointer.any_pressed()) {
             self.focus = Focus::Git;
         }
         let (colors, settings, preset) = (self.colors, self.settings.clone(), self.keymap.preset);
-        let events = self
-            .active_live()
-            .and_then(|l| l.git.as_mut())
-            .map(|g| g.show(ui, &colors, &settings, preset, now));
+        let focused = self.focus == Focus::Git;
+        let active = self.state.active.clone().unwrap_or_default();
+        let bound = self
+            .state
+            .repos
+            .iter()
+            .flat_map(|r| r.remotes.iter())
+            .find_map(|g| g.workspaces.iter().any(|w| w.id == active).then(|| g.name.clone()));
+        let events = self.active_live().and_then(|l| l.git.as_mut()).map(|g| {
+            g.set_app_context(focused, bound.as_deref());
+            g.show(ui, &colors, &settings, preset, now)
+        });
         self.on_git_events(ui.ctx(), events.unwrap_or_default());
     }
 
@@ -470,7 +488,25 @@ impl App {
         if let Some(path) = self.open_sheet.take() {
             self.open_sheet = self.show_open_sheet(ctx, path);
         }
+        self.clone_sheet(ctx);
         self.toasts.show(ctx, &self.colors, self.time);
+    }
+
+    /// §5.3: draw the clone sheet / progress pill; a finished clone joins the recents and opens
+    /// as a workspace (§5.2) when asked.
+    fn clone_sheet(&mut self, ctx: &egui::Context) {
+        for event in self.clone.show(ctx, &self.colors, &self.settings) {
+            match event {
+                super::clone::CloneEvent::Toast(t) => self.toast(t),
+                super::clone::CloneEvent::Cloned { location, name, open } => {
+                    self.state.touch_recent(location.clone(), &name, crate::util::unix_now());
+                    self.dirty = true;
+                    if open {
+                        self.open(ctx, location, None, None);
+                    }
+                }
+            }
+        }
     }
 
     /// The minimal "Open Folder" sheet: a path field (a native picker is a later step).

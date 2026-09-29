@@ -56,6 +56,7 @@ impl App {
         match action {
             Action::CommandPalette => self.palette = Some(Palette::default()),
             Action::OpenFolder | Action::NewWorkspace => self.open_sheet = Some(default_open_path()),
+            Action::CloneRepository => self.clone.open(ctx, &self.settings),
             Action::CloseWorkspace => {
                 if let Some(id) = self.state.active.clone() {
                     self.close_workspace(&id);
@@ -115,6 +116,30 @@ impl App {
             A::GitPaneChangesView => self.set_git_view(GitView::Changes),
             A::GitPaneRefsView => self.set_git_view(GitView::Refs),
             A::FocusTerminalFromGitPane => self.focus = Focus::Terminal,
+            A::SearchCommits | A::Stash => {
+                // §5.8 / §5.12: both open inside the git pane, which takes keyboard focus.
+                if action == A::SearchCommits {
+                    self.set_git_view(GitView::Graph);
+                } else if let Some(ws) =
+                    self.state.active.clone().and_then(|id| self.state.workspace_mut(&id))
+                {
+                    ws.git_pane_open = true;
+                    self.focus = Focus::Git;
+                    self.dirty = true;
+                }
+                let git = self.active_live().and_then(|l| l.git.as_mut());
+                let toast = match (git, action) {
+                    (Some(g), A::SearchCommits) => {
+                        g.open_search();
+                        None
+                    }
+                    (Some(g), _) => g.open_stash(),
+                    (None, _) => None,
+                };
+                if let Some(t) = toast {
+                    self.toast(t);
+                }
+            }
             A::Undo | A::Redo => {
                 if let Some(git) = self.active_live().and_then(|l| l.git.as_mut()) {
                     if action == A::Undo { git.undo() } else { git.redo() }
@@ -158,6 +183,16 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
             A::ShortcutOverlay => self.palette = Some(Palette::default()),
+            A::FetchBoundRemote | A::Pull | A::Push | A::ForcePushWithLease => self.sync_action(ctx, action),
+            A::NewBranch
+            | A::NewTag
+            | A::CreateBranchAtSelectedCommit
+            | A::CreateTagAtSelectedCommit
+            | A::CheckoutSelected
+            | A::MergeSelectedIntoCurrent
+            | A::RebaseCurrentOntoSelected
+            | A::CherryPickSelectedOntoCurrent
+            | A::SetUpstream => self.git_pane_action(ctx, action),
             other => {
                 self.toast(Toast::info(format!(
                     "{} is not available in this build yet",
@@ -217,12 +252,18 @@ impl App {
 
     pub(super) fn palette_items(&self) -> Vec<Item> {
         let preset = self.keymap.preset;
-        let actions = keymap::table().iter().map(|d| Item {
-            group: Group::Actions,
-            label: d.label.to_string(),
-            detail: self.keymap.bindings(d.action).first().map(|c| preset.label(c)).unwrap_or_default(),
-            target: Target::Action(d.action),
-        });
+        let shortcut =
+            |a: Action| self.keymap.bindings(a).first().map(|c| preset.label(c)).unwrap_or_default();
+        let git_commands = crate::ui::palette::git_items(shortcut);
+        let actions = keymap::table()
+            .iter()
+            .filter(|d| !crate::ui::palette::superseded_by_git_items(d.action))
+            .map(|d| Item {
+                group: Group::Actions,
+                label: d.label.to_string(),
+                detail: self.keymap.bindings(d.action).first().map(|c| preset.label(c)).unwrap_or_default(),
+                target: Target::Action(d.action),
+            });
         let workspaces = self.state.workspaces().into_iter().map(|w| Item {
             group: Group::Workspaces,
             label: format!("{} {}", self.workspace_status(&w.id).0.glyph(), w.name).trim().to_string(),
@@ -250,7 +291,23 @@ impl App {
                 detail: "Enter to checkout".into(),
                 target: Target::Branch(b),
             });
-        actions.chain(workspaces).chain(branches).chain(recents).collect()
+        let tags = crate::ui::palette::tag_items(
+            self.state
+                .active
+                .as_deref()
+                .and_then(|id| self.live.get(id))
+                .and_then(|l| l.git.as_ref())
+                .map(|g| g.tags())
+                .unwrap_or_default(),
+        );
+        actions
+            .chain(git_commands)
+            .chain(self.sync_palette_items())
+            .chain(workspaces)
+            .chain(branches)
+            .chain(tags)
+            .chain(recents)
+            .collect()
     }
 
     pub(super) fn on_palette(&mut self, ctx: &egui::Context, target: Target) {
@@ -263,7 +320,96 @@ impl App {
                     git.checkout(ctx, name);
                 }
             }
+            Target::Sync(request) => self.sync_request(ctx, request),
+            Target::Tag(name) => {
+                if let Some(git) = self.active_live().and_then(|l| l.git.as_mut()) {
+                    git.checkout_tag(ctx, name);
+                }
+            }
+            Target::PickBranch { merge } => {
+                if self.show_git_pane()
+                    && let Some(git) = self.active_live().and_then(|l| l.git.as_mut())
+                {
+                    git.open_merge_picker(merge);
+                }
+            }
         }
+    }
+
+    /// Opens the active workspace's git pane and focuses it; `false` (with a toast) when the
+    /// workspace has no repository.
+    fn show_git_pane(&mut self) -> bool {
+        let has_git = self.active_live().is_some_and(|l| l.git.is_some());
+        if !has_git {
+            self.toast(Toast::info("Open a git repository first"));
+            return false;
+        }
+        if let Some(ws) = self.state.active.clone().and_then(|id| self.state.workspace_mut(&id)) {
+            ws.git_pane_open = true;
+            self.dirty = true;
+        }
+        self.focus = Focus::Git;
+        true
+    }
+
+    /// `Mod+B`, `Mod+Shift+T`, and the §7.3 graph actions chosen from the palette or menu bar:
+    /// the git pane opens its popover or runs the action (§5.9, §5.11).
+    fn git_pane_action(&mut self, ctx: &egui::Context, action: Action) {
+        if !self.show_git_pane() {
+            return;
+        }
+        let handled =
+            self.active_live().and_then(|l| l.git.as_mut()).is_some_and(|g| g.run_action(ctx, action));
+        if !handled {
+            self.toast(Toast::info(format!(
+                "{} is not available in this build yet",
+                keymap::def(action).label
+            )));
+        }
+    }
+
+    /// Fetch / pull / push requested from a git pane menu (§5.4 item 3, §5.10). The sync
+    /// feature runs these; until it is wired in, say what was asked for.
+    pub(super) fn on_sync_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: crate::ui::git_pane::requests::SyncRequest,
+    ) {
+        self.sync_request(ctx, request.into());
+    }
+
+    /// §5.10 **Bind active workspace to this remote**: moves the workspace to that remote's
+    /// group under its repo (created if new), so push / pull / fetch default to it.
+    pub(super) fn bind_active_to_remote(&mut self, remote: &str) {
+        let Some(id) = self.state.active.clone() else { return };
+        let Some(repo) = self
+            .state
+            .repos
+            .iter_mut()
+            .find(|r| r.remotes.iter().any(|g| g.workspaces.iter().any(|w| w.id == id)))
+        else {
+            return;
+        };
+        let Some(from) = repo.remotes.iter().position(|g| g.workspaces.iter().any(|w| w.id == id)) else {
+            return;
+        };
+        if repo.remotes[from].name == remote {
+            self.toast(Toast::info(format!("Already bound to {remote}")));
+            return;
+        }
+        let Some(pos) = repo.remotes[from].workspaces.iter().position(|w| w.id == id) else { return };
+        let ws = repo.remotes[from].workspaces.remove(pos);
+        match repo.remotes.iter_mut().find(|g| g.name == remote) {
+            Some(group) => group.workspaces.push(ws),
+            None => repo.remotes.push(crate::model::state::RemoteGroup {
+                name: remote.to_string(),
+                url: None,
+                collapsed: false,
+                workspaces: vec![ws],
+            }),
+        }
+        self.dirty = true;
+        self.toast(Toast::success(format!("Workspace bound to {remote}")));
     }
 
     pub(super) fn activate(&mut self, ctx: &egui::Context, id: &str) {
@@ -345,10 +491,9 @@ impl App {
                 self.state.recents.clear();
                 self.dirty = true;
             }
-            WelcomeAction::CloneRepository | WelcomeAction::ConnectToHost => {
-                self.toast(Toast::info(
-                    "Clone and SSH workspaces are the next milestone; open a local folder for now",
-                ));
+            WelcomeAction::CloneRepository => self.clone.open(ctx, &self.settings),
+            WelcomeAction::ConnectToHost => {
+                self.toast(Toast::info("SSH workspaces are the next milestone; open a local folder for now"));
             }
             WelcomeAction::SetUpHooks => {
                 self.toast(Toast::info(

@@ -254,6 +254,16 @@ pub struct StatusInfo {
     pub ports: Vec<u16>,
     pub unread: usize,
     pub remote_state: Option<String>,
+    pub sync: SyncStatus,
+}
+
+/// The status bar's sync part (§5.10): a spinning arrow while a fetch/pull/push runs, "Last fetch
+/// Xm", and "Fetch failed · 3m" (click for the stderr) while background fetches keep failing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub syncing: bool,
+    pub last_fetch: Option<String>,
+    pub fetch_failed: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +274,8 @@ pub enum StatusAction {
     ContinueOp,
     AbortOp,
     CreateBranch,
+    /// "Fetch failed · 3m" clicked: show the last background fetch's stderr.
+    ShowFetchError,
 }
 
 /// Status dot color token (§5.29 urgency chain). Shared with the sidebar (§5.22).
@@ -317,6 +329,9 @@ pub fn status_bar(ui: &mut egui::Ui, info: &StatusInfo, colors: &Colors) -> Opti
                 action = Some(StatusAction::OpenChanges);
             }
         }
+        if sync_status(ui, &info.sync, colors) {
+            action = Some(StatusAction::ShowFetchError);
+        }
 
         ui.separator();
 
@@ -346,6 +361,19 @@ pub fn status_bar(ui: &mut egui::Ui, info: &StatusInfo, colors: &Colors) -> Opti
         });
     });
     action
+}
+
+/// Draws [`SyncStatus`]; returns whether "Fetch failed" was clicked.
+fn sync_status(ui: &mut egui::Ui, sync: &SyncStatus, colors: &Colors) -> bool {
+    if sync.syncing {
+        ui.add(egui::Spinner::new().size(12.0).color(colors.get(Token::Accent)));
+    }
+    if let Some(label) = &sync.last_fetch {
+        ui.colored_label(colors.get(Token::FgSecondary), label);
+    }
+    let Some(failed) = &sync.fetch_failed else { return false };
+    let text = egui::RichText::new(failed).color(colors.get(Token::Warning));
+    ui.add(egui::Link::new(text)).on_hover_text("Show the error").clicked()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

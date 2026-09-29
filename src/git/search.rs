@@ -3,6 +3,7 @@
 //! `author: path: before: after: hash: branch: tag: msg:` AND together; quotes make phrases
 //! (`msg:"fix login"`). Dates are `YYYY-MM-DD`. An unknown `foo:` prefix is a plain word.
 
+use super::log::Commit;
 use crate::util;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -228,6 +229,63 @@ impl Query {
         }
         args
     }
+}
+
+/// One commit as search sees it: the graph's record plus its full message body and the paths it
+/// changed (none for a merge, as `--name-only` shows none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub commit: Commit,
+    /// The message after the subject line, leading blank lines trimmed.
+    pub body: String,
+    pub paths: Vec<String>,
+}
+
+/// `git log` argv for search: every commit field [`Doc`] needs, one `%x1e`-led record per
+/// commit, the changed paths after it (`--name-only -z`). `extra` is `-n`, `--all`, and the
+/// [`Query::git_log_args`] filters (which end in `-- <pathspecs>`, so they go last).
+pub fn search_log_args(extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "log".to_string(),
+        "--topo-order".to_string(),
+        "-z".to_string(),
+        "--name-only".to_string(),
+        "--decorate=full".to_string(),
+        "--no-show-signature".to_string(),
+        "--no-color".to_string(),
+        format!("--format=%x1e{}%x1f%B", super::log::LOG_FORMAT),
+    ];
+    for arg in extra {
+        if arg == "--all" {
+            args.push(format!("--exclude={}*", super::ops::HIDDEN_REFS));
+        }
+        args.push(arg.clone());
+    }
+    args
+}
+
+/// Parses [`search_log_args`] output. Each record is `\x1e` + the ten [`super::log::LOG_FORMAT`]
+/// fields + `\x1f` + the raw message, NUL-terminated, then the changed paths, each
+/// NUL-terminated (the first preceded by a newline). Malformed records are skipped.
+pub fn parse_search_log(out: &[u8]) -> Vec<Found> {
+    out.split(|&b| b == 0x1e).filter(|r| !r.is_empty()).filter_map(parse_found).collect()
+}
+
+fn parse_found(rec: &[u8]) -> Option<Found> {
+    let mut parts = rec.split(|&b| b == 0);
+    let header = parts.next()?;
+    // The first ten fields are the graph's record; everything after the tenth separator is the
+    // raw message (which may itself contain the separator).
+    let cut = header.iter().enumerate().filter(|(_, b)| **b == 0x1f).nth(9).map(|(i, _)| i)?;
+    let commit = super::log::parse_record(&header[..cut])?;
+    let message = String::from_utf8_lossy(&header[cut + 1..]);
+    let body = message.split_once('\n').map_or("", |(_, rest)| rest).trim_start_matches(['\n', '\r']);
+    let paths = parts
+        .map(|p| p.strip_prefix(b"\n").unwrap_or(p))
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    Some(Found { commit, body: body.trim_end().to_string(), paths })
 }
 
 /// A pathspec matching every path that contains `term`, ignoring case, like a local `path:`
@@ -612,6 +670,54 @@ mod tests {
         let brackets = repo.commit_file("[w]*?.txt", "b", "brackets");
         assert_eq!(remote_search(&repo, "path:[w]*?"), vec![brackets]);
         assert!(remote_search(&repo, "path:w*x").is_empty(), "`*` must not act as a wildcard");
+    }
+
+    fn search_log(repo: &TempRepo, extra: &[&str]) -> Vec<Found> {
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let args = search_log_args(&extra);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        parse_search_log(&repo.git_raw(&args))
+    }
+
+    #[test]
+    fn search_log_parses_real_git_with_paths_bodies_and_empty_commits() {
+        let mut repo = TempRepo::new();
+        repo.write("a b.txt", "a");
+        repo.write("dir/ünï\ncode.rs", "u");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "first\n\nbody line\nsecond line"]);
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let third = repo.commit_file("dir/x.rs", "x", "third");
+        repo.git(&["tag", "v1"]);
+
+        let found = search_log(&repo, &["--all", "-n", "10"]);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].commit.id, third);
+        assert_eq!(found[0].commit.subject, "third");
+        assert_eq!(found[0].paths, vec!["dir/x.rs"]);
+        assert!(found[0].commit.refs.iter().any(|d| *d == crate::git::log::Decoration::Tag("v1".into())));
+        assert_eq!(found[1].commit.subject, "empty");
+        assert!(found[1].paths.is_empty());
+        assert_eq!(found[2].body, "body line\nsecond line");
+        assert_eq!(found[2].paths, vec!["a b.txt", "dir/ünï\ncode.rs"]);
+    }
+
+    #[test]
+    fn search_log_with_filter_args_narrows_in_git() {
+        let mut repo = TempRepo::new();
+        repo.commit_file("src/auth.rs", "a", "auth");
+        repo.commit_file("README.md", "b", "readme");
+        let mut extra = vec!["--all".to_string(), "-n".to_string(), "5".to_string()];
+        extra.extend(Query::parse("path:auth").git_log_args());
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let found = search_log(&repo, &extra);
+        assert_eq!(found.iter().map(|f| f.commit.subject.as_str()).collect::<Vec<_>>(), vec!["auth"]);
+    }
+
+    #[test]
+    fn search_log_skips_garbage() {
+        assert!(parse_search_log(b"").is_empty());
+        assert!(parse_search_log(b"\x1enot a record\0").is_empty());
     }
 
     #[test]

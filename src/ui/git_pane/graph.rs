@@ -145,6 +145,11 @@ impl GitPane {
         let lane_width = (row_height * 0.7).max(10.0);
 
         let focus_id = ui.id().with("graph_focus_bg");
+        if self.show_search(ui, colors, now, row_height, focus_id) {
+            ui.separator();
+            self.show_details(ui, colors, now, events, ctx);
+            return;
+        }
         let bg_rect = ui.available_rect_before_wrap();
         let bg = ui.interact(bg_rect, focus_id, egui::Sense::click());
         if bg.clicked() {
@@ -152,22 +157,28 @@ impl GitPane {
         }
         let has_focus = bg.has_focus();
         self.handle_keys(ui, has_focus);
+        self.graph_op_keys(ui, has_focus, events);
 
         let total = self.rows.len();
+        let selected_before = self.selected.clone();
         let mut trigger_more = false;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(
-            ui,
-            row_height,
-            total,
-            |ui, range| {
-                if near_end(range.end, self.log_loaded) && self.log_has_more && !self.log_loading {
-                    trigger_more = true;
-                }
-                for i in range.clone() {
-                    self.draw_row(ui, colors, now, i, row_height, lane_width, events);
-                }
-            },
-        );
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(offset) = self.take_search_scroll(ui, row_height) {
+            area = area.vertical_scroll_offset(offset);
+        }
+        area.show_rows(ui, row_height, total, |ui, range| {
+            if near_end(range.end, self.log_loaded) && self.log_has_more && !self.log_loading {
+                trigger_more = true;
+            }
+            for i in range.clone() {
+                self.draw_row(ui, colors, now, i, row_height, lane_width, events);
+            }
+        });
+        // A click on a row (which covers the focus background) still gives the graph the
+        // keyboard, so j/k and the §7.3 op keys work right after it.
+        if self.selected != selected_before {
+            bg.request_focus();
+        }
         if trigger_more {
             let n = worker::next_log_n(self.log_loaded);
             self.dispatch_log_page(ctx, n);
@@ -262,12 +273,11 @@ impl GitPane {
             if chip_resp.clicked() {
                 self.select_index(i);
             }
-            if chip_resp.double_clicked()
-                && let Some(target) = checkout_target(dec)
-            {
-                let ctx = self.ctx.clone();
-                self.start_checkout(&ctx, target.to_string());
+            if chip_resp.double_clicked() {
+                self.chip_double_clicked(dec, events);
             }
+            let ctx = self.ctx.clone();
+            self.attach_commit_menu(&ctx, &chip_resp, &commit, events);
             cursor = chip_rect.right() + 4.0;
         }
 
@@ -304,7 +314,11 @@ impl GitPane {
         if resp.clicked() {
             self.select_index(i);
         }
-        let _ = events;
+        if resp.secondary_clicked() {
+            self.select_index(i);
+        }
+        let ctx = self.ctx.clone();
+        self.attach_commit_menu(&ctx, &resp, &commit, events);
     }
 }
 

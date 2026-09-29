@@ -208,6 +208,15 @@ impl Settings {
         true
     }
 
+    /// Settings → **Default clone directory** (§5.23) as the clone sheet shows it (§5.3):
+    /// the configured folder, or the home directory (`~`) when unset or blank.
+    pub fn clone_dir(&self) -> String {
+        match self.general.default_clone_dir.as_deref().map(str::trim) {
+            Some(dir) if !dir.is_empty() => dir.to_string(),
+            _ => "~".to_string(),
+        }
+    }
+
     /// Does a branch match `protected_branches` (exact or trailing `/*` glob)?
     ///
     /// A pattern ending in `/*` matches any branch strictly under that prefix (`release/*`
@@ -425,6 +434,16 @@ mod tests {
 
     fn settings_path(dir: &std::path::Path) -> std::path::PathBuf {
         dir.join("settings.toml")
+    }
+
+    #[test]
+    fn clone_dir_defaults_to_home_and_reads_the_setting() {
+        let mut s = Settings::default();
+        assert_eq!(s.clone_dir(), "~");
+        s.general.default_clone_dir = Some("  ".into());
+        assert_eq!(s.clone_dir(), "~", "blank means unset");
+        let parsed: Settings = toml::from_str("[general]\ndefault_clone_dir = \"~/src\"\n").expect("parse");
+        assert_eq!(parsed.clone_dir(), "~/src");
     }
 
     // -- spec defaults (§5.23 and the sections it points at) ----------------------------------

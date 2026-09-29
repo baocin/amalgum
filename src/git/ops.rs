@@ -1217,7 +1217,7 @@ pub fn read_facts(git: &Git, needs: &Needs, now: u64) -> Result<Facts, GitError>
 
 /// The operation git left in progress, asked through its pseudo-refs so it works over ssh too
 /// (`REBASE_HEAD` marks a rebase stopped on a conflict).
-fn in_progress(git: &Git) -> Option<RepoOp> {
+pub fn in_progress(git: &Git) -> Option<RepoOp> {
     let exists = |r: &str| git.run(&["rev-parse", "-q", "--verify", r]).is_ok();
     status::detect_op(|marker| match marker {
         "rebase-merge" | "rebase-apply" => exists("REBASE_HEAD"),
