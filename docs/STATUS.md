@@ -34,6 +34,7 @@ shells) found 55 distinct defects; all were fixed test-first and each fix was at
 | §5.18 undo/redo journal | `git::journal` | ✅ |
 | §5.16 interactive rebase plans + editor helpers | `git::rebase`, `amalgum --sequence-editor/--editor` | ✅ |
 | §5.7 commit message rules | `git::message` | ✅ |
+| §5.15 file history (`log --follow`, renames) and blame porcelain, blame heat | `git::history`, `git::blame`, `model::blame` | ✅ |
 | §5.29 status model, per-agent adapters, hook installers | `agent::status`, `agent::adapters::*` | ✅ |
 | §5.27 OSC 7/0/2/9/99/777/133 + BEL scanner | `agent::osc` | ✅ |
 | §5.30 hibernation rules | `agent::hibernate` | ✅ (the UI that acts on them is ⬜) |
@@ -58,12 +59,13 @@ in CI but has not been looked at on a real display.
 | §5.3 clone | ✅ | sheet, clipboard autofill, shallow, clone on a remote host, progress + cancel; native folder picker ⬜ |
 | §5.28 SSH workspaces | 🟡 | `ui/app/remote.rs`: `amalgum open host:path`, Connect to host sheet (host list from ssh config, tmux option), restore on launch, W16 progress line / banner / host-key dialog, tmux reattach on reconnect, remote git pane (10 s poll), hooks live and drained, ⊘ row + Disconnect / Reconnect / Kill sessions, `ssh -L` forwards in a ports popover; listening remote ports are not discovered (forward by number), file drag-and-drop upload ⬜, Settings → SSH per-host table ⬜ (settings.toml `[ssh]`, read at launch) |
 | §5.4 graph: streamed log, lanes, chips, working-tree row, selection, commit context menu | ✅ | focus mode, collapse, drag-and-drop ⬜ |
-| §5.5–5.6 details and diff (word-level) | 🟡 | unified only; split view, images, blame ⬜ |
+| §5.5–5.6 details and diff (word-level) | 🟡 | unified only; split view, images ⬜ |
 | §5.7 Changes: stage/unstage, per-hunk stage/unstage/discard, commit, amend | ✅ | line-range selection, sign-off, commit-and-push ⬜ |
 | §5.8 search | ✅ | in-memory matching; the on-disk index for 100k-commit repos ⬜ |
 | §5.10 fetch / pull / push, background fetch, protected branches | ✅ | battery check ⬜ (no platform reading) |
 | §5.11 tags, §5.12 stashes, §5.16 cherry-pick / revert / reset | ✅ | |
-| §5.13 compare, §5.14 multi-select, §5.15 history/blame, §5.16 interactive rebase UI | ⬜ | rebase plans and editor helpers exist |
+| §5.13 compare, §5.14 multi-select | ✅ | `ui/git_pane/compare.rs`; **Squash into one** emits `GitEvent::Rebase` with the plan, and the app only toasts until the §5.16 runner lands |
+| §5.15 file history and blame (W12) | ✅ | `ui/git_pane/history.rs`, `ui/git_pane/blame.rs`: right-click a file (Changes, commit details, history rows) or `Mod+Shift+H` / `b`; history replaces the details panel, Open at this commit, full-pane blame with heat, hover message, blame back/forward and breadcrumb, Blame this line in diffs; compare file lists ⬜ (§5.13 not built) |
 | §5.9 branches: create, checkout (incl. remote/tracking), rename, delete, upstream, merge, rebase | ✅ | drag-and-drop, "Switch to that workspace" ⬜ |
 | §5.18 undo/redo (`Mod+Z` in the git pane) for every ref-changing operation | ✅ | undo panel ⬜ |
 | §5.20 destructive confirmations | ✅ | |

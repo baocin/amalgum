@@ -91,6 +91,8 @@ enum ChangesAction {
     SelectFile(Side, String),
     /// §5.7 file menu: type the path into the focused terminal (for handing it to an agent).
     SendPath(String),
+    /// §5.15 file menu: **File history** / **Blame**.
+    FileView(super::history::FileViewRequest),
     StageHunk(usize),
     UnstageHunk(usize),
     RequestDiscardHunk(String, usize),
@@ -159,11 +161,16 @@ impl GitPane {
                 );
                 (cb, label_resp)
             });
+            let file_row = super::history::changes_file(e);
             resp.inner.1.context_menu(|ui| {
                 if ui.button("Send path to terminal").clicked() {
                     action = Some(ChangesAction::SendPath(e.path.clone()));
                 }
+                if let Some(request) = super::history::changes_menu_items(ui, &file_row) {
+                    action = Some(ChangesAction::FileView(request));
+                }
             });
+            self.note_file_focus(&resp.inner.1, file_row);
             if resp.inner.0.changed() {
                 action = Some(ChangesAction::Stage(e.path.clone()));
             } else if resp.inner.1.clicked() {
@@ -190,11 +197,16 @@ impl GitPane {
                 );
                 (cb, label_resp)
             });
+            let file_row = super::history::changes_file(e);
             resp.inner.1.context_menu(|ui| {
                 if ui.button("Send path to terminal").clicked() {
                     action = Some(ChangesAction::SendPath(e.path.clone()));
                 }
+                if let Some(request) = super::history::changes_menu_items(ui, &file_row) {
+                    action = Some(ChangesAction::FileView(request));
+                }
             });
+            self.note_file_focus(&resp.inner.1, file_row);
             if resp.inner.0.changed() {
                 action = Some(ChangesAction::Unstage(e.path.clone()));
             } else if resp.inner.1.clicked() {
@@ -309,6 +321,7 @@ impl GitPane {
             ChangesAction::CancelDiscard => self.changes.pending_discard = None,
             ChangesAction::Commit => self.dispatch_commit(ctx),
             ChangesAction::SendPath(path) => events.push(GitEvent::SendToTerminal(path)),
+            ChangesAction::FileView(request) => self.open_file_view(ctx, request),
         }
     }
 

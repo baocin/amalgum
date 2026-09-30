@@ -111,7 +111,11 @@ impl App {
             A::FocusPaneDown => self.move_focus(Dir::Down),
             A::ZoomPane => self.zoomed = !self.zoomed,
             A::MaximizePane => match self.focus {
-                Focus::Git => self.git_maximized = !self.git_maximized,
+                Focus::Git => {
+                    // The user's choice now: a view closing later no longer restores its own.
+                    self.git_maximized_before = None;
+                    self.git_maximized = !self.git_maximized;
+                }
                 Focus::Terminal => self.zoomed = !self.zoomed,
             },
             A::ToggleGitPane => {
@@ -202,7 +206,19 @@ impl App {
             | A::MergeSelectedIntoCurrent
             | A::RebaseCurrentOntoSelected
             | A::CherryPickSelectedOntoCurrent
+            | A::InteractiveRebaseFromSelected
+            | A::SquashSelectedIntoParent
+            | A::FixupSelectedIntoParent
+            | A::EditSelectedCommitMessage
             | A::SetUpstream => self.git_pane_action(ctx, action),
+            A::FileHistoryOfFocusedFile | A::BlameFocusedFile => {
+                // §5.15: the git pane knows which file is focused.
+                if self.show_git_pane()
+                    && let Some(git) = self.active_live().and_then(|l| l.git.as_mut())
+                {
+                    git.file_action(ctx, action);
+                }
+            }
             other => {
                 self.toast(Toast::info(format!(
                     "{} is not available in this build yet",
@@ -341,6 +357,13 @@ impl App {
                     && let Some(git) = self.active_live().and_then(|l| l.git.as_mut())
                 {
                     git.open_merge_picker(merge);
+                }
+            }
+            Target::Compare => {
+                if self.show_git_pane()
+                    && let Some(git) = self.active_live().and_then(|l| l.git.as_mut())
+                {
+                    git.open_compare_palette();
                 }
             }
         }

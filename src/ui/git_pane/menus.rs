@@ -59,7 +59,9 @@ impl GitPane {
             web,
             in_head,
         };
-        git_menu::commit_menu(&commit.id, &RowRefs::from_decorations(&commit.refs), &cx)
+        let mut menu = git_menu::commit_menu(&commit.id, &RowRefs::from_decorations(&commit.refs), &cx);
+        git_menu::insert_group_after_undo(&mut menu, git_menu::rewrite_entries(&cx, commit.parents.len()));
+        menu
     }
 
     /// Runs what the commit menu's `action` asks for. `at` is where a follow-up popover opens.
@@ -112,6 +114,19 @@ impl GitPane {
                     self.open_url(ctx, url);
                 }
             }
+            MenuAction::CompareWithCurrent { rev } => self.compare_with_current(rev),
+            MenuAction::CompareWith { rev } => self.compare_with(rev),
+            MenuAction::CherryPickSelection { .. }
+            | MenuAction::RevertSelection
+            | MenuAction::SquashSelection
+            | MenuAction::CopyHashes
+            | MenuAction::CompareSelection => self.on_selection_action(ctx, action, events),
+            MenuAction::InteractiveRebase => self.open_interactive_rebase(ctx, &id),
+            MenuAction::EditMessage => self.open_edit_message(ctx, &id, at),
+            MenuAction::SquashIntoParent => {
+                self.meld_into_parent(ctx, &id, crate::git::rebase::Action::Squash)
+            }
+            MenuAction::FixupIntoParent => self.meld_into_parent(ctx, &id, crate::git::rebase::Action::Fixup),
         }
     }
 

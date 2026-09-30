@@ -109,6 +109,7 @@ impl GitPane {
     /// Details for `commit`, which need not be among the loaded graph rows (a remote search
     /// result further back than the graph has read).
     pub(super) fn show_commit_details(&mut self, ctx: &egui::Context, commit: Commit) {
+        self.details_replaced(); // §5.13: a new selection ends compare mode
         let id = commit.id.clone();
         self.details = Some(DetailsState::new(commit));
         self.dispatch_commit_body(ctx, id.clone());
@@ -118,6 +119,7 @@ impl GitPane {
     /// §5.12 "Select a stash: details shows its diff exactly like a commit". The header comes
     /// from the stash list at once and is completed from `git log -1` on a worker.
     pub(super) fn select_stash(&mut self, ctx: &egui::Context, stash: &Stash) {
+        self.details_replaced(); // §5.13: a new selection ends compare mode
         self.selected = super::Selection::None;
         let commit = Commit {
             id: stash.oid.clone(),
@@ -255,6 +257,18 @@ impl GitPane {
         _events: &mut Vec<GitEvent>,
         ctx: &egui::Context,
     ) {
+        if self.view == crate::model::state::GitView::Graph {
+            return; // drawn in the Graph view's bottom panel (`show_graph_bottom_panel`)
+        }
+        // §5.13 compare mode and §5.14 multi-selection take the details area over.
+        if self.show_selection_details(ui, colors, now) {
+            return;
+        }
+        self.draw_details(ui, colors, now, ctx);
+    }
+
+    /// The selected commit's (or stash's) details: message, files, and the selected file's diff.
+    pub(super) fn draw_details(&mut self, ui: &mut egui::Ui, colors: &Colors, now: u64, ctx: &egui::Context) {
         // Snapshot everything needed for rendering up front: every field below borrows `self`
         // immutably, and several widgets below (parent hashes, file rows, "Load more") need a
         // `&mut self` call when clicked, so no borrow of `self.details` may still be alive by
@@ -273,6 +287,7 @@ impl GitPane {
 
         let stash = details.stash.clone();
         let mut action: Option<DetailAction> = None;
+        let mut file_view: Option<super::history::FileViewRequest> = None;
 
         if let Some(stash) = &stash {
             ui.horizontal(|ui| {
@@ -367,15 +382,19 @@ impl GitPane {
                         ui.colored_label(color, label);
                         ui.weak(counts);
                     });
-                    let clicked = ui
-                        .interact(
-                            resp.response.rect,
-                            ui.id().with(("detail_file", &f.path)),
-                            egui::Sense::click(),
-                        )
-                        .clicked();
-                    if clicked {
+                    let row = ui.interact(
+                        resp.response.rect,
+                        ui.id().with(("detail_file", &f.path)),
+                        egui::Sense::click(),
+                    );
+                    if row.clicked() {
                         action = Some(DetailAction::SelectFile(f.path.clone()));
+                    }
+                    if stash.is_none() {
+                        // §5.15: right-click → File history / Blame; `b` on the focused row.
+                        let target = super::history::FileRow::in_commit(&commit.id, &f.path, f.status);
+                        self.note_file_focus(&row, target.clone());
+                        file_view = super::history::file_menu(&row, &target).or(file_view);
                     }
                 }
             }
@@ -387,13 +406,21 @@ impl GitPane {
         } else {
             let mut want_more = false;
             for file in &diff {
-                render_diff_file(ui, colors, file, limit, &mut want_more);
+                let line = render_diff_file(ui, colors, file, limit, &mut want_more);
+                if let Some(line) = line.filter(|_| stash.is_none()) {
+                    let target = super::history::line_target(&commit.id, file, line);
+                    file_view = target.map(super::history::FileViewRequest::Blame).or(file_view);
+                }
             }
             if want_more {
                 action = Some(DetailAction::LoadMore);
             }
         }
 
+        if let Some(request) = file_view {
+            self.open_file_view(ctx, request);
+            return;
+        }
         match action {
             Some(DetailAction::SelectParent(hash)) => {
                 self.selected = super::Selection::Commit(hash);
@@ -778,7 +805,7 @@ impl GitPane {
     }
 }
 
-fn status_color(colors: &Colors, status: char) -> egui::Color32 {
+pub(super) fn status_color(colors: &Colors, status: char) -> egui::Color32 {
     match status {
         'A' | 'C' => colors.get(Token::DiffAddFg),
         'D' => colors.get(Token::DiffDelFg),
@@ -788,14 +815,15 @@ fn status_color(colors: &Colors, status: char) -> egui::Color32 {
 
 /// Renders one file's hunks (read-only: used by the commit details view). `budget` is decremented
 /// as lines are drawn; once it reaches the file's `limit`, drawing stops and `*want_more` is set
-/// if the caller clicks "Load more".
+/// if the caller clicks "Load more". Returns the line chosen with **Blame this line** (§5.15).
 pub(super) fn render_diff_file(
     ui: &mut egui::Ui,
     colors: &Colors,
     file: &FileDiff,
     limit: usize,
     want_more: &mut bool,
-) {
+) -> Option<super::history::DiffLine> {
+    let mut blame_line = None;
     let title = match (&file.old_path, &file.new_path) {
         (Some(a), Some(b)) if a != b => format!("{a} → {b}"),
         (Some(a), _) => a.clone(),
@@ -805,7 +833,7 @@ pub(super) fn render_diff_file(
     ui.label(egui::RichText::new(title).strong());
     if file.binary {
         ui.weak("Binary file");
-        return;
+        return None;
     }
     let total: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
     let (shown, truncated) = visible_line_count(total, limit);
@@ -835,13 +863,16 @@ pub(super) fn render_diff_file(
             let paired = pair_for_word_diff(&hunk.lines, i);
             match paired {
                 Some((del, add)) => {
-                    render_line(ui, colors, &hunk.lines[del], Some(&hunk.lines[add].display()));
-                    render_line(ui, colors, &hunk.lines[add], Some(&hunk.lines[del].display()));
+                    let r = render_line(ui, colors, &hunk.lines[del], Some(&hunk.lines[add].display()));
+                    line_menu(&r, &hunk.lines[del], &mut blame_line);
+                    let r = render_line(ui, colors, &hunk.lines[add], Some(&hunk.lines[del].display()));
+                    line_menu(&r, &hunk.lines[add], &mut blame_line);
                     i += 2;
                     drawn += 2;
                 }
                 None => {
-                    render_line(ui, colors, &hunk.lines[i], None);
+                    let r = render_line(ui, colors, &hunk.lines[i], None);
+                    line_menu(&r, &hunk.lines[i], &mut blame_line);
                     i += 1;
                     drawn += 1;
                 }
@@ -854,6 +885,24 @@ pub(super) fn render_diff_file(
             *want_more = true;
         }
     }
+    blame_line
+}
+
+/// The diff line menu's **Blame this line** (§5.6, §5.15): a removed line is blamed on the old
+/// side, every other line on the new side.
+fn line_menu(resp: &egui::Response, line: &Line, chosen: &mut Option<super::history::DiffLine>) {
+    use super::history::DiffLine;
+    let target = match line.kind {
+        LineKind::Del => line.old_no.map(DiffLine::Old),
+        _ => line.new_no.map(DiffLine::New),
+    };
+    let Some(target) = target else { return };
+    resp.context_menu(|ui| {
+        if ui.button("Blame this line").clicked() {
+            *chosen = Some(target);
+            ui.close();
+        }
+    });
 }
 
 /// If `lines[i]` is a `Del` immediately followed by an `Add` (a replace pair, so word-diff
@@ -868,10 +917,14 @@ pub(super) fn pair_for_word_diff(lines: &[Line], i: usize) -> Option<(usize, usi
     }
 }
 
-pub(super) fn render_line(ui: &mut egui::Ui, colors: &Colors, line: &Line, pair_text: Option<&str>) {
+pub(super) fn render_line(
+    ui: &mut egui::Ui,
+    colors: &Colors,
+    line: &Line,
+    pair_text: Option<&str>,
+) -> egui::Response {
     if line.kind == LineKind::NoNewline {
-        ui.weak("\\ No newline at end of file");
-        return;
+        return ui.weak("\\ No newline at end of file");
     }
     let (bg, fg, word_bg) = match line.kind {
         LineKind::Add => {
@@ -890,7 +943,7 @@ pub(super) fn render_line(ui: &mut egui::Ui, colors: &Colors, line: &Line, pair_
     };
 
     let row_h = 16.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
@@ -908,6 +961,7 @@ pub(super) fn render_line(ui: &mut egui::Ui, colors: &Colors, line: &Line, pair_
     let job = line_job(&text, fg, &highlight, word_bg);
     let galley = painter.layout_job(job);
     painter.galley(rect.left_center() + egui::vec2(80.0, -galley.size().y / 2.0), galley, fg);
+    resp
 }
 
 pub(super) fn line_job(

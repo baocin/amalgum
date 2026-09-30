@@ -130,6 +130,8 @@ enum RefsAction {
     /// §5.12: show the stash in the details.
     SelectStash(crate::git::refs::Stash),
     Stash,
+    /// §5.13 **Compare with current** (`false`) / **Compare with…** (`true`).
+    Compare(String, bool),
 }
 
 impl GitPane {
@@ -244,6 +246,12 @@ impl GitPane {
                         if ui.button(format!("Rebase `{cur}` onto `{b}`")).clicked() {
                             set(RefsAction::Rebase(b.clone()));
                         }
+                        if ui.button("Compare with current").clicked() {
+                            set(RefsAction::Compare(b.clone(), false));
+                        }
+                    }
+                    if ui.button("Compare with…").clicked() {
+                        set(RefsAction::Compare(b.clone(), true));
                     }
                     ui.separator();
                     if ui.button("Rename…").on_hover_text("F2").clicked() {
@@ -363,6 +371,12 @@ impl GitPane {
                         if ui.button(format!("Rebase `{cur}` onto `{}`", r.short)).clicked() {
                             set(RefsAction::Rebase(r.short.clone()));
                         }
+                        if ui.button("Compare with current").clicked() {
+                            set(RefsAction::Compare(r.short.clone(), false));
+                        }
+                        if ui.button("Compare with…").clicked() {
+                            set(RefsAction::Compare(r.short.clone(), true));
+                        }
                         ui.separator();
                         if ui.button("Copy branch name").clicked() {
                             set(RefsAction::Copy(r.short.clone()));
@@ -407,6 +421,12 @@ impl GitPane {
                     }
                     if ui.button("Create branch from tag…").clicked() {
                         set(RefsAction::CreateBranch { base: t.short.clone(), at });
+                    }
+                    if ui.button("Compare with current").clicked() {
+                        set(RefsAction::Compare(t.short.clone(), false));
+                    }
+                    if ui.button("Compare with…").clicked() {
+                        set(RefsAction::Compare(t.short.clone(), true));
                     }
                     if !remote_names.is_empty() {
                         ui.menu_button("Push to…", |ui| {
@@ -630,6 +650,8 @@ impl GitPane {
             RefsAction::Reveal(path) => self.reveal(ctx, path),
             RefsAction::SelectStash(stash) => self.select_stash(ctx, &stash),
             RefsAction::Stash => events.extend(self.open_stash().map(GitEvent::Toast)),
+            RefsAction::Compare(rev, false) => self.compare_with_current(rev),
+            RefsAction::Compare(rev, true) => self.compare_with(rev),
         }
     }
 }

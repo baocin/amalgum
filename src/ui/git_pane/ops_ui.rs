@@ -177,7 +177,7 @@ pub(super) struct OpsState {
     /// The Refs view's selected row (§7.6 keys act on it).
     pub(super) refs_sel: Option<super::refs::RefsSel>,
     /// The app's keyboard focus is on this pane (not a terminal); set every frame by the app.
-    app_focused: bool,
+    pub(super) app_focused: bool,
     /// The remote the workspace is bound to (its sidebar group), from the app.
     bound_remote: Option<String>,
     /// `(commit, HEAD, loaded commits)` → whether the commit is in HEAD's history, so an open
@@ -327,6 +327,11 @@ impl GitPane {
         if self.ops.bound_remote.as_deref() != bound_remote {
             self.ops.bound_remote = bound_remote.filter(|r| !r.is_empty()).map(str::to_string);
         }
+    }
+
+    /// The app's keyboard focus is on this pane (not a terminal).
+    pub(super) fn app_focused(&self) -> bool {
+        self.ops.app_focused
     }
 
     /// One ref-changing operation at a time (ops, undo / redo, checkout, worktree changes): the
@@ -732,6 +737,10 @@ impl GitPane {
                 };
                 self.selected_commit_action(ctx, &commit, action, &mut events);
             }
+            A::InteractiveRebaseFromSelected
+            | A::SquashSelectedIntoParent
+            | A::FixupSelectedIntoParent
+            | A::EditSelectedCommitMessage => self.rebase_action(ctx, action),
             A::SetUpstream => match self.current_branch() {
                 Some(b) => self.open_upstream_picker(b, None),
                 None => events

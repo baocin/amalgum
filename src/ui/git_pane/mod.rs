@@ -14,19 +14,24 @@
 //! Module layout: [`worker`] is the `Reply` enum and every pure helper around it (pagination,
 //! generation guard, journal-entry builders); [`graph`] the Graph view; [`details`] the commit
 //! details and diff below it; [`changes`] the Changes view (staging + commit editor); [`refs`]
-//! the Refs view.
+//! the Refs view; [`compare`] the multi-commit selection and compare mode (§5.13, §5.14).
 
+mod blame;
 mod changes;
+mod compare;
 mod details;
 mod graph;
+mod history;
 mod menus;
 mod ops_ui;
+mod rebase;
 mod refs;
 pub mod requests;
 mod search;
 mod sync;
 mod worker;
 
+pub use rebase::paused_label;
 pub use sync::SyncRequest;
 
 use super::chrome::Toast;
@@ -63,6 +68,8 @@ pub struct RepoSummary {
     pub op: Option<RepoOp>,
     pub conflicts: usize,
     pub loading: bool,
+    /// A rebase this pane started is stopped at this commit (§5.16 "Rebase paused at ab12cd3").
+    pub rebase_paused: Option<String>,
 }
 
 /// Things the pane asks the app to do.
@@ -81,6 +88,9 @@ pub enum GitEvent {
     BindRemote(String),
     /// A remote read failed with ssh's own exit code: check the host's connection (§5.28).
     HostUnreachable,
+    /// Maximize the git pane while blame (§5.15, W12) or the W9 rebase editor (§5.16) is open
+    /// (`true`), and restore what it was (`false`).
+    MaximizePane(bool),
 }
 
 /// The graph's current selection.
@@ -139,6 +149,10 @@ pub struct GitPane {
     // -- commit search (§5.8) and stash popovers (§5.12) --
     search: search::SearchUi,
     stash_ui: details::StashUi,
+    // -- multi-commit selection (§5.14) and compare mode (§5.13) --
+    sel: compare::SelectUi,
+    // -- file history and blame (§5.15) --
+    file_views: history::FileViews,
 
     // -- worker plumbing --
     tx: Sender<Reply>,
@@ -155,6 +169,8 @@ pub struct GitPane {
     initial_loading: bool,
     /// Fetch / pull / push (§5.10), see [`sync`].
     sync: sync::SyncState,
+    /// Interactive rebase (§5.16), see [`rebase`].
+    rebase: rebase::RebaseState,
 }
 
 impl GitPane {
@@ -206,6 +222,8 @@ impl GitPane {
             ops: ops_ui::OpsState::default(),
             search: search::SearchUi::default(),
             stash_ui: details::StashUi::default(),
+            sel: compare::SelectUi::default(),
+            file_views: history::FileViews::default(),
             tx,
             rx,
             generation: 1,
@@ -217,6 +235,7 @@ impl GitPane {
             last_summary: RepoSummary::default(),
             initial_loading: true,
             sync: sync::SyncState::default(),
+            rebase: rebase::RebaseState::default(),
         };
         pane.search = search::SearchUi::new(&pane.location);
         pane.dispatch_bootstrap(ctx);
@@ -285,7 +304,14 @@ impl GitPane {
 
         self.poll_watch(&ctx, frame_time, settings.git.remote_refresh_secs);
 
-        self.show_sync_toolbar(ui, colors, preset, &mut events);
+        if self.show_blame_view(ui, colors, now, &mut events, &ctx) {
+            self.show_ops_overlays(ui, colors, settings, preset, &mut events);
+            self.show_stash_overlays(ui, colors, settings, preset, &mut events);
+            return events;
+        }
+        if !self.rebase_editor_open() {
+            self.show_sync_toolbar(ui, colors, preset, &mut events);
+        }
         ui.horizontal(|ui| {
             for (label, v) in
                 [("Graph", GitView::Graph), ("Changes", GitView::Changes), ("Refs", GitView::Refs)]
@@ -302,7 +328,12 @@ impl GitPane {
         });
         ui.separator();
 
+        let rebase_editor = self.show_rebase_editor(ui, colors, preset, &mut events);
+        if !rebase_editor {
+            self.show_graph_bottom_panel(ui, colors, now, &ctx);
+        }
         match self.view {
+            _ if rebase_editor => {} // W9 replaces the views while the plan is edited (§5.16)
             GitView::Graph => self.show_graph(ui, colors, settings, now, &mut events, &ctx),
             GitView::Changes => self.show_changes(ui, colors, settings, preset, &mut events, &ctx),
             GitView::Refs => {
@@ -310,8 +341,10 @@ impl GitPane {
                 self.show_refs_details(ui, colors, now, &mut events, &ctx);
             }
         }
+        self.file_view_frame(ui, &mut events);
         self.show_ops_overlays(ui, colors, settings, preset, &mut events);
         self.show_stash_overlays(ui, colors, settings, preset, &mut events);
+        self.show_rebase_overlays(ui, colors, settings, preset, &mut events);
 
         let summary = self.compute_summary();
         if summary != self.last_summary {
@@ -535,6 +568,9 @@ impl GitPane {
             Reply::Ops(reply) => self.apply_ops_reply(ctx, reply, events),
             Reply::Search(reply) => self.apply_search_reply(reply, events),
             Reply::Stash(reply) => self.apply_stash_reply(ctx, reply, events),
+            Reply::Compare(reply) => self.apply_compare_reply(reply, events),
+            Reply::FileView(reply) => self.apply_file_view_reply(ctx, reply, events),
+            Reply::Rebase(reply) => self.apply_rebase_reply(ctx, reply, events),
         }
     }
 
@@ -587,6 +623,7 @@ impl GitPane {
             op: self.op,
             conflicts,
             loading: self.initial_loading,
+            rebase_paused: self.rebase_paused_at(),
         }
     }
 }
@@ -954,6 +991,8 @@ mod tests {
             ops: ops_ui::OpsState::default(),
             search: search::SearchUi::default(),
             stash_ui: details::StashUi::default(),
+            sel: compare::SelectUi::default(),
+            file_views: history::FileViews::default(),
             tx,
             rx,
             generation: 1,
@@ -965,6 +1004,7 @@ mod tests {
             last_summary: RepoSummary::default(),
             initial_loading: true,
             sync: sync::SyncState::default(),
+            rebase: rebase::RebaseState::default(),
         }
     }
 }

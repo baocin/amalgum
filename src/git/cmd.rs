@@ -202,6 +202,13 @@ impl Git {
 
     /// The full argv that would run, for logs and the error details pane.
     pub fn argv(&self, args: &[&str]) -> Vec<String> {
+        self.argv_with_env(args, &[])
+    }
+
+    /// [`argv`](Self::argv) for a git that also gets `env`: remotely the pairs join the `env
+    /// K=V…` prefix (sshd passes nothing through); locally [`Self::command_with_env`] sets them
+    /// on the process instead.
+    fn argv_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Vec<String> {
         match &self.location {
             Location::Local { path } => {
                 let mut v = vec![self.git_bin.clone(), "-C".to_string(), path.display().to_string()];
@@ -212,6 +219,7 @@ impl Git {
                 // sshd does not pass our environment through: `env K=V … git …` on the host.
                 let mut remote_argv: Vec<String> = vec!["env".to_string()];
                 remote_argv.extend(GIT_ENV.iter().map(|(k, v)| format!("{k}={v}")));
+                remote_argv.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
                 remote_argv.extend(["git".to_string(), "-C".to_string(), path.clone()]);
                 remote_argv.extend(args.iter().map(|a| a.to_string()));
                 let remote_refs: Vec<&str> = remote_argv.iter().map(String::as_str).collect();
@@ -241,25 +249,41 @@ impl Git {
 
     /// A ready-to-spawn command (env set, stdin null unless the caller changes it).
     pub fn command(&self, args: &[&str]) -> Command {
-        let argv = self.argv(args);
+        self.command_with_env(args, &[])
+    }
+
+    /// [`command`](Self::command) for a git that also gets `env`, wherever it runs.
+    fn command_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
+        let argv = self.argv_with_env(args, env);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         for var in REPO_ENV_VARS {
             cmd.env_remove(var);
         }
         cmd.envs(GIT_ENV.iter().copied());
+        if let Location::Local { .. } = self.location {
+            cmd.envs(env.iter().copied());
+        }
         cmd.stdin(Stdio::null());
         cmd
     }
 
     /// Run to completion; stdout on success.
     pub fn run(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
-        self.run_inner(args, None)
+        self.run_inner(args, None, &[], false)
     }
 
     /// Run with `input` piped to stdin (commit messages, patches for `apply --cached`).
     pub fn run_with_stdin(&self, args: &[&str], input: &[u8]) -> Result<Vec<u8>, GitError> {
-        self.run_inner(args, Some(input))
+        self.run_inner(args, Some(input), &[], false)
+    }
+
+    /// Run with extra environment variables for git and the programs it starts
+    /// (`GIT_SEQUENCE_EDITOR`, §5.16), set where git runs: on the host for a remote location.
+    /// A failure that says nothing on stderr carries stdout in the error instead: `git rebase`
+    /// prints some refusals there ("You must edit all merge conflicts…").
+    pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<Vec<u8>, GitError> {
+        self.run_inner(args, None, env, true)
     }
 
     /// Run a long network command (§5.3, §5.10): `--progress` is added to `clone`, `fetch`,
@@ -351,11 +375,17 @@ impl Git {
         if status.success() { Ok(stdout) } else { Err(error(status.code(), log)) }
     }
 
-    fn run_inner(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, GitError> {
-        let argv = self.argv(args);
+    fn run_inner(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        env: &[(&str, &str)],
+        stdout_on_error: bool,
+    ) -> Result<Vec<u8>, GitError> {
+        let argv = self.argv_with_env(args, env);
         let command_line = quoted_command_line(&argv);
 
-        let mut cmd = self.command(args);
+        let mut cmd = self.command_with_env(args, env);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         if input.is_some() {
             cmd.stdin(Stdio::piped());
@@ -383,11 +413,11 @@ impl Git {
         if output.status.success() {
             Ok(output.stdout)
         } else {
-            Err(GitError {
-                command: command_line,
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            })
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if stdout_on_error && stderr.trim().is_empty() {
+                stderr = String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+            Err(GitError { command: command_line, code: output.status.code(), stderr })
         }
     }
 }
@@ -597,6 +627,33 @@ mod tests {
         );
         std::fs::write(&path, script).expect("write fake host");
         path.display().to_string()
+    }
+
+    /// `run_with_env` sets the variables where git runs: on the process locally, in the `env`
+    /// prefix remotely (sshd forwards nothing). `git var GIT_EDITOR` prints what git would use.
+    #[test]
+    fn run_with_env_reaches_local_and_remote_git() {
+        let repo = TempRepo::new();
+        let env = [("GIT_EDITOR", "my editor --flag")];
+        let local = Git::new(Location::Local { path: repo.path().to_path_buf() });
+        let out = local.run_with_env(&["var", "GIT_EDITOR"], &env).expect("local git var");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "my editor --flag");
+
+        let host_dir = tempfile::tempdir().expect("tempdir");
+        let remote = Git {
+            location: Location::Remote {
+                host: fake_host(host_dir.path()),
+                path: repo.path().display().to_string(),
+            },
+            git_bin: "git".into(),
+            ssh_bin: "sh".into(),
+            control_dir: None,
+            ssh_config: None,
+        };
+        let out = remote.run_with_env(&["var", "GIT_EDITOR"], &env).expect("remote git var");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "my editor --flag");
+        let argv = remote.argv_with_env(&["status"], &env);
+        assert!(argv[3].contains("GIT_OPTIONAL_LOCKS=0 'GIT_EDITOR=my editor --flag' git -C"), "{argv:?}");
     }
 
     /// The environment the module doc promises must reach the *remote* git, not just the local

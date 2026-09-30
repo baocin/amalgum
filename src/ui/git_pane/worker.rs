@@ -78,6 +78,9 @@ pub(super) enum Reply {
     Ops(super::ops_ui::OpsReply),
     Search(super::search::SearchReply),
     Stash(super::details::StashReply),
+    Compare(super::compare::CompareReply),
+    FileView(super::history::FileViewReply),
+    Rebase(super::rebase::RebaseReply),
 }
 
 /// `git diff --no-index` shows an untracked file "as all-added" (§4 "Changes view"), but unlike

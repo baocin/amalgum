@@ -93,6 +93,9 @@ pub struct App {
     zoomed: bool,
     /// `Mod+\` with the git pane focused: the git pane fills the window (§3).
     git_maximized: bool,
+    /// `git_maximized` before a view maximized the pane (§5.15 blame), restored when it closes,
+    /// with the workspace it was saved in: switching workspace (or `Mod+\\`) drops it.
+    git_maximized_before: Option<(Option<String>, bool)>,
     focus: Focus,
     dirty: bool,
     /// `ctx.input(|i| i.time)` of the current frame, for toasts.
@@ -159,6 +162,7 @@ impl App {
             show_sidebar: true,
             zoomed: false,
             git_maximized: false,
+            git_maximized_before: None,
             focus: Focus::Terminal,
             dirty: false,
             time: 0.0,
@@ -260,6 +264,10 @@ impl App {
             behind: s.behind,
             changed: s.changed,
             op: s.op.map(|op| (op, s.conflicts)),
+            rebase: s
+                .rebase_paused
+                .as_deref()
+                .map(|at| (super::git_pane::paused_label(at, s.conflicts), s.conflicts == 0)),
             agent,
             ports: self.workspace_ports(ws),
             unread: self.notifications.unread(),
@@ -335,6 +343,14 @@ impl App {
             }
             StatusAction::RemotePorts => self.show_remote_ports(),
             StatusAction::ShowFetchError => self.show_fetch_error(),
+            StatusAction::ContinueRebase | StatusAction::AbortRebase => {
+                if let Some(pane) = self.active_live().and_then(|l| l.git.as_mut()) {
+                    match action {
+                        StatusAction::ContinueRebase => pane.rebase_continue(),
+                        _ => pane.rebase_abort(),
+                    }
+                }
+            }
             StatusAction::ContinueOp | StatusAction::AbortOp | StatusAction::CreateBranch => {
                 self.set_git_view(crate::model::state::GitView::Changes);
             }
@@ -380,6 +396,16 @@ impl App {
                 GitEvent::Sync(request) => self.on_sync_request(ctx, request),
                 GitEvent::BindRemote(remote) => self.bind_active_to_remote(&remote),
                 GitEvent::HostUnreachable => self.probe_active_host(),
+                GitEvent::MaximizePane(true) => {
+                    self.git_maximized_before.get_or_insert((self.state.active.clone(), self.git_maximized));
+                    self.git_maximized = true;
+                    self.focus = Focus::Git;
+                }
+                GitEvent::MaximizePane(false) => {
+                    if let Some((_, before)) = self.git_maximized_before.take() {
+                        self.git_maximized = before;
+                    }
+                }
             }
         }
     }
@@ -425,6 +451,12 @@ impl eframe::App for App {
             if let Some(action) = action {
                 self.on_sidebar(&ctx, action);
             }
+        }
+        // A view's maximize belongs to the workspace it was opened in.
+        if self.git_maximized_before.as_ref().is_some_and(|(ws, _)| *ws != self.state.active)
+            && let Some((_, before)) = self.git_maximized_before.take()
+        {
+            self.git_maximized = before;
         }
         let git_open = self
             .state
@@ -485,8 +517,12 @@ impl App {
             .iter()
             .flat_map(|r| r.remotes.iter())
             .find_map(|g| g.workspaces.iter().any(|w| w.id == active).then(|| g.name.clone()));
+        let rebase_helper = self.remote_rebase_helper(&active);
         let events = self.active_live().and_then(|l| l.git.as_mut()).map(|g| {
             g.set_app_context(focused, bound.as_deref());
+            if let Some(helper) = rebase_helper {
+                g.set_rebase_helper(helper);
+            }
             g.show(ui, &colors, &settings, preset, now)
         });
         if events.is_none()

@@ -58,7 +58,7 @@ pub struct FileDiff {
 
 /// Decode a git C-quoted path body (the bytes between the surrounding `"` `"`, which are always
 /// pure ASCII: non-ASCII bytes are escaped as `\NNN` octal by git before quoting).
-fn decode_c_quoted(body: &str) -> String {
+pub(crate) fn decode_c_quoted(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

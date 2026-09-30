@@ -11,14 +11,20 @@
 //! - [`sync`]     fetch / pull / push decisions and labels for the git pane toolbar (§5.10)
 //! - [`git_menu`] commit context menu, ref-name validation, git-op confirmations (§5.4, §5.9–5.21)
 //! - [`search`]   commit search field, history, and scheduling (§5.8)
+//! - [`selection`] the graph's multi-commit selection: range, toggle, anchor (§5.14)
+//! - [`blame`]    blame gutter, heat, and the blame-back stack (§5.15)
+//! - [`rebase_plan`] the W9 interactive-rebase editor and the commit-menu rewrite plans (§5.16)
 
+pub mod blame;
 pub mod clone;
 pub mod confirm;
 pub mod fuzzy;
 pub mod git_menu;
 pub mod keymap;
 pub mod layout;
+pub mod rebase_plan;
 pub mod search;
+pub mod selection;
 pub mod settings;
 pub mod state;
 pub mod sync;

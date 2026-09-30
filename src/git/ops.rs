@@ -1215,14 +1215,21 @@ pub fn read_facts(git: &Git, needs: &Needs, now: u64) -> Result<Facts, GitError>
     })
 }
 
-/// The operation git left in progress, asked through its pseudo-refs so it works over ssh too
-/// (`REBASE_HEAD` marks a rebase stopped on a conflict).
+/// Exits 0 when the git-dir path given as the next argument exists (`rebase-merge`,
+/// `MERGE_HEAD`), asked through git so it works over ssh too.
+pub const GIT_PATH_EXISTS_ARGS: &[&str] = &[
+    "-c",
+    "alias.amalgum-exists=!f() { test -e \"$(git rev-parse --git-path \"$1\")\"; }; f",
+    "amalgum-exists",
+];
+
+/// The operation git left in progress, from the files `status::detect_op` names (not from
+/// `REBASE_HEAD`, which git leaves behind after a rebase that squashed).
 pub fn in_progress(git: &Git) -> Option<RepoOp> {
-    let exists = |r: &str| git.run(&["rev-parse", "-q", "--verify", r]).is_ok();
-    status::detect_op(|marker| match marker {
-        "rebase-merge" | "rebase-apply" => exists("REBASE_HEAD"),
-        "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => exists(marker),
-        _ => false,
+    status::detect_op(|marker| {
+        let mut args = GIT_PATH_EXISTS_ARGS.to_vec();
+        args.push(marker);
+        git.run(&args).is_ok()
     })
 }
 
@@ -1638,6 +1645,29 @@ mod tests {
         r.git(&["checkout", "-q", "feat"]);
         let err = execute(&git(&r), &Op::Rebase { onto: "main".into() }, NOW).unwrap_err();
         assert!(matches!(err, OpError::Conflict { op: Some(RepoOp::Rebase), .. }), "{err:?}");
+        assert_eq!(in_progress(&git(&r)), Some(RepoOp::Rebase));
+        r.git(&["rebase", "--abort"]);
+        assert_eq!(in_progress(&git(&r)), None);
+    }
+
+    /// Regression: git leaves `REBASE_HEAD` behind after an interactive rebase that squashed,
+    /// which must not read as a rebase still in progress (a `Pending` would never journal).
+    #[test]
+    fn a_finished_squash_rebase_is_not_in_progress() {
+        let mut r = repo();
+        let base = r.commit_file("a.txt", "a", "Base");
+        let one = r.commit_file("b.txt", "b", "One");
+        let two = r.commit_file("c.txt", "c", "Two");
+        let todo = r.write("todo", &format!("pick {one} One\nsquash {two} Two\n"));
+        let out = hermetic_git(r.path())
+            .env("GIT_SEQUENCE_EDITOR", format!("cp {}", todo.display()))
+            .env("GIT_EDITOR", "true")
+            .args(["rebase", "-i", &base])
+            .output()
+            .expect("spawn git rebase");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(r.git(&["rev-parse", "-q", "--verify", "REBASE_HEAD"]).len() == 40, "git left REBASE_HEAD");
+        assert_eq!(in_progress(&git(&r)), None);
     }
 
     #[test]

@@ -249,6 +249,9 @@ pub struct StatusInfo {
     pub behind: u32,
     pub changed: usize,
     pub op: Option<(RepoOp, usize)>,
+    /// A rebase the git pane started is stopped (§5.16 step 4): "Rebase paused at ab12cd3", and
+    /// whether **Continue** is possible (no conflicts left). Shown instead of `op`.
+    pub rebase: Option<(String, bool)>,
     /// Focused tab's agent status and label ("claude running 4m").
     pub agent: Option<(Status, String)>,
     pub ports: Vec<u16>,
@@ -273,6 +276,9 @@ pub enum StatusAction {
     OpenPort(u16),
     ContinueOp,
     AbortOp,
+    /// **Continue** / **Abort** of the git pane's stopped interactive rebase (§5.16).
+    ContinueRebase,
+    AbortRebase,
     CreateBranch,
     /// "Fetch failed · 3m" clicked: show the last background fetch's stderr.
     ShowFetchError,
@@ -307,7 +313,17 @@ pub fn status_bar(ui: &mut egui::Ui, info: &StatusInfo, colors: &Colors) -> Opti
         ui.spacing_mut().item_spacing.x = 10.0;
 
         // ---- Left: in-progress op, detached HEAD, or branch + ahead/behind/dirty ----
-        if let Some((op, conflicts)) = &info.op {
+        if let Some((label, can_continue)) = &info.rebase {
+            let token = if *can_continue { Token::Warning } else { Token::Danger };
+            ui.colored_label(colors.get(token), label);
+            let resp = ui.add_enabled(*can_continue, egui::Button::new("Continue").small());
+            if resp.on_disabled_hover_text("Resolve the conflicts in Changes first").clicked() {
+                action = Some(StatusAction::ContinueRebase);
+            }
+            if ui.small_button("Abort").clicked() {
+                action = Some(StatusAction::AbortRebase);
+            }
+        } else if let Some((op, conflicts)) = &info.op {
             ui.colored_label(colors.get(Token::Danger), op_label(*op, *conflicts));
             if ui.small_button("Continue").clicked() {
                 action = Some(StatusAction::ContinueOp);

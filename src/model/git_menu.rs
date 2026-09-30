@@ -141,6 +141,34 @@ pub enum MenuAction {
     CopySubject,
     CopyPermalink,
     OpenInBrowser,
+    /// §5.13 **Compare with current**: compare mode, `current`…`rev`.
+    CompareWithCurrent {
+        rev: String,
+    },
+    /// §5.13 **Compare with…**: compare mode with `rev` on the right and the left picker open.
+    CompareWith {
+        rev: String,
+    },
+    /// §5.14 **Cherry-pick N commits onto…** ▸ `onto` (a local branch).
+    CherryPickSelection {
+        onto: String,
+    },
+    /// §5.14 **Revert N commits**.
+    RevertSelection,
+    /// §5.14 **Squash into one**.
+    SquashSelection,
+    /// §5.14 **Copy hashes**.
+    CopyHashes,
+    /// §5.14 **Compare oldest…newest**.
+    CompareSelection,
+    /// §5.16 **Interactively rebase from here**.
+    InteractiveRebase,
+    /// §5.16 **Edit commit message**.
+    EditMessage,
+    /// §5.16 **Squash into parent**.
+    SquashIntoParent,
+    /// §5.16 **Fixup into parent**.
+    FixupIntoParent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,8 +277,8 @@ fn current_name<'a>(cx: &MenuContext<'a>) -> &'a str {
 
 /// The commit context menu (§5.4), in the spec's order, with items that don't apply hidden
 /// (Undo / Redo stay, disabled, when their stack is empty). Groups are separated by
-/// [`MenuEntry::Separator`]. Items 8 (interactive rebase, edit message, squash, fixup) and 9
-/// (compare) belong to the rebase and compare features and are not built here.
+/// [`MenuEntry::Separator`]. Item 8 (interactive rebase, edit message, squash, fixup) is
+/// [`rewrite_entries`], placed by [`insert_group_after_undo`]; 9 (compare) is added here.
 pub fn commit_menu(id: &str, refs: &RowRefs, cx: &MenuContext) -> Vec<MenuEntry> {
     let mut groups: Vec<Vec<MenuEntry>> = Vec::new();
     let current = current_name(cx);
@@ -367,6 +395,15 @@ pub fn commit_menu(id: &str, refs: &RowRefs, cx: &MenuContext) -> Vec<MenuEntry>
     };
     groups.push(vec![stack("Undo", cx.undo, MenuAction::Undo), stack("Redo", cx.redo, MenuAction::Redo)]);
 
+    // 9. Compare with current · Compare with… (§5.13)
+    let rev = compare_rev(id, refs, cx);
+    let mut compare = Vec::new();
+    if !is_head && cx.head.is_some() {
+        compare.push(item("Compare with current", MenuAction::CompareWithCurrent { rev: rev.clone() }));
+    }
+    compare.push(item("Compare with…", MenuAction::CompareWith { rev }));
+    groups.push(compare);
+
     // 10. Rename branch · Delete branch · Delete tag (per ref on the row)
     let mut per_ref = Vec::new();
     for b in &refs.locals {
@@ -397,6 +434,111 @@ pub fn commit_menu(id: &str, refs: &RowRefs, cx: &MenuContext) -> Vec<MenuEntry>
         out.extend(g);
     }
     out
+}
+
+/// What a row's **Compare with…** compares (§5.13): its first branch that isn't current, else
+/// its current branch, a remote branch, a tag, and finally the commit itself.
+pub fn compare_rev(id: &str, refs: &RowRefs, cx: &MenuContext) -> String {
+    refs.locals
+        .iter()
+        .find(|b| Some(b.as_str()) != cx.current_branch)
+        .or(refs.current.as_ref())
+        .or_else(|| refs.remotes.iter().find(|r| !r.ends_with("/HEAD")))
+        .or(refs.tags.first())
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Repository facts the multi-selection menu (§5.14) depends on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectionContext<'a> {
+    /// How many commits are selected (2 or more).
+    pub count: usize,
+    /// `None` when detached.
+    pub current_branch: Option<&'a str>,
+    pub local_branches: &'a [String],
+    /// Contiguous rows forming one first-parent line of non-merge commits, all in the current
+    /// branch's history: **Squash into one** applies.
+    pub squashable: bool,
+    /// Any selected commit is a merge: revert and cherry-pick need a mainline per commit, so
+    /// they are left to the single-commit menu.
+    pub has_merge: bool,
+    /// Every selected commit is already in the current branch: picking them onto it would be
+    /// empty, so it is not offered.
+    pub in_current: bool,
+}
+
+/// The context menu of a multi-commit selection (§5.14): **Cherry-pick N commits onto…** ▸
+/// local branches (the current one first), **Revert N commits**, **Squash into one** (only when
+/// squashable), **Copy hashes**, **Compare oldest…newest**.
+pub fn selection_menu(cx: &SelectionContext) -> Vec<MenuEntry> {
+    let n = cx.count;
+    let mut onto: Vec<MenuEntry> = Vec::new();
+    if let Some(current) = cx.current_branch.filter(|_| !cx.in_current) {
+        onto.push(item(
+            format!("`{current}` (current)"),
+            MenuAction::CherryPickSelection { onto: current.into() },
+        ));
+    }
+    for b in cx.local_branches.iter().filter(|b| Some(b.as_str()) != cx.current_branch) {
+        onto.push(item(format!("`{b}`"), MenuAction::CherryPickSelection { onto: b.clone() }));
+    }
+    let mut out = Vec::new();
+    let pick = format!("Cherry-pick {n} commits onto…");
+    if cx.has_merge {
+        // `git cherry-pick` of a merge needs `-m`: left to single-commit cherry-pick, like revert.
+        out.push(MenuEntry::Item { label: pick, action: MenuAction::CopyHashes, enabled: false });
+    } else if !onto.is_empty() {
+        out.push(MenuEntry::Submenu { label: pick, entries: onto });
+    }
+    out.push(MenuEntry::Item {
+        label: format!("Revert {n} commits"),
+        action: MenuAction::RevertSelection,
+        enabled: !cx.has_merge,
+    });
+    if cx.squashable {
+        out.push(item("Squash into one", MenuAction::SquashSelection));
+    }
+    out.push(MenuEntry::Separator);
+    out.push(item("Copy hashes", MenuAction::CopyHashes));
+    out.push(item("Compare oldest…newest", MenuAction::CompareSelection));
+    out
+}
+
+/// §5.4 item 8, the history-rewriting group: **Interactively rebase from here** · **Edit
+/// message** · **Squash into parent** · **Fixup into parent**. Only for a commit in the current
+/// branch's history (`in_head`); the last two need a single parent (`parents`), itself rewritable.
+pub fn rewrite_entries(cx: &MenuContext, parents: usize) -> Vec<MenuEntry> {
+    if cx.current_branch.is_none() || cx.in_head != Some(true) {
+        return Vec::new();
+    }
+    let mut out = vec![
+        item("Interactively rebase from here…", MenuAction::InteractiveRebase),
+        item("Edit commit message…", MenuAction::EditMessage),
+    ];
+    if parents == 1 {
+        out.push(item("Squash into parent", MenuAction::SquashIntoParent));
+        out.push(item("Fixup into parent", MenuAction::FixupIntoParent));
+    }
+    out
+}
+
+/// Puts `group` into a [`commit_menu`] where §5.4 orders it: after the Undo / Redo group (7),
+/// else at the end, separated from its neighbours.
+pub fn insert_group_after_undo(menu: &mut Vec<MenuEntry>, group: Vec<MenuEntry>) {
+    if group.is_empty() {
+        return;
+    }
+    let redo = menu
+        .iter()
+        .position(|e| matches!(e, MenuEntry::Item { action: MenuAction::Redo, .. }))
+        .map_or(menu.len(), |i| i + 1);
+    let mut block = if redo > 0 { vec![MenuEntry::Separator] } else { Vec::new() };
+    block.extend(group);
+    if redo < menu.len() && !matches!(menu[redo], MenuEntry::Separator) {
+        block.push(MenuEntry::Separator);
+    }
+    menu.splice(redo..redo, block);
 }
 
 /// The remote push, pull, fetch, and new-branch upstreams default to (§5.10): the remote the
@@ -760,6 +902,9 @@ mod tests {
                 "Undo: commit h0h0h0h",
                 "Redo last operation",
                 "---",
+                "Compare with current",
+                "Compare with…",
+                "---",
                 "Rename branch `feat`…",
                 "Delete branch `feat`",
                 "Delete tag `v1`",
@@ -832,6 +977,104 @@ mod tests {
         let got = labels(&commit_menu("c1", &RowRefs::default(), &cx));
         assert!(got.iter().any(|l| l.starts_with("Cherry-pick")));
         assert!(!got.contains(&"Revert".to_string()));
+    }
+
+    // ---- §5.13 compare / §5.14 selection ----
+
+    #[test]
+    fn compare_items_name_the_rows_ref_and_hide_compare_with_current_on_head() {
+        let f = Fixture::new();
+        let row = refs(vec![Decoration::Branch("feat".into()), Decoration::Tag("v1".into())]);
+        let menu = commit_menu("c1", &row, &f.cx());
+        assert!(
+            menu.contains(&item(
+                "Compare with current",
+                MenuAction::CompareWithCurrent { rev: "feat".into() }
+            ))
+        );
+        assert!(menu.contains(&item("Compare with…", MenuAction::CompareWith { rev: "feat".into() })));
+        let head = commit_menu("h0", &refs(vec![Decoration::CurrentBranch("main".into())]), &f.cx());
+        assert!(find(&head, "Compare with current").is_none());
+        assert!(head.contains(&item("Compare with…", MenuAction::CompareWith { rev: "main".into() })));
+    }
+
+    #[test]
+    fn compare_rev_prefers_branches_then_remotes_tags_and_the_hash() {
+        let f = Fixture::new();
+        let cx = f.cx();
+        let r = |d: Vec<Decoration>| compare_rev("c1", &refs(d), &cx);
+        assert_eq!(r(vec![Decoration::CurrentBranch("main".into()), Decoration::Branch("x".into())]), "x");
+        assert_eq!(
+            r(vec![Decoration::Remote("origin/HEAD".into()), Decoration::Remote("origin/a".into())]),
+            "origin/a"
+        );
+        assert_eq!(r(vec![Decoration::Tag("v1".into())]), "v1");
+        assert_eq!(r(vec![]), "c1");
+    }
+
+    #[test]
+    fn selection_menu_follows_the_spec_wording() {
+        let locals = s(&["main", "feat"]);
+        let cx = SelectionContext {
+            count: 5,
+            current_branch: Some("feat"),
+            local_branches: &locals,
+            squashable: true,
+            has_merge: false,
+            in_current: false,
+        };
+        let menu = selection_menu(&cx);
+        assert_eq!(
+            labels(&menu),
+            [
+                "Cherry-pick 5 commits onto… ▸",
+                "Revert 5 commits",
+                "Squash into one",
+                "---",
+                "Copy hashes",
+                "Compare oldest…newest"
+            ]
+        );
+        let Some(MenuEntry::Submenu { entries, .. }) = find(&menu, "Cherry-pick") else { panic!("submenu") };
+        assert_eq!(labels(entries), ["`feat` (current)", "`main`"]);
+        assert!(entries.contains(&item("`main`", MenuAction::CherryPickSelection { onto: "main".into() })));
+    }
+
+    #[test]
+    fn selection_menu_hides_squash_and_disables_revert_when_they_do_not_apply() {
+        let locals = s(&["main"]);
+        let cx = SelectionContext {
+            count: 2,
+            current_branch: None,
+            local_branches: &locals,
+            squashable: false,
+            has_merge: true,
+            in_current: false,
+        };
+        let menu = selection_menu(&cx);
+        assert!(find(&menu, "Squash").is_none());
+        assert_eq!(
+            find(&menu, "Revert"),
+            Some(&MenuEntry::Item {
+                label: "Revert 2 commits".into(),
+                action: MenuAction::RevertSelection,
+                enabled: false
+            })
+        );
+        assert!(
+            matches!(find(&menu, "Cherry-pick"), Some(MenuEntry::Item { enabled: false, .. })),
+            "a merge can't be cherry-picked without -m"
+        );
+        let cx = SelectionContext { has_merge: false, ..cx };
+        let menu = selection_menu(&cx);
+        let Some(MenuEntry::Submenu { entries, .. }) = find(&menu, "Cherry-pick") else { panic!("submenu") };
+        assert_eq!(labels(entries), ["`main`"], "detached: every local branch, none marked current");
+        let both = s(&["main", "feat"]);
+        let cx =
+            SelectionContext { current_branch: Some("main"), in_current: true, local_branches: &both, ..cx };
+        let menu = selection_menu(&cx);
+        let Some(MenuEntry::Submenu { entries, .. }) = find(&menu, "Cherry-pick") else { panic!("submenu") };
+        assert_eq!(labels(entries), ["`feat`"], "commits already on `main` are not picked onto it");
     }
 
     #[test]
@@ -1176,5 +1419,51 @@ mod tests {
         assert_eq!(c.title, "Undo merge feat?");
         assert_eq!(c.verb, "Undo");
         assert!(!c.kind.allows_dont_ask());
+    }
+
+    // ---- §5.4 item 8: history rewriting ----
+
+    #[test]
+    fn rewrite_group_only_for_commits_in_the_current_branchs_history() {
+        let f = Fixture::new();
+        let in_head = MenuContext { in_head: Some(true), ..f.cx() };
+        assert_eq!(
+            labels(&rewrite_entries(&in_head, 1)),
+            [
+                "Interactively rebase from here…",
+                "Edit commit message…",
+                "Squash into parent",
+                "Fixup into parent"
+            ]
+        );
+        assert_eq!(
+            labels(&rewrite_entries(&in_head, 0)),
+            ["Interactively rebase from here…", "Edit commit message…"],
+            "a root commit has no parent to meld into"
+        );
+        assert_eq!(labels(&rewrite_entries(&in_head, 2)).len(), 2, "nor does a merge, as one");
+        assert!(rewrite_entries(&MenuContext { in_head: Some(false), ..f.cx() }, 1).is_empty());
+        assert!(rewrite_entries(&MenuContext { in_head: None, ..f.cx() }, 1).is_empty(), "unknown: hidden");
+        let detached = MenuContext { current_branch: None, in_head: Some(true), ..f.cx() };
+        assert!(rewrite_entries(&detached, 1).is_empty(), "rebasing needs a branch");
+    }
+
+    #[test]
+    fn rewrite_group_goes_after_undo_redo() {
+        let f = Fixture::new();
+        let cx = MenuContext { in_head: Some(true), ..f.cx() };
+        let mut menu = commit_menu("c1", &refs(vec![Decoration::Branch("feat".into())]), &cx);
+        insert_group_after_undo(&mut menu, rewrite_entries(&cx, 1));
+        let got = labels(&menu);
+        let redo = got.iter().position(|l| l.starts_with("Redo")).expect("redo");
+        assert_eq!(got[redo + 1], "---");
+        assert_eq!(got[redo + 2], "Interactively rebase from here…");
+        assert_eq!(got[redo + 5], "Fixup into parent");
+        assert_eq!(got[redo + 6], "---", "separated from the next group");
+        assert!(!got.windows(2).any(|w| w[0] == "---" && w[1] == "---"));
+
+        let mut empty = Vec::new();
+        insert_group_after_undo(&mut empty, vec![item("x", MenuAction::EditMessage)]);
+        assert_eq!(labels(&empty), ["x"], "no undo group: appended");
     }
 }

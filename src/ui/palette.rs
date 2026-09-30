@@ -3,7 +3,8 @@
 //! prefixes `> @ # $ ~ !`; ↑/↓/Enter/Esc; shortcuts right-aligned.
 //!
 //! Git commands with a trailing `…` (**Create branch…**, **Create tag…**, **Merge…**,
-//! **Rebase…**) open a popover or branch picker in the git pane; see [`git_items`].
+//! **Rebase…**, **Compare…**) open a popover, branch picker, or compare mode in the git pane; see
+//! [`git_items`].
 
 use super::theme::Colors;
 use crate::git::Location;
@@ -26,6 +27,8 @@ pub enum Target {
     PickBranch {
         merge: bool,
     },
+    /// **Compare**: the git pane's compare mode with a ref picker open (§5.13).
+    Compare,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +111,7 @@ pub fn git_items(shortcut: impl Fn(Action) -> String) -> Vec<Item> {
         item("Create tag…", shortcut(Action::NewTag), Target::Action(Action::NewTag)),
         item("Merge…", String::new(), Target::PickBranch { merge: true }),
         item("Rebase…", String::new(), Target::PickBranch { merge: false }),
+        item("Compare…", String::new(), Target::Compare),
     ]
 }
 
@@ -412,6 +416,7 @@ mod tests {
         assert_eq!(results[0].0.target, Target::Action(Action::NewBranch));
         let merge = build_results("merge", &items);
         assert_eq!(merge[0].0.target, Target::PickBranch { merge: true });
+        assert_eq!(build_results("compare", &items)[0].0.target, Target::Compare);
         assert!(superseded_by_git_items(Action::NewTag));
         assert!(!superseded_by_git_items(Action::Push));
     }

@@ -169,6 +169,18 @@ impl App {
         Some((host, self.remote.ssh.machine(host)?))
     }
 
+    /// The `amalgum` a remote workspace's git runs as its rebase editors (§5.16): the CLI its
+    /// host's session installed, or why there is none. `None` for a local workspace or a host
+    /// not connected yet.
+    pub(super) fn remote_rebase_helper(
+        &self,
+        workspace: &str,
+    ) -> Option<Result<crate::git::rebase::Helper, String>> {
+        let host = self.live.get(workspace)?.remote.as_ref()?.host.as_str();
+        let session = self.remote.ssh.session(host)?;
+        Some(crate::git::rebase::Helper::remote(&session.cli, &session.info.home, env!("CARGO_PKG_VERSION")))
+    }
+
     /// A remote workspace whose host is not connected: terminals grey out, git pauses.
     pub(super) fn remote_down(&self, workspace: &str) -> bool {
         self.live

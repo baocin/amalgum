@@ -73,6 +73,7 @@ impl GitPane {
     fn select_index(&mut self, idx: usize) {
         let Some(commit) = self.commits.get(idx) else { return };
         let id = commit.id.clone();
+        self.on_single_select(&id);
         self.selected = Selection::Commit(id);
         let ctx = self.ctx.clone();
         self.load_details_for_selected(&ctx);
@@ -83,6 +84,20 @@ impl GitPane {
             return;
         }
         let cur = self.selected_index();
+        // §5.14 `Shift+↓/↑` extends the selection instead of moving it.
+        let extend = ui.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                Some(1)
+            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                Some(-1)
+            } else {
+                None
+            }
+        });
+        if let Some(delta) = extend {
+            self.extend_by_key(delta);
+            return;
+        }
         let (down, up, home, end) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::J) || i.key_pressed(egui::Key::ArrowDown),
@@ -162,6 +177,8 @@ impl GitPane {
         let total = self.rows.len();
         let selected_before = self.selected.clone();
         let mut trigger_more = false;
+        // The details / compare / history panel below the graph is its own bottom panel
+        // (`show_graph_bottom_panel`), laid out first, so the graph takes what is left.
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(offset) = self.take_search_scroll(ui, row_height) {
             area = area.vertical_scroll_offset(offset);
@@ -201,7 +218,7 @@ impl GitPane {
     ) {
         let commit = self.commits[i].clone();
         let row = self.rows[i].clone();
-        let is_selected = matches!(&self.selected, Selection::Commit(id) if id == &commit.id);
+        let is_selected = self.row_selected(&commit.id);
 
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), egui::Sense::click());
@@ -312,13 +329,13 @@ impl GitPane {
         );
 
         if resp.clicked() {
-            self.select_index(i);
+            self.graph_click(i, ui.input(|inp| inp.modifiers));
         }
         if resp.secondary_clicked() {
-            self.select_index(i);
+            self.graph_secondary_click(i);
         }
         let ctx = self.ctx.clone();
-        self.attach_commit_menu(&ctx, &resp, &commit, events);
+        self.attach_row_menu(&ctx, &resp, &commit, events);
     }
 }
 
