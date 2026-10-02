@@ -24,7 +24,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: v
         # bash -eo pipefail: without it, a failing `sed` here would still show green (head's
         # exit status, not sed's, decides the pipeline's) and produce an empty version string.
@@ -45,7 +45,7 @@ jobs:
           - { os: macos-15, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup toolchain install && rustup target add ${{ matrix.target }}
       - id: build
         # Assign before echoing: with `bash -e`, a failing command substitution used as an
@@ -54,7 +54,7 @@ jobs:
           bin="$(scripts/build cli ${{ matrix.target }})"
           echo "bin=$bin" >> "$GITHUB_OUTPUT"
       - run: scripts/check-linkage "${{ steps.build.outputs.bin }}" cli
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
           path: ${{ steps.build.outputs.bin }}
@@ -69,9 +69,9 @@ jobs:
           - { os: macos-15, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup toolchain install && rustup target add ${{ matrix.target }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: cli-*
           path: embed-in
@@ -88,7 +88,7 @@ jobs:
           bin="$(scripts/build app ${{ matrix.target }})"
           echo "bin=$bin" >> "$GITHUB_OUTPUT"
       - run: scripts/check-linkage "${{ steps.build.outputs.bin }}" app
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: app-${{ matrix.target }}
           path: ${{ steps.build.outputs.bin }}
@@ -97,8 +97,8 @@ jobs:
     needs: [check-version, app]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: app-*-apple-darwin
           path: dist/in
@@ -127,7 +127,7 @@ jobs:
           chmod +x dist/in/*/amalgum
           dmg="$(scripts/package-macos "${{ needs.check-version.outputs.version }}" dist/in/app-aarch64-apple-darwin/amalgum dist/in/app-x86_64-apple-darwin/amalgum)"
           echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-macos
           path: ${{ steps.pkg.outputs.dmg }}
@@ -136,8 +136,8 @@ jobs:
     needs: [check-version, app]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: app-x86_64-unknown-linux-gnu
           path: dist/in
@@ -150,7 +150,7 @@ jobs:
           chmod +x dist/in/amalgum
           tarball="$(scripts/package-linux "${{ needs.check-version.outputs.version }}" dist/in/amalgum x86_64 | head -1)"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux
           path: ${{ steps.pkg.outputs.tarball }}
@@ -161,7 +161,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: in
       - name: Collect assets
